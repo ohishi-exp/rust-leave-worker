@@ -6,11 +6,12 @@
 mod support;
 
 use chrono::NaiveDate;
-use leave::cron::{run, Summary};
+use leave::cron::{run, NotifyTarget, Summary};
 use leave::ichiban::EMPLOYEES_PATH;
 use serde_json::{json, Value};
 use support::{
-    add_days, admin, app_client, ichiban_with, lineworks_channel, tenant, FakeIchiban, FakeNotifier,
+    add_days, admin, app_client, ichiban_with, lineworks_channel, notify_recipient, tenant,
+    FakeIchiban, FakeNotifier,
 };
 use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
@@ -201,7 +202,7 @@ async fn detects_notifies_and_grants() {
     );
     assert_eq!(s.unknown.get("謎"), Some(&1));
     let sent = n.sent.lock().unwrap().clone();
-    assert_eq!(sent, vec![(ch.unwrap(), "【勤怠申請】一番星と申請書のずれ 3 件\n1021 山田太郎: 10/03 有休 — 申請書なし\n1021 山田太郎: 10/06 労災 — 一番星に入力なし\n1022 佐藤花子: 09/20 欠勤 — 申請書なし".to_owned())]);
+    assert_eq!(sent, vec![(NotifyTarget::Channel(ch.unwrap()), "【勤怠申請】一番星と申請書のずれ 3 件\n1021 山田太郎: 10/03 有休 — 申請書なし\n1021 山田太郎: 10/06 労災 — 一番星に入力なし\n1022 佐藤花子: 09/20 欠勤 — 申請書なし".to_owned())]);
     assert_eq!(
         alerts(t).await,
         vec![
@@ -345,7 +346,82 @@ async fn no_channel_keeps_alerts_pending() {
         .unwrap();
     let s = run_once(&f, &n).await;
     assert_eq!((s.tenants[0].sent_messages, s.tenants[0].notified), (1, 1));
-    assert_eq!(n.sent.lock().unwrap()[0].0, ch);
+    assert_eq!(n.sent.lock().unwrap()[0].0, NotifyTarget::Channel(ch));
+}
+
+/// 有効な tenant の宛先を個人にする
+async fn set_recipient(t: Uuid, r: Uuid) {
+    admin()
+        .await
+        .execute(
+            "UPDATE alc_api.leave_settings SET lineworks_channel_id = NULL, notify_recipient_id = $2 WHERE tenant_id = $1",
+            &[&t, &r],
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn recipient_target_is_sent() {
+    let _g = serial().await;
+    let (t, _) = enabled_tenant("10", false).await;
+    let r = notify_recipient(t, "lineworks", true).await;
+    set_recipient(t, r).await;
+    let f = ichiban(
+        vec![employee("1021", "山田太郎", "10", None)],
+        &[day("1021", "2026-10-03", "有休")],
+    );
+    let n = FakeNotifier::default();
+    let s = run_once(&f, &n).await;
+    assert_eq!((s.tenants[0].sent_messages, s.tenants[0].notified), (1, 1));
+    assert_eq!(
+        *n.sent.lock().unwrap(),
+        vec![(
+            NotifyTarget::Recipient(r),
+            "【勤怠申請】一番星と申請書のずれ 1 件\n1021 山田太郎: 10/03 有休 — 申請書なし"
+                .to_owned()
+        )]
+    );
+    assert!(alerts(t).await.iter().all(|x| x.4));
+}
+
+#[tokio::test]
+async fn unusable_recipient_keeps_alerts_pending() {
+    let _g = serial().await;
+    let (t, _) = enabled_tenant("10", false).await;
+    let f = ichiban(
+        vec![employee("1021", "山田太郎", "10", None)],
+        &[day("1021", "2026-10-03", "有休")],
+    );
+    // 無効になった個人・LINE の行には送らない (警告は未通知のまま残る)
+    for r in [
+        notify_recipient(t, "lineworks", false).await,
+        notify_recipient(t, "line", true).await,
+    ] {
+        set_recipient(t, r).await;
+        let n = FakeNotifier::default();
+        let s = run_once(&f, &n).await;
+        assert_eq!((s.tenants[0].pending, s.tenants[0].sent_messages), (1, 0));
+        assert!(n.sent.lock().unwrap().is_empty());
+        assert_eq!(*n.calls.lock().unwrap(), 0);
+    }
+    assert!(alerts(t).await.iter().all(|x| !x.4));
+    // 有効に戻せば次の回に送る
+    admin()
+        .await
+        .execute(
+            "UPDATE alc_api.notify_recipients SET enabled = true, provider = 'lineworks', lineworks_user_id = line_user_id, line_user_id = NULL WHERE tenant_id = $1 AND provider = 'line'",
+            &[&t],
+        )
+        .await
+        .unwrap();
+    let n = FakeNotifier::default();
+    let s = run_once(&f, &n).await;
+    assert_eq!(s.tenants[0].sent_messages, 1);
+    assert!(matches!(
+        n.sent.lock().unwrap()[0].0,
+        NotifyTarget::Recipient(_)
+    ));
 }
 
 #[tokio::test]

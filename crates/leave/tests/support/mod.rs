@@ -23,7 +23,7 @@ use axum::http::{Request, Response};
 use axum::{middleware, Router};
 use futures_util::future::BoxFuture;
 use futures_util::lock::Mutex;
-use leave::cron::{Notifier, NotifyError};
+use leave::cron::{Notifier, NotifyError, NotifyTarget};
 use leave::ichiban::{IchibanApi, IchibanError, IchibanResponse};
 use leave::reconcile::days_paths;
 use leave::store::{PdfStore, StoreError};
@@ -209,6 +209,25 @@ pub async fn lineworks_channel(tenant_id: Uuid) -> Uuid {
     .get(0)
 }
 
+/// tenant の通知先 (個人) を 1 つ作る (`provider` = lineworks / line、値は固定のダミー)
+pub async fn notify_recipient(tenant_id: Uuid, provider: &str, enabled: bool) -> Uuid {
+    let user = Uuid::new_v4().to_string();
+    let (lw, line) = match provider {
+        "lineworks" => (Some(user.as_str()), None),
+        _ => (None, Some(user.as_str())),
+    };
+    admin()
+        .await
+        .query_one(
+            "INSERT INTO alc_api.notify_recipients (tenant_id, name, provider, lineworks_user_id, line_user_id, enabled) \
+             VALUES ($1, 'test', $2, $3, $4, $5) RETURNING id",
+            &[&tenant_id, &provider, &lw, &line, &enabled],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
 /// ページを 1 枚作る (受信の口の代わり。`alc_api_app` で tenant_tx の中から入れる)
 pub async fn page(tenant_id: Uuid, r2_key: &str, page_no: i32, received_at: &str) -> Uuid {
     let mut pg = app_client().await;
@@ -309,10 +328,10 @@ impl IchibanApi for FakeIchiban {
 /// テストの「今」(日本時間では 2026-10-10 の 9 時)
 pub const NOW: &str = "2026-10-10T00:00:00Z";
 
-/// 偽の LINE WORKS 送信 (送った (チャネル, 本文) を記録する)。`fail_calls` に入る回 (0 始まり) は失敗する
+/// 偽の LINE WORKS 送信 (送った (宛先, 本文) を記録する)。`fail_calls` に入る回 (0 始まり) は失敗する
 #[derive(Default)]
 pub struct FakeNotifier {
-    pub sent: StdMutex<Vec<(Uuid, String)>>,
+    pub sent: StdMutex<Vec<(NotifyTarget, String)>>,
     pub fail_calls: Vec<usize>,
     pub calls: StdMutex<usize>,
 }
@@ -320,7 +339,7 @@ pub struct FakeNotifier {
 impl Notifier for FakeNotifier {
     fn send<'a>(
         &'a self,
-        channel_id: Uuid,
+        target: NotifyTarget,
         text: &'a str,
     ) -> BoxFuture<'a, Result<(), NotifyError>> {
         Box::pin(async move {
@@ -332,10 +351,7 @@ impl Notifier for FakeNotifier {
             if self.fail_calls.contains(&n) {
                 return Err(NotifyError("status"));
             }
-            self.sent
-                .lock()
-                .unwrap()
-                .push((channel_id, text.to_owned()));
+            self.sent.lock().unwrap().push((target, text.to_owned()));
             Ok(())
         })
     }

@@ -8,7 +8,8 @@ use std::collections::HashMap;
 use leave::ichiban::{DEPARTMENTS_PATH, EMPLOYEES_PATH};
 use serde_json::{json, Value};
 use support::{
-    app, call, ichiban_with, lineworks_channel, page, tenant, App, FakeIchiban, FakePdfs,
+    app, call, ichiban_with, lineworks_channel, notify_recipient, page, tenant, App, FakeIchiban,
+    FakePdfs,
 };
 use uuid::Uuid;
 
@@ -194,7 +195,7 @@ async fn settings_default_then_upsert() {
     assert_eq!(
         got.json(),
         json!({"mailbox": null, "allowed_senders": [], "dept_codes": [], "lineworks_channel_id": null,
-               "grace_days": 7, "enabled": false, "updated_at": null})
+               "notify_recipient_id": null, "grace_days": 7, "enabled": false, "updated_at": null})
     );
 
     let mailbox = format!("Leave-{}", &t.simple().to_string()[..12]);
@@ -277,6 +278,62 @@ async fn lineworks_channel_must_belong_to_tenant() {
     let got = call(&a, "GET", "/api/leave/settings", Some(t1), ADMIN, None).await;
     assert_eq!(got.json()["lineworks_channel_id"], own.to_string());
     assert_eq!(got.json()["grace_days"], 7);
+}
+
+#[tokio::test]
+async fn notify_recipient_must_be_own_enabled_lineworks() {
+    let (t1, t2) = (tenant().await, tenant().await);
+    let own = notify_recipient(t1, "lineworks", true).await;
+    let other = notify_recipient(t2, "lineworks", true).await;
+    let line = notify_recipient(t1, "line", true).await;
+    let disabled = notify_recipient(t1, "lineworks", false).await;
+    let a = app(FakePdfs::default(), None).await;
+
+    let got = put_settings(&a, t1, json!({"notify_recipient_id": own})).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json()["notify_recipient_id"], own.to_string());
+    assert_eq!(got.json()["lineworks_channel_id"], Value::Null);
+
+    for r in [other, line, disabled, Uuid::new_v4()] {
+        let got = put_settings(&a, t1, json!({"notify_recipient_id": r, "grace_days": 1})).await;
+        assert_eq!(got.status, 400);
+        assert_eq!(got.json(), json!({"error": "unknown_notify_recipient"}));
+    }
+    // 拒んだ PUT は何も書いていない
+    let got = call(&a, "GET", "/api/leave/settings", Some(t1), ADMIN, None).await;
+    assert_eq!(got.json()["notify_recipient_id"], own.to_string());
+    assert_eq!(got.json()["grace_days"], 7);
+}
+
+#[tokio::test]
+async fn notify_targets_are_exclusive() {
+    let t = tenant().await;
+    let ch = lineworks_channel(t).await;
+    let r = notify_recipient(t, "lineworks", true).await;
+    let a = app(FakePdfs::default(), None).await;
+
+    let got = put_settings(
+        &a,
+        t,
+        json!({"lineworks_channel_id": ch, "notify_recipient_id": r}),
+    )
+    .await;
+    assert_eq!(got.status, 400);
+    assert_eq!(got.json(), json!({"error": "both_notify_targets"}));
+
+    // グループから個人へ置き換えられる (PUT は全体の置き換え)
+    let got = put_settings(&a, t, json!({"lineworks_channel_id": ch})).await;
+    assert_eq!(got.status, 200);
+    let got = put_settings(&a, t, json!({"notify_recipient_id": r})).await;
+    assert_eq!(got.status, 200);
+    let v = got.json();
+    assert_eq!(
+        (
+            v["lineworks_channel_id"].clone(),
+            v["notify_recipient_id"].clone()
+        ),
+        (Value::Null, json!(r.to_string()))
+    );
 }
 
 #[tokio::test]
