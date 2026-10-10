@@ -1,4 +1,4 @@
-//! 管理 API の口 (13 本、worker が `/api` の下に nest するので実際の path は `/api/leave/…`)。
+//! 管理 API の口 (15 本、worker が `/api` の下に nest するので実際の path は `/api/leave/…`)。
 //!
 //! | method | path | 中身 |
 //! |---|---|---|
@@ -12,6 +12,7 @@
 //! | GET / POST | `/leave/grants` | 有給の付与台帳と残 / 手で付与を足す (`ledger`) |
 //! | POST | `/leave/grants/auto` | 法定付与を足す (`ledger`) |
 //! | PUT / DELETE | `/leave/grants/{id}` | 付与を直す / 消す (`ledger`) |
+//! | GET / PUT | `/leave/opening` | 全員分の有給の期首残 / 一括保存 (`ledger`) |
 //! | POST | `/leave/settings/test-notify` | 保存済みの通知先へ固定の文面を 1 通送る (毎朝の cron と同じ宛先・同じ送信) |
 //!
 //! **全部の口を [`require_admin`] が包む** (管理者でなければ 403。handler にも DB にも届かない)。
@@ -87,6 +88,10 @@ pub fn tenant_router() -> Router<LeaveState> {
             get(ledger::list_grants).post(ledger::create_grant),
         )
         .route("/leave/grants/auto", post(ledger::auto_grants))
+        .route(
+            "/leave/opening",
+            get(ledger::list_openings).put(ledger::put_openings),
+        )
         .route(
             "/leave/grants/{id}",
             put(ledger::update_grant).delete(ledger::delete_grant),

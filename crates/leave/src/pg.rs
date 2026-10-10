@@ -9,7 +9,7 @@ use tokio_postgres::{Error, Row};
 use uuid::Uuid;
 
 use crate::cron::NotifyTarget;
-use crate::grants::{self, AutoGrant, Grant, GrantWrite};
+use crate::grants::{self, AutoGrant, Grant, GrantWrite, Opening, OpeningPut};
 use crate::pages::{ListQuery, Page, PageDetail, PageUpdate, Period};
 use crate::reconcile::{LinkedPeriod, Mismatch, PendingAlert};
 use crate::settings::{Settings, ValidSettings};
@@ -131,6 +131,32 @@ pub mod sql {
          SELECT $1, u.e, u.g, u.t / 10.0, u.x, 'auto' \
          FROM unnest($2::text[], $3::date[], $4::int4[], $5::date[]) AS u(e, g, t, x) \
          ON CONFLICT (tenant_id, employee_cd, grant_date) DO NOTHING";
+
+    /// 期首残 (日数は 0.1 日単位の整数で受け渡す)
+    const OPENING_COLUMNS: &str =
+        "employee_cd, as_of, (carryover * 10)::int4, (\"current\" * 10)::int4";
+
+    pub fn openings() -> String {
+        format!(
+            "SELECT {OPENING_COLUMNS} FROM alc_api.leave_opening WHERE tenant_id = $1 ORDER BY employee_cd"
+        )
+    }
+
+    pub fn opening_by_employee() -> String {
+        format!(
+            "SELECT {OPENING_COLUMNS} FROM alc_api.leave_opening WHERE tenant_id = $1 AND employee_cd = $2"
+        )
+    }
+
+    /// 期首残をまとめて入れる (在れば置き換え)
+    pub const OPENINGS_UPSERT: &str = "INSERT INTO alc_api.leave_opening \
+         (tenant_id, employee_cd, as_of, carryover, \"current\") \
+         SELECT $1, u.e, $2, u.c / 10.0, u.r / 10.0 FROM unnest($3::text[], $4::int4[], $5::int4[]) AS u(e, c, r) \
+         ON CONFLICT (tenant_id, employee_cd) DO UPDATE SET as_of = EXCLUDED.as_of, \
+         carryover = EXCLUDED.carryover, \"current\" = EXCLUDED.\"current\", updated_at = NOW()";
+
+    pub const OPENINGS_DELETE: &str = "DELETE FROM alc_api.leave_opening \
+         WHERE tenant_id = $1 AND employee_cd = ANY($2::text[])";
 
     /// 紐づけ済みのページの期間のうち `$3`〜`$4` に掛かるもの (`$2` が NULL なら全乗務員)
     pub const LINKED_PERIODS: &str = "SELECT p.employee_cd, p.id, pr.kind, pr.start_date, pr.end_date, pr.half \
@@ -306,6 +332,89 @@ pub async fn insert_auto_grants(
                 ],
             )
             .await
+        })
+    })
+    .await
+}
+
+fn opening_from_row(row: &Row) -> (String, Opening) {
+    (
+        row.get(0),
+        Opening {
+            as_of: row.get(1),
+            carryover: row.get(2),
+            current: row.get(3),
+        },
+    )
+}
+
+/// 自 tenant の期首残の全員分 (乗務員コード順)
+pub async fn list_openings(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+) -> Result<Vec<(String, Opening)>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(&sql::openings(), &[(&tenant_id, Type::UUID)])
+                .await?;
+            Ok(rows.iter().map(opening_from_row).collect())
+        })
+    })
+    .await
+}
+
+/// 乗務員 1 人の期首残
+pub async fn get_opening(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    employee_cd: String,
+) -> Result<Option<Opening>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let row = tx
+                .query_typed_opt(
+                    &sql::opening_by_employee(),
+                    &[(&tenant_id, Type::UUID), (&employee_cd, Type::TEXT)],
+                )
+                .await?;
+            Ok(row.as_ref().map(|r| opening_from_row(r).1))
+        })
+    })
+    .await
+}
+
+/// 期首残の一括保存 (upsert と削除を 1 回の transaction で)。(保存した行数, 消えた行数)
+pub async fn put_openings(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    put: OpeningPut,
+) -> Result<(u64, u64), Error> {
+    let codes: Vec<String> = put.upserts.iter().map(|(c, _, _)| c.clone()).collect();
+    let carry: Vec<i32> = put.upserts.iter().map(|&(_, c, _)| c).collect();
+    let current: Vec<i32> = put.upserts.iter().map(|&(_, _, r)| r).collect();
+    let (as_of, deletes) = (put.as_of, put.deletes);
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let saved = tx
+                .execute_typed(
+                    sql::OPENINGS_UPSERT,
+                    &[
+                        (&tenant_id, Type::UUID),
+                        (&as_of, Type::DATE),
+                        (&codes, Type::TEXT_ARRAY),
+                        (&carry, Type::INT4_ARRAY),
+                        (&current, Type::INT4_ARRAY),
+                    ],
+                )
+                .await?;
+            let deleted = tx
+                .execute_typed(
+                    sql::OPENINGS_DELETE,
+                    &[(&tenant_id, Type::UUID), (&deletes, Type::TEXT_ARRAY)],
+                )
+                .await?;
+            Ok((saved, deleted))
         })
     })
     .await

@@ -38,6 +38,9 @@ pub struct Employee {
     pub employee_code: String,
     #[serde(default)]
     pub employee_name: Option<String>,
+    /// 一番星の値のまま (文字列か数値)
+    #[serde(default)]
+    pub dept_code: Option<Value>,
     #[serde(default)]
     pub hire_date: Option<NaiveDate>,
     #[serde(default)]
@@ -424,6 +427,7 @@ mod tests {
             vec![Employee {
                 employee_code: "1021".into(),
                 employee_name: Some("甲".into()),
+                dept_code: Some(json!("10")),
                 hire_date: Some(d("2020-04-01")),
                 retire_date: None
             }]
