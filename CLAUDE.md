@@ -16,13 +16,15 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
 
 ## 規範
 - 管理 API の口は `/api/leave/…` だけ。**全部管理者限定** (`auth::is_admin` の 1 か所)。403 のテストも足す。
-  例外は `POST /internal/ingest` のみ (共有 secret。`internal.rs` を見る)。
+  例外は `POST /internal/ingest` (共有 secret。`internal.rs` を見る) と定時実行 (`#[event(scheduled)]`、本番だけ・
+  `crates/leave/src/cron.rs`。tenant をまたぐのは `leave_enabled_tenants()` だけ)。
 - 公開範囲を弱めない: 本番・staging とも Service Binding だけ (どの env も `workers_dev`/`preview_urls` = false、route 無し)。
-  `ICHIBAN_DB`・Hyperdrive は本番だけ、staging の R2 は staging の bucket。
+  `ICHIBAN_DB`・`AUTH_WORKER` (LINE WORKS 送信)・Hyperdrive・`[triggers]` (cron) は本番だけ (staging / local の crons は空)、
+  staging の R2 は staging の bucket。
   `wrangler.toml` の表の順を変えない (新しい表は placement より後)。
 - DB は `PgClient::tenant_tx` + `query_typed` 系だけ。SQL は `crates/leave/src/pg.rs` の 1 か所。
   名前付き prepared statement 禁止。WHERE に tenant_id も明示する。
 - 応答・ログには固定の語だけ (識別子・入力値・生のエラー文を出さない)。
-- `coverage_100.toml` の登録を外さない。CI の本数 (lib 32・api_db 29) はテストを足したら上げる。
+- `coverage_100.toml` の登録を外さない。CI の本数 (lib 65・api_db 41・cron_db 6) はテストを足したら上げる。
 - public repo: ホスト名・tenant UUID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (alc-vein-worker と同じ rev)。

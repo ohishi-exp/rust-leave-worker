@@ -4,10 +4,11 @@
 //! 口はすべて `/api/leave/…` (auth-worker の `/alc-proxy` が `/api/…` のまま Service Binding で転送する)。
 //!
 //! **この Worker は JWT を検証せず、auth-worker が付け直した tenant / role ヘッダーを信頼する**
-//! (`alc_core_wasm::require_tenant_header` と crates/leave の `auth::require_admin`)。本番の到達経路は
-//! auth-worker からの Service Binding だけで、`workers_dev` / `preview_urls` / `routes` を持たない
-//! (wrangler.toml と scripts/check-exposure.sh が保証する)。staging だけはテストから叩くため
-//! `workers_dev = true` で、その workers.dev は Cloudflare Access で保護する。
+//! (`alc_core_wasm::require_tenant_header` と crates/leave の `auth::require_admin`)。本番・staging とも
+//! workers.dev を開けず (`workers_dev` / `preview_urls` = false、`routes` を持たない)、入口は Service Binding だけ
+//! (例外の `/internal/ingest` も Service Binding。wrangler.toml と scripts/check-exposure.sh が保証する)。
+//!
+//! 定時実行 (`scheduled`、本番だけ) は毎朝一番星と申請書を突き合わせ、ずれを LINE WORKS へ送る (crates/leave の `cron`)。
 
 // worker 本体は wasm32 専用。native の `cargo build` / `clippy` / `test` (workspace の root で打つもの) では空の crate にして、
 // crates/leave だけを検査させる
@@ -23,19 +24,36 @@ use alc_core_wasm::require_tenant_header;
 use axum::body::Body;
 use axum::http::{HeaderValue, Response, StatusCode};
 use axum::{middleware, Router};
+use chrono::{DateTime, Utc};
 use futures_util::lock::Mutex;
-use leave::{ingest_router, tenant_router, IngestState, LeaveState, LogSink, INGEST_PATH};
+use leave::cron::Notifier;
+use leave::{ingest_router, tenant_router, Clock, IngestState, LeaveState, LogSink, INGEST_PATH};
 use tower_service::Service;
-use worker::{console_error, event, Context, Env, HttpRequest, Result, WorkerVersionMetadata};
+use worker::{
+    console_error, console_log, event, Context, Date, Env, HttpRequest, Result, ScheduleContext,
+    ScheduledEvent, WorkerVersionMetadata,
+};
 
-use crate::bindings::{IchibanBinding, R2Pdfs};
+use crate::bindings::{AuthWorkerNotifier, IchibanBinding, NoNotifier, R2Pdfs};
 
 /// R2 の binding (本番と staging で別の bucket)
 const LEAVE_R2_BINDING: &str = "LEAVE_R2";
-/// 一番星 Worker の Service Binding (本番だけ。staging には置かない — 部門・社員の口は 503)
+/// 一番星 Worker の Service Binding (本番だけ。staging には置かない — 部門・社員・カレンダー・付与の口は 503)
 const ICHIBAN_DB_BINDING: &str = "ICHIBAN_DB";
-/// メール取り込みの口の共有 secret (Secrets Store の binding。`.get()` で実値にする)
+/// メール取り込みの口と LINE WORKS 送信 (auth-worker の内部 proxy) の共有 secret
+/// (Secrets Store の binding。`.get()` で実値にする)
 const INGEST_SECRET_BINDING: &str = "INTERNAL_SHARED_SECRET";
+/// auth-worker の Service Binding (本番だけ)。LINE WORKS への送信 (定時実行の通知) に使う
+const AUTH_WORKER_BINDING: &str = "AUTH_WORKER";
+
+/// 今の時刻 (JS の Date)
+fn now() -> DateTime<Utc> {
+    DateTime::from_timestamp_millis(Date::now().as_millis() as i64).unwrap_or_default()
+}
+
+fn clock() -> Clock {
+    Arc::new(now)
+}
 
 /// 管理 API は `/api` の下にだけ出す。tenant の layer は nest の中の全 route (と、その下で当たらない path) に掛かる。
 /// メール取り込みの口 `/internal/ingest` は nest の外 (tenant・admin の layer の外で、共有 secret で守る)
@@ -122,6 +140,7 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
         pdfs,
         ichiban,
         log: log_sink(),
+        now: clock(),
     };
     let mut resp = match router(state, ingest).call(req).await {
         Ok(r) => r,
@@ -140,4 +159,44 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
         }
     }
     Ok(resp)
+}
+
+/// 送信の口 (auth-worker の binding と共有 secret)。どちらかが無ければ送らない (警告は未通知のまま次の回へ残る)
+async fn notifier(env: &Env) -> Box<dyn Notifier> {
+    let Ok(fetcher) = env.service(AUTH_WORKER_BINDING) else {
+        console_error!("leave: cron no {AUTH_WORKER_BINDING} binding");
+        return Box::new(NoNotifier);
+    };
+    let secret = match env.secret_store(INGEST_SECRET_BINDING) {
+        Ok(store) => store.get().await.ok().flatten(),
+        Err(_) => None,
+    };
+    match secret {
+        Some(s) => Box::new(AuthWorkerNotifier::new(fetcher, s)),
+        None => {
+            console_error!("leave: cron no {INGEST_SECRET_BINDING} secret");
+            Box::new(NoNotifier)
+        }
+    }
+}
+
+/// 毎朝の突き合わせ (wrangler.toml の `[triggers]`、本番だけ)。中身は crates/leave の `cron::run`
+#[event(scheduled)]
+async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    let Ok(fetcher) = env.service(ICHIBAN_DB_BINDING) else {
+        console_error!("leave: cron no {ICHIBAN_DB_BINDING} binding");
+        return;
+    };
+    let ichiban = IchibanBinding::new(fetcher);
+    let mut pg = match db::connect(&env).await {
+        Ok(c) => c,
+        Err(e) => {
+            console_error!("leave: cron {e}");
+            return;
+        }
+    };
+    let notifier = notifier(&env).await;
+    let today = leave::ledger::jst_date(now());
+    let summary = leave::cron::run(&mut pg, &ichiban, notifier.as_ref(), today).await;
+    console_log!("leave: {}", summary.line());
 }

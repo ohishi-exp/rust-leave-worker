@@ -23,7 +23,9 @@ use axum::http::{Request, Response};
 use axum::{middleware, Router};
 use futures_util::future::BoxFuture;
 use futures_util::lock::Mutex;
+use leave::cron::{Notifier, NotifyError};
 use leave::ichiban::{IchibanApi, IchibanError, IchibanResponse};
+use leave::reconcile::days_paths;
 use leave::store::{PdfStore, StoreError};
 use leave::{ingest_router, tenant_router, IngestState, LeaveState, INGEST_PATH};
 use tokio::sync::OnceCell;
@@ -130,8 +132,8 @@ async fn migrate(su: &Client) {
             .file_name()
             .unwrap()
             .to_string_lossy()
-            .ends_with("_leave_tables.sql")),
-        "取り出した migrations に leave の表が無い (scripts/ALC_MIGRATIONS_REV が古い)"
+            .ends_with("_leave_enabled_tenants.sql")),
+        "取り出した migrations に leave の表と leave_enabled_tenants() (164) が無い (scripts/ALC_MIGRATIONS_REV が古い)"
     );
     for file in files {
         let name = file.file_name().unwrap().to_owned();
@@ -304,6 +306,84 @@ impl IchibanApi for FakeIchiban {
     }
 }
 
+/// テストの「今」(日本時間では 2026-10-10 の 9 時)
+pub const NOW: &str = "2026-10-10T00:00:00Z";
+
+/// 偽の LINE WORKS 送信 (送った (チャネル, 本文) を記録する)。`fail_calls` に入る回 (0 始まり) は失敗する
+#[derive(Default)]
+pub struct FakeNotifier {
+    pub sent: StdMutex<Vec<(Uuid, String)>>,
+    pub fail_calls: Vec<usize>,
+    pub calls: StdMutex<usize>,
+}
+
+impl Notifier for FakeNotifier {
+    fn send<'a>(
+        &'a self,
+        channel_id: Uuid,
+        text: &'a str,
+    ) -> BoxFuture<'a, Result<(), NotifyError>> {
+        Box::pin(async move {
+            let n = {
+                let mut c = self.calls.lock().unwrap();
+                *c += 1;
+                *c - 1
+            };
+            if self.fail_calls.contains(&n) {
+                return Err(NotifyError("status"));
+            }
+            self.sent
+                .lock()
+                .unwrap()
+                .push((channel_id, text.to_owned()));
+            Ok(())
+        })
+    }
+}
+
+/// 一番星の偽物の応答 (path → (状態, 本文))
+pub fn ichiban_with(pairs: &[(&str, u16, serde_json::Value)]) -> FakeIchiban {
+    FakeIchiban {
+        responses: pairs
+            .iter()
+            .map(|(p, s, v)| {
+                (
+                    (*p).to_owned(),
+                    IchibanResponse {
+                        status: *s,
+                        body: serde_json::to_vec(v).unwrap(),
+                    },
+                )
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// 一番星の休暇の口の応答を `from`〜`to` の区間ぶん (worker が呼ぶのと同じ 92 日ごとの path で) 登録する。
+/// 各区間の本文は `rows` のうち日付がその区間に入るもの
+pub fn add_days(f: &mut FakeIchiban, from: &str, to: &str, rows: &[serde_json::Value]) {
+    for path in days_paths(from.parse().unwrap(), to.parse().unwrap()) {
+        let (_, q) = path.split_once("?from=").unwrap();
+        let (a, b) = q.split_once("&to=").unwrap();
+        let data: Vec<_> = rows
+            .iter()
+            .filter(|r| {
+                let d = r["date"].as_str().unwrap();
+                a <= d && d <= b
+            })
+            .cloned()
+            .collect();
+        f.responses.insert(
+            path.clone(),
+            IchibanResponse {
+                status: 200,
+                body: serde_json::to_vec(&serde_json::json!({ "data": data })).unwrap(),
+            },
+        );
+    }
+}
+
 pub struct App {
     pub router: Router,
     pub pdfs: Arc<FakePdfs>,
@@ -318,6 +398,11 @@ pub async fn app(pdfs: FakePdfs, ichiban: Option<FakeIchiban>) -> App {
 
 /// 接続が切れた DB (backend を落とした接続) で組み立てる (DB のエラーの経路を通すため)
 pub async fn app_with_broken_db(ichiban: Option<FakeIchiban>) -> App {
+    build(broken_client().await, FakePdfs::default(), ichiban)
+}
+
+/// 接続が切れた `alc_api_app` の接続 (backend を落とした接続)
+pub async fn broken_client() -> PgClient {
     let mut pg = app_client().await;
     let pid: i32 = pg
         .tenant_tx(Uuid::new_v4(), |tx| {
@@ -335,7 +420,7 @@ pub async fn app_with_broken_db(ichiban: Option<FakeIchiban>) -> App {
         .unwrap()
         .get(0);
     assert!(terminated);
-    build(pg, FakePdfs::default(), ichiban)
+    pg
 }
 
 fn build(pg: PgClient, pdfs: FakePdfs, ichiban: Option<FakeIchiban>) -> App {
@@ -348,6 +433,7 @@ fn build(pg: PgClient, pdfs: FakePdfs, ichiban: Option<FakeIchiban>) -> App {
         pdfs: pdfs.clone(),
         ichiban: ichiban.clone().map(|i| i as Arc<dyn IchibanApi>),
         log: Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_owned())),
+        now: Arc::new(|| NOW.parse().unwrap()),
     };
     let ingest_state = IngestState {
         pg: state.pg.clone(),

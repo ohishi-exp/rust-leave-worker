@@ -677,6 +677,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tower",
+ "unicode-normalization",
  "uuid",
 ]
 
@@ -1044,10 +1045,12 @@ dependencies = [
  "alc-core-wasm",
  "alc-worker-db",
  "axum",
+ "chrono",
  "futures-util",
  "leave",
  "tokio-postgres",
  "tower-service",
+ "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "worker",

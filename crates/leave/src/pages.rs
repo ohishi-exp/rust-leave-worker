@@ -75,7 +75,7 @@ pub struct ListQuery {
     pub offset: i64,
 }
 
-fn non_empty(v: Option<String>) -> Option<String> {
+pub(crate) fn non_empty(v: Option<String>) -> Option<String> {
     v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
 }
 

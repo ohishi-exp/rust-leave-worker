@@ -1,15 +1,19 @@
-//! crates/leave の trait の Workers での実装: R2 の binding (`LEAVE_R2`) と一番星 Worker の Service Binding (`ICHIBAN_DB`)。
+//! crates/leave の trait の Workers での実装: R2 の binding (`LEAVE_R2`)・一番星 Worker の Service Binding (`ICHIBAN_DB`)・
+//! LINE WORKS への送信 (auth-worker の Service Binding `AUTH_WORKER`)。
 //!
 //! 値と future は JS の値で `Send` でないので、`worker::send` の `SendWrapper`・`SendFuture` で包む (Workers は単一 thread)。
 //! エラーは段の名前だけに落とす (**key・ランタイムの生のエラー文はログに出さない**)。
 //!
-//! このファイルは wasm 専用で、CI のテストと coverage の gate の外 (確かめるのは staging の実物)。
+//! このファイルは wasm 専用で、CI のテストと coverage の gate の外 (確かめるのは staging / 本番の実物)。
 
 use futures_util::future::BoxFuture;
+use leave::cron::{send_body, Notifier, NotifyError, LINEWORKS_SEND_URL};
 use leave::ichiban::{IchibanApi, IchibanError, IchibanResponse};
 use leave::store::{PdfStore, StoreError};
+use uuid::Uuid;
+use wasm_bindgen::JsValue;
 use worker::send::{SendFuture, SendWrapper};
-use worker::{Bucket, Fetcher, Method, Request, RequestInit};
+use worker::{Bucket, Fetcher, Headers, Method, Request, RequestInit};
 
 /// R2 の bucket (binding `LEAVE_R2`)
 pub struct R2Pdfs(SendWrapper<Bucket>);
@@ -82,5 +86,64 @@ impl IchibanApi for IchibanBinding {
                 body: body.to_vec(),
             })
         }))
+    }
+}
+
+/// auth-worker (Service Binding `AUTH_WORKER`) の内部 proxy 経由で LINE WORKS へ送る。
+/// `X-Alc-Proxy-Secret` は Secrets Store の共有 secret (consumer worker の証明)。応答の本文は読まない
+pub struct AuthWorkerNotifier {
+    fetcher: SendWrapper<Fetcher>,
+    secret: String,
+}
+
+impl AuthWorkerNotifier {
+    pub fn new(fetcher: Fetcher, secret: String) -> Self {
+        Self {
+            fetcher: SendWrapper::new(fetcher),
+            secret,
+        }
+    }
+}
+
+impl Notifier for AuthWorkerNotifier {
+    fn send<'a>(
+        &'a self,
+        channel_id: Uuid,
+        text: &'a str,
+    ) -> BoxFuture<'a, Result<(), NotifyError>> {
+        Box::pin(SendFuture::new(async move {
+            let headers = Headers::new();
+            headers
+                .set("X-Alc-Proxy-Secret", &self.secret)
+                .map_err(|_| NotifyError("headers"))?;
+            headers
+                .set("Content-Type", "application/json")
+                .map_err(|_| NotifyError("headers"))?;
+            let mut init = RequestInit::new();
+            init.with_method(Method::Post)
+                .with_headers(headers)
+                .with_body(Some(JsValue::from_str(&send_body(channel_id, text))));
+            let req = Request::new_with_init(LINEWORKS_SEND_URL, &init)
+                .map_err(|_| NotifyError("request"))?;
+            let resp = self
+                .fetcher
+                .fetch_request(req)
+                .await
+                .map_err(|_| NotifyError("fetch"))?;
+            if (200..300).contains(&resp.status().as_u16()) {
+                Ok(())
+            } else {
+                Err(NotifyError("status"))
+            }
+        }))
+    }
+}
+
+/// 送れない (binding か secret が無い)。警告は未通知のまま残り、次の回に送る
+pub struct NoNotifier;
+
+impl Notifier for NoNotifier {
+    fn send<'a>(&'a self, _: Uuid, _: &'a str) -> BoxFuture<'a, Result<(), NotifyError>> {
+        Box::pin(async { Err(NotifyError("not_configured")) })
     }
 }
