@@ -4,8 +4,7 @@
 #   本番 (トップレベル) の到達経路は auth-worker からの Service Binding だけにする:
 #   - workers_dev = false / preview_urls = false (*.workers.dev と preview URL を開けない)
 #   - route / routes / custom_domain を書かない
-#   staging (env.staging) だけはテストから叩くため workers_dev = true にし、その workers.dev の
-#   ホスト名は Cloudflare Access で保護する。workers_dev = true を許すのは env.staging だけ。
+#   本番・staging とも workers.dev を開けない。入口は Service Binding だけ (どの env も workers_dev / preview_urls を false にする)。
 #   scripts/check-exposure.sh が CI で毎回これを検査する。
 # ★ 表の順を変えない・前の方に表を足さない (scripts/check-exposure-test.sh の陰性対照は、特定の表の
 #   直前に行を挿して崩す作り。CLAUDE.md)。新しい表は placement の表より後に置く。
@@ -51,6 +50,13 @@ bucket_name = "leave-pdfs"
 binding = "ICHIBAN_DB"
 service = "ichibanboshi-ichiban"
 
+# メール取り込みの口 (/internal/ingest) の共有 secret。ippoan/email-receiver の wrangler.toml と同じ Secrets Store の
+# secret (値は repo に無い。worker では `.get()` で実値にする)。binding は env に継承されないので staging にも書く
+[[secrets_store_secrets]]
+binding = "INTERNAL_SHARED_SECRET"
+store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
+secret_name = "INTERNAL_SHARED_SECRET"
+
 # auth-worker (Service Binding)。定時実行の LINE WORKS 通知を内部 proxy 経由で送る (src/bindings.rs)。本番だけに置く
 [[services]]
 binding = "AUTH_WORKER"
@@ -65,7 +71,7 @@ crons = ["0 22 * * *"]
 # 既存の Tunnel 経由で PgBouncer へ繋ぐ。src/db.rs)。Hyperdrive は通さない。ICHIBAN_DB は無い (部門・社員の口は 503)。
 [env.staging]
 name = "rust-leave-worker-staging"
-workers_dev = true
+workers_dev = false
 preview_urls = false
 
 [env.staging.observability]
@@ -91,6 +97,11 @@ remote = true
 [[env.staging.r2_buckets]]
 binding = "LEAVE_R2"
 bucket_name = "leave-pdfs-staging"
+
+[[env.staging.secrets_store_secrets]]
+binding = "INTERNAL_SHARED_SECRET"
+store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
+secret_name = "INTERNAL_SHARED_SECRET"
 
 # 定時実行は本番だけ (トップレベルの triggers を継承させない)
 [env.staging.triggers]

@@ -21,7 +21,7 @@ env:
 
 jobs:
   # 先頭の check-exposure.sh は「外から素で届かない」(本番は workers_dev / preview_urls = false、
-  # route / routes 無し。workers_dev = true は Cloudflare Access で守る env.staging だけ) の検査 —
+  # route / routes 無し。どの env も workers_dev / preview_urls = true にしない) の検査 —
   # この Worker は X-Tenant-ID / X-User-Role を信頼するので、崩れたら外から管理 API に届く。
   # check-exposure-test.sh はその陰性対照 (wrangler.toml を崩すと exit 1 になること)。
   leave-worker:
@@ -75,9 +75,9 @@ jobs:
           cargo llvm-cov --locked -p leave --no-report 2>&1 | tee "$RUNNER_TEMP/leave-test.txt"
           # target ごとの結果の行だけを見る (ほかの target の行と取り違えない)
           awk '/Running unittests src\/lib\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/leave-test.txt" \
-            | grep -Eq '^test result: ok\. 57 passed; 0 failed; 0 ignored'
+            | grep -Eq '^test result: ok\. 65 passed; 0 failed; 0 ignored'
           awk '/Running tests\/api_db\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/leave-test.txt" \
-            | grep -Eq '^test result: ok\. 35 passed; 0 failed; 0 ignored'
+            | grep -Eq '^test result: ok\. 41 passed; 0 failed; 0 ignored'
           awk '/Running tests\/cron_db\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/leave-test.txt" \
             | grep -Eq '^test result: ok\. 6 passed; 0 failed; 0 ignored'
           # -p を付けないと直下の package (worker) だけが対象になり、報告が空になる
