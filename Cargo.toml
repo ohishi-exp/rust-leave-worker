@@ -1,0 +1,42 @@
+# 休暇申請書 (PDF) の管理 API の Worker (Refs #1)。型は ippoan/alc-vein-worker・ippoan/alc-dtako-worker と同じ。
+# 直下の package が worker、route の crate は crates/leave (同じ workspace・lock は直下の 1 つ)。
+#
+# 口と検証は crates/leave に在り、この Worker が持つのは DB への経路 (`src/db.rs`)・R2 と一番星 Worker の
+# binding を crate の trait に載せる実装 (`src/bindings.rs`)・workers-rs への載せ方 (`src/lib.rs`) だけ。
+[package]
+name = "rust-leave-worker"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[workspace]
+members = ["crates/leave"]
+
+# alc-core-wasm と alc-worker-db は ippoan/alc-worker-kit から引く。git 依存・rev 固定で、**2 つとも同じ rev**
+# (ippoan/alc-vein-worker と同じ rev)。**書くのはここ 1 か所だけ** (worker と crates/leave は `workspace = true` で継承する)。
+# 出どころが 2 つになると `TenantId` (alc-core-wasm)・`PgClient` (alc-worker-db) が別の型になり、
+# コンパイルは通るのに全リクエストが 500 になる。rev を上げるときは 2 つを一緒に上げ、Cargo.lock も一緒に更新する。
+[workspace.dependencies]
+alc-core-wasm = { git = "https://github.com/ippoan/alc-worker-kit", rev = "5a3b749e891a68f026b53b4402e8861d3aeb3639" }
+alc-worker-db = { git = "https://github.com/ippoan/alc-worker-kit", rev = "5a3b749e891a68f026b53b4402e8861d3aeb3639", features = ["chrono"] }
+
+# 使わない依存は入れない
+[dependencies]
+alc-core-wasm = { workspace = true }
+alc-worker-db = { workspace = true }
+axum = { version = "0.8", default-features = false }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+leave = { path = "crates/leave" }
+tokio-postgres = { version = "0.7", default-features = false, features = ["js"] }
+tower-service = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+worker = { version = "0.8", features = ["http", "axum", "tokio-postgres"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
