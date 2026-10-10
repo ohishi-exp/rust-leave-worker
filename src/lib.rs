@@ -27,7 +27,10 @@ use axum::{middleware, Router};
 use chrono::{DateTime, Utc};
 use futures_util::lock::Mutex;
 use leave::cron::Notifier;
-use leave::{ingest_router, tenant_router, Clock, IngestState, LeaveState, LogSink, INGEST_PATH};
+use leave::{
+    ingest_router, tenant_router, Clock, IngestState, LeaveState, LogSink, INGEST_PATH,
+    TEST_NOTIFY_PATH,
+};
 use tower_service::Service;
 use worker::{
     console_error, console_log, event, Context, Date, Env, HttpRequest, Result, ScheduleContext,
@@ -127,6 +130,12 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
     } else {
         None
     };
+    // 送信の口 (secret の取得を伴う) はテスト送信の口へのリクエストでだけ組む。ほかの口は使わない
+    let notifier: Arc<dyn Notifier> = if req.uri().path() == TEST_NOTIFY_PATH {
+        Arc::from(notifier(&env).await)
+    } else {
+        Arc::new(NoNotifier)
+    };
     let pg = Arc::new(Mutex::new(pg));
     let pdfs = Arc::new(R2Pdfs::new(bucket));
     let ingest = IngestState {
@@ -139,6 +148,7 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
         pg,
         pdfs,
         ichiban,
+        notifier,
         log: log_sink(),
         now: clock(),
     };
@@ -161,7 +171,8 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
     Ok(resp)
 }
 
-/// 送信の口 (auth-worker の binding と共有 secret)。どちらかが無ければ送らない (警告は未通知のまま次の回へ残る)
+/// 送信の口 (auth-worker の binding と共有 secret)。どちらかが無ければ送らない (警告は未通知のまま次の回へ残る。
+/// テスト送信の口は 503 `notify_unavailable`)。cron とテスト送信の口で共用する
 async fn notifier(env: &Env) -> Box<dyn Notifier> {
     let Ok(fetcher) = env.service(AUTH_WORKER_BINDING) else {
         console_error!("leave: cron no {AUTH_WORKER_BINDING} binding");

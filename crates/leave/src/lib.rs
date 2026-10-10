@@ -28,4 +28,4 @@ pub mod settings;
 pub mod store;
 
 pub use internal::{ingest_router, IngestState, INGEST_PATH};
-pub use routes::{tenant_router, Clock, LeaveState, LogSink};
+pub use routes::{tenant_router, Clock, LeaveState, LogSink, TEST_NOTIFY_PATH, TEST_NOTIFY_TEXT};
