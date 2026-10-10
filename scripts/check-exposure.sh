@@ -6,9 +6,9 @@
 # Service Binding だけでなければならない (ippoan/rust-alc-api#556 と同じ穴を開けない)。
 #   - トップレベル (本番): workers_dev = false と preview_urls = false が明示されている
 #   - どこにも (トップレベル・env 配下とも) route / routes が無い (custom_domain も routes の中に書く)
-#   - workers_dev / preview_urls が true になってよいのは env.staging だけ
+#   - どの env (staging を含む) にも workers_dev = true / preview_urls = true が無い
+#     (入口は Service Binding だけ。トップレベルの true を env が継承するのも不可)
 #   - どの vars にも ALLOW_INSECURE_DB (DB への平文接続を許すローカル専用フラグ) が無い
-#     (staging の workers.dev は Cloudflare Access で保護する前提。README 参照)
 #   - トップレベル (本番) に平文 (NoTls + trust) で繋ぐ DB の binding が無い: vpc_services /
 #     vpc_networks (Workers VPC)。src/db.rs はこの binding を Hyperdrive の binding LEAVE_HYPERDRIVE →
 #     文字列 DATABASE_URL より先に見るので、本番に紛れると TLS を強制する経路を飛ばして平文に落ちる。
@@ -16,11 +16,11 @@
 #   - どの階層にも (トップレベル・env 配下とも) durable_objects と containers が無い
 #     (この worker は Durable Object も Container も持たない)
 #   - env 配下 (env.staging を含む) に hyperdrive が無い (ippoan/rust-alc-api#723)。Hyperdrive の binding は本番の DB へ
-#     届くので、トップレベル (本番) にだけ置く (workers.dev が開いている staging に置かない)
+#     届くので、トップレベル (本番) にだけ置く (staging に置かない)
 #   - env 配下の r2_buckets に本番の bucket (bucket_name = "leave-pdfs" 完全一致) が無い
 #     (staging が本番の bucket を指すと、本番の申請書を読み書きする)
 #   - env 配下 (env.staging を含む) に services が無い。一番星 Worker (ICHIBAN_DB) は本番の社員マスタを返すので、
-#     workers.dev が開いている staging から引かせない (一番星 Worker に staging は無い)
+#     staging から引かせない (一番星 Worker に staging は無い)
 # 違えば exit 1。CI で毎回走らせる。陰性対照は scripts/check-exposure-test.sh。
 #
 #   bash scripts/check-exposure.sh [wrangler.toml]
@@ -54,11 +54,11 @@ for scope, table in [("トップレベル", cfg)] + [(f"env.{n}", e) for n, e in
         if key in table:
             err(f"{scope} に {key} がある (外から直接届く)")
 
-# 公開してよいのは Access で守る env.staging だけ (workers_dev / preview_urls は env へ継承される)
+# どの env も公開しない (workers_dev / preview_urls は env へ継承される)
 for name, e in envs.items():
     for key in ("workers_dev", "preview_urls"):
-        if e.get(key, cfg.get(key)) is True and name != "staging":
-            err(f"env.{name} の {key} が true (公開してよいのは Access で守る env.staging だけ)")
+        if e.get(key, cfg.get(key)) is True:
+            err(f"env.{name} の {key} が true (どの env も workers.dev / preview URL を開けない)")
 
 # 平文の DB 接続を許すフラグはローカル (wrangler dev --var / .dev.vars) にだけ置く
 for scope, table in [("トップレベル", cfg)] + [(f"env.{n}", e) for n, e in envs.items()]:
@@ -76,7 +76,7 @@ for scope, table in [("トップレベル", cfg)] + [(f"env.{n}", e) for n, e in
         if key in table:
             err(f"{scope} に {key} がある (この worker は Durable Object も Container も持たない)")
 
-# Hyperdrive の binding は本番の DB へ届く。workers.dev が開いている staging を含め、env 配下には置かない
+# Hyperdrive の binding は本番の DB へ届く。staging を含め、env 配下には置かない
 for name, e in envs.items():
     if e.get("hyperdrive"):
         err(f"env.{name} に hyperdrive がある (本番の DB へ届く binding。トップレベルにだけ置く)")
@@ -94,5 +94,5 @@ for name, e in envs.items():
 
 if errors:
     sys.exit(1)
-print(f"OK: {path} は本番が workers_dev / preview_urls = false・route 無しで、公開する env は staging だけ")
+print(f"OK: {path} は本番が workers_dev / preview_urls = false・route 無しで、どの env も workers.dev を開けない")
 PY
