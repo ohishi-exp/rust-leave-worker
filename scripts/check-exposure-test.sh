@@ -32,6 +32,10 @@ PY
 }
 
 expect 0 "wrangler.toml そのまま" wrangler.toml
+mutate "staging で workers_dev = true" \
+  's = s.replace("name = \"rust-leave-worker-staging\"\nworkers_dev = false", "name = \"rust-leave-worker-staging\"\nworkers_dev = true", 1)'
+mutate "staging で preview_urls = true" \
+  's = s.replace("preview_urls = false\n\n[env.staging.observability]", "preview_urls = true\n\n[env.staging.observability]", 1)'
 mutate "staging 以外の env で workers_dev = true" \
   's += "\n[env.dev]\nname = \"leave-dev\"\nworkers_dev = true\n"'
 mutate "staging 以外の env で preview_urls = true" \

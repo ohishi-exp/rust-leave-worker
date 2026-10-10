@@ -16,7 +16,7 @@ DB テストは使い捨ての postgres:17 に向ける。URL が無ければ失
 
 ## 規範
 - 口は `/api/leave/…` だけ。**全部の口が管理者限定** (`auth::is_admin` の 1 か所)。403 のテストも足す。
-- 公開範囲を弱めない: 本番は Service Binding だけ (`workers_dev`/`preview_urls` = false、route 無し)。
+- 公開範囲を弱めない: 本番・staging とも Service Binding だけ (どの env も `workers_dev`/`preview_urls` = false、route 無し)。
   `ICHIBAN_DB` (本番の社員マスタ)・Hyperdrive は本番だけ、staging の R2 は staging の bucket。
   `wrangler.toml` の表の順を変えない (新しい表は placement より後)。
 - DB は `PgClient::tenant_tx` + `query_typed` 系だけ。SQL は `crates/leave/src/pg.rs` の 1 か所。

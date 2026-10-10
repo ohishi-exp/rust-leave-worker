@@ -104,38 +104,13 @@ jobs:
           grep -oE '[0-9A-Fa-f]{32}' "$log" | sort -u | while read -r hex; do
             echo "::add-mask::${hex}"
           done
-          url=$(grep -oE 'https://[A-Za-z0-9.-]+\.workers\.dev' "$log" | head -1 || true)
-          if [ -n "$url" ]; then
-            echo "::add-mask::${url}"
-            echo "::add-mask::${url#https://}"
-            echo "$url" >"$RUNNER_TEMP/staging-url"
-          fi
-          sed -E -e 's#[A-Za-z0-9.-]+\.workers\.dev#<staging>#g' -e 's#[0-9A-Fa-f]{32}#<account>#g' "$log"
+          sed -E -e 's#[A-Za-z0-9.-]+\.workers\.dev#<workers-dev>#g' -e 's#[0-9A-Fa-f]{32}#<account>#g' "$log"
           [ "$status" = 0 ] || exit "$status"
-          [ -n "$url" ] || { echo "::error::wrangler の出力に staging の URL が無い"; exit 1; }
-      # Access が効いていること: token 無しは Worker に届かず、Access が 302 (ログインへ) か 403 を返す。
-      # deploy が途中で失敗しても Worker はアップロード済みのことがあるので、deploy が走った限り必ず確かめる
-      - name: token 無しの /api/leave/settings が Access に止められる
-        if: ${{ !cancelled() && steps.deploy.outcome != 'skipped' }}
-        run: |
-          if [ ! -s "$RUNNER_TEMP/staging-url" ]; then
-            echo "::warning::wrangler の出力に staging の URL が無いので Access の検査を skip (Worker の公開状態は dashboard で確かめること)"
-            exit 0
+          # staging も workers_dev = false なので workers.dev の URL は出ないはず (出たら公開されている)
+          if grep -qE '[A-Za-z0-9.-]+\.workers\.dev' "$log"; then
+            echo "::error::staging に workers.dev の URL が付いた (workers_dev = false のはず。直ちに止めること)"
+            exit 1
           fi
-          url=$(cat "$RUNNER_TEMP/staging-url")
-          # デプロイ直後は workers.dev のルートが行き渡るまで 404 が返る。404 だけは
-          # 10 秒おきに最大 12 回待つ。200 (Access が効いていない) とその他のコードは即 fail
-          for i in $(seq 1 12); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' "${url}/api/leave/settings")
-            echo "[${i}/12] token 無しの GET <staging>/api/leave/settings → ${code}"
-            case "$code" in
-              302|403) exit 0 ;;
-              404) [ "$i" -lt 12 ] && sleep 10 ;;
-              *) echo "::error::token 無しで ${code} (Access が効いていない。直ちに止めること)"; exit 1 ;;
-            esac
-          done
-          echo "::error::token 無しで 12 回とも 404 (workers.dev のルートが行き渡らない。Access の状態も dashboard で確かめること)"
-          exit 1
 
   deploy-prod:
     name: deploy production
