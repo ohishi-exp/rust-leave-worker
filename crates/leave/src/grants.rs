@@ -923,13 +923,9 @@ mod tests {
                 deletes: vec!["1023".into()],
             }
         );
-        for bad in ["2026-9-30", "2026-02-30", "", "2026/09/30"] {
-            assert_eq!(
-                validate_opening(put_input(bad, vec![])),
-                Err("invalid_as_of"),
-                "{bad}"
-            );
-        }
+        let bad_dates = ["2026-9-30", "2026-02-30", "", "2026/09/30"]
+            .map(|bad| validate_opening(put_input(bad, vec![])));
+        assert_eq!(bad_dates, [const { Err("invalid_as_of") }; 4]);
         let many = vec![("1021", None, None); MAX_OPENING_ROWS + 1];
         assert_eq!(
             validate_opening(put_input("2026-09-30", many)),
