@@ -1,0 +1,34 @@
+# 行カバレッジ 100% の登録簿 (ippoan/alc-vein-worker・ippoan/alc-dtako-worker の同名のファイルの形。Refs #1)。
+#
+#   bash scripts/fetch-migrations.sh
+#   LEAVE_TEST_ADMIN_DATABASE_URL=... cargo llvm-cov --locked -p leave --text > cov-leave.txt
+#   bash scripts/check_coverage_100.sh --use-cache cov-leave.txt
+#
+# 計測するのは `cargo test -p leave` の全部 = 各 module の単体テスト (純粋関数) と tests/api_db.rs
+# (口から実 DB・偽の PDF 置き場・偽の一番星まで。接続先が無ければ失敗する)。
+# lib.rs は mod 宣言だけ、store.rs は trait だけで実行行が無いので登録しない。
+# worker 本体 (直下の src/、wasm 専用。R2・Service Binding の実装 src/bindings.rs を含む) は native で計測できないので対象外。
+
+# 管理者の判定 (1 か所) と操作した人
+[[files]]
+path = "crates/leave/src/auth.rs"
+
+# 設定の入力の検証 (mailbox・grace_days・一覧の掃除)
+[[files]]
+path = "crates/leave/src/settings.rs"
+
+# 一覧の条件・期間・紐づけの更新の検証
+[[files]]
+path = "crates/leave/src/pages.rs"
+
+# 一番星の社員の応答の解釈と部門での絞り込み
+[[files]]
+path = "crates/leave/src/ichiban.rs"
+
+# SQL を流す 1 か所 (tests/api_db.rs が実 DB で通す)
+[[files]]
+path = "crates/leave/src/pg.rs"
+
+# 口 (400 / 403 / 404 / 409 / 500 / 502 / 503 の本文とログまで)
+[[files]]
+path = "crates/leave/src/routes.rs"
