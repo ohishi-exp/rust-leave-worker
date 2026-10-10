@@ -21,7 +21,7 @@ env:
 
 jobs:
   # 先頭の check-exposure.sh は「外から素で届かない」(本番は workers_dev / preview_urls = false、
-  # route / routes 無し。workers_dev = true は Cloudflare Access で守る env.staging だけ) の検査 —
+  # route / routes 無し。どの env も workers_dev / preview_urls = true にしない) の検査 —
   # この Worker は X-Tenant-ID / X-User-Role を信頼するので、崩れたら外から管理 API に届く。
   # check-exposure-test.sh はその陰性対照 (wrangler.toml を崩すと exit 1 になること)。
   leave-worker:
