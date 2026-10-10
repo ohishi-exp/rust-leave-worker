@@ -32,3 +32,23 @@ path = "crates/leave/src/pg.rs"
 # 口 (400 / 403 / 404 / 409 / 500 / 502 / 503 の本文とログまで)
 [[files]]
 path = "crates/leave/src/routes.rs"
+
+# 品名N の正規化 (一番星の休暇入力 → 区分)
+[[files]]
+path = "crates/leave/src/kinds.rs"
+
+# 有給の法定付与・FIFO の残・付与の入力の検証
+[[files]]
+path = "crates/leave/src/grants.rs"
+
+# 一番星と申請書の突き合わせ・カレンダーの日・通知の文面
+[[files]]
+path = "crates/leave/src/reconcile.rs"
+
+# カレンダーと付与台帳の口 (tests/api_db.rs が実 DB で通す)
+[[files]]
+path = "crates/leave/src/ledger.rs"
+
+# 毎朝の突き合わせ (tests/cron_db.rs が実 DB・偽の一番星・偽の送信で通す)
+[[files]]
+path = "crates/leave/src/cron.rs"

@@ -5,30 +5,14 @@ mod support;
 
 use std::collections::HashMap;
 
-use leave::ichiban::{IchibanResponse, DEPARTMENTS_PATH, EMPLOYEES_PATH};
+use leave::ichiban::{DEPARTMENTS_PATH, EMPLOYEES_PATH};
 use serde_json::{json, Value};
-use support::{app, call, lineworks_channel, page, tenant, App, FakeIchiban, FakePdfs};
+use support::{
+    app, call, ichiban_with, lineworks_channel, page, tenant, App, FakeIchiban, FakePdfs,
+};
 use uuid::Uuid;
 
 const ADMIN: Option<&str> = Some("admin");
-
-fn ichiban_with(pairs: &[(&str, u16, Value)]) -> FakeIchiban {
-    FakeIchiban {
-        responses: pairs
-            .iter()
-            .map(|(p, s, v)| {
-                (
-                    (*p).to_owned(),
-                    IchibanResponse {
-                        status: *s,
-                        body: serde_json::to_vec(v).unwrap(),
-                    },
-                )
-            })
-            .collect(),
-        ..Default::default()
-    }
-}
 
 fn employees_body() -> Value {
     json!({
@@ -149,6 +133,43 @@ mod forbidden {
     #[tokio::test]
     async fn get_pdf() {
         assert_forbidden("GET", "/api/leave/pages/{id}/pdf", None).await;
+    }
+
+    #[tokio::test]
+    async fn calendar() {
+        assert_forbidden(
+            "GET",
+            "/api/leave/calendar?employee_cd=1021&month=2026-10",
+            None,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn list_grants() {
+        assert_forbidden("GET", "/api/leave/grants?employee_cd=1021", None).await;
+    }
+
+    #[tokio::test]
+    async fn create_grant() {
+        let body = json!({"employee_cd": "1021", "grant_date": "2026-04-01", "days": 1});
+        assert_forbidden("POST", "/api/leave/grants", Some(body)).await;
+    }
+
+    #[tokio::test]
+    async fn auto_grants() {
+        assert_forbidden("POST", "/api/leave/grants/auto?employee_cd=1021", None).await;
+    }
+
+    #[tokio::test]
+    async fn update_grant() {
+        let body = json!({"days": 1, "expires_on": "2028-01-01"});
+        assert_forbidden("PUT", "/api/leave/grants/{id}", Some(body)).await;
+    }
+
+    #[tokio::test]
+    async fn delete_grant() {
+        assert_forbidden("DELETE", "/api/leave/grants/{id}", None).await;
     }
 }
 
@@ -701,6 +722,671 @@ async fn db_errors_are_500() {
     for line in logs.iter() {
         assert!(
             !line.contains(&t.to_string()) && !line.contains(&p.to_string()),
+            "{line}"
+        );
+    }
+}
+
+// ---- カレンダーと有給の付与台帳 (ledger) ----
+
+fn ledger_employees() -> Value {
+    json!({"data": [
+        {"employee_code": "1021", "employee_name": "山田太郎", "dept_code": "10", "hire_date": "2024-04-01", "retire_date": null},
+        {"employee_code": "1030", "employee_name": "甲", "dept_code": "10", "hire_date": null, "retire_date": null},
+        {"employee_code": "2001", "employee_name": "乙", "dept_code": "20", "hire_date": "2020-04-01", "retire_date": null}
+    ]})
+}
+
+fn day(code: &str, date: &str, item: &str) -> Value {
+    json!({"employee_code": code, "date": date, "item_name": item})
+}
+
+/// 1021 の一番星の休暇 (付与台帳の今日 = 2026-10-10 とカレンダーの 2026-10 の両方の区間で登録する)
+fn ledger_ichiban(rows: &[Value]) -> FakeIchiban {
+    let mut f = ichiban_with(&[(EMPLOYEES_PATH, 200, ledger_employees())]);
+    support::add_days(&mut f, "2024-04-01", "2026-10-10", rows);
+    support::add_days(&mut f, "2024-04-01", "2026-10-31", rows);
+    f
+}
+
+fn ledger_rows() -> Vec<Value> {
+    vec![
+        day("1021", "2025-01-10", "有休"),
+        day("1021", "2025-11-01", "午前休"),
+        day("1021", "2026-03-02", "労災"),
+        day("1021", "2026-10-01", "有休（積置）"),
+        day("1021", "2026-10-02", "有休"),
+        day("1021", "2026-10-05", "午前休"),
+        day("1021", "2026-10-06", "労災"),
+        day("1021", "2026-10-07", "謎"),
+        day("1021", "2026-10-09", "休み"),
+        day("2001", "2026-10-01", "有休"),
+    ]
+}
+
+async fn ledger_app(t: Uuid) -> App {
+    let a = app(FakePdfs::default(), Some(ledger_ichiban(&ledger_rows()))).await;
+    assert_eq!(
+        put_settings(&a, t, json!({"dept_codes": ["10"]}))
+            .await
+            .status,
+        200
+    );
+    a
+}
+
+#[tokio::test]
+async fn grants_auto_manual_edit_delete_and_balance() {
+    let t = tenant().await;
+    let a = ledger_app(t).await;
+    // 法定付与: 入社 2024-04-01 → 2024-10-01 (10 日)・2025-10-01 (11 日)・2026-10-01 (12 日)
+    let got = call(
+        &a,
+        "POST",
+        "/api/leave/grants/auto?employee_cd=1021",
+        Some(t),
+        ADMIN,
+        None,
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(
+        got.json(),
+        json!({"employee_cd": "1021", "hire_date": "2024-04-01", "inserted": 3, "computed": [
+        {"grant_date": "2024-10-01", "days": 10.0, "expires_on": "2026-10-01"},
+        {"grant_date": "2025-10-01", "days": 11.0, "expires_on": "2027-10-01"},
+        {"grant_date": "2026-10-01", "days": 12.0, "expires_on": "2028-10-01"}]})
+    );
+    let again = call(
+        &a,
+        "POST",
+        "/api/leave/grants/auto?employee_cd=1021",
+        Some(t),
+        ADMIN,
+        None,
+    )
+    .await;
+    assert_eq!(again.json()["inserted"], 0);
+    // 入社日の無い乗務員は付与しない
+    let none = call(
+        &a,
+        "POST",
+        "/api/leave/grants/auto?employee_cd=1030",
+        Some(t),
+        ADMIN,
+        None,
+    )
+    .await;
+    assert_eq!(
+        none.json(),
+        json!({"employee_cd": "1030", "hire_date": null, "inserted": 0, "computed": []})
+    );
+
+    // 手で足す (manual)。同じ付与日は 409
+    let body =
+        json!({"employee_cd": "1021", "grant_date": "2026-04-01", "days": 3.5, "note": " 前職 "});
+    let got = call(
+        &a,
+        "POST",
+        "/api/leave/grants",
+        Some(t),
+        ADMIN,
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(got.status, 201);
+    let manual = got.json();
+    assert_eq!(
+        (
+            manual["source"].as_str(),
+            manual["days"].as_f64(),
+            manual["expires_on"].as_str(),
+            manual["note"].as_str()
+        ),
+        (Some("manual"), Some(3.5), Some("2028-04-01"), Some("前職"))
+    );
+    let dup = call(&a, "POST", "/api/leave/grants", Some(t), ADMIN, Some(body)).await;
+    assert_eq!(
+        (dup.status, dup.json()),
+        (409, json!({"error": "grant_exists"}))
+    );
+
+    // 一覧と残 (今日 = 2026-10-10)。2024-10-01 の付与は 2025-01-10 (1)・2025-11-01 (0.5) を消化して 8.5 日が失効、
+    // 2026-10-01・02・05 (2.5) は 2025-10-01 の付与から
+    let got = call(
+        &a,
+        "GET",
+        "/api/leave/grants?employee_cd=1021",
+        Some(t),
+        ADMIN,
+        None,
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    let v = got.json();
+    assert_eq!(
+        v["balance"],
+        json!({"as_of": "2026-10-10", "remaining": 24.0, "expired": 8.5, "unallocated": 0.0, "consumption_from": "2024-04-01"})
+    );
+    let rows: Vec<(String, String, f64, f64, f64)> = v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| {
+            (
+                g["grant_date"].as_str().unwrap().to_owned(),
+                g["source"].as_str().unwrap().to_owned(),
+                g["used"].as_f64().unwrap(),
+                g["remaining"].as_f64().unwrap(),
+                g["expired"].as_f64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("2024-10-01".into(), "auto".into(), 1.5, 0.0, 8.5),
+            ("2025-10-01".into(), "auto".into(), 2.5, 8.5, 0.0),
+            ("2026-04-01".into(), "manual".into(), 0.0, 3.5, 0.0),
+            ("2026-10-01".into(), "auto".into(), 0.0, 12.0, 0.0)
+        ]
+    );
+    assert_eq!(
+        (v["employee_name"].as_str(), v["hire_date"].as_str()),
+        (Some("山田太郎"), Some("2024-04-01"))
+    );
+
+    // auto を手で直すと manual になり、auto の再計算で上書きされない
+    let auto_id = v["data"][1]["id"].as_str().unwrap().to_owned();
+    let got = call(
+        &a,
+        "PUT",
+        &format!("/api/leave/grants/{auto_id}"),
+        Some(t),
+        ADMIN,
+        Some(json!({"days": 12, "expires_on": "2027-10-01", "note": "修正"})),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(
+        (
+            got.json()["source"].as_str(),
+            got.json()["days"].as_f64(),
+            got.json()["note"].as_str()
+        ),
+        (Some("manual"), Some(12.0), Some("修正"))
+    );
+    let again = call(
+        &a,
+        "POST",
+        "/api/leave/grants/auto?employee_cd=1021",
+        Some(t),
+        ADMIN,
+        None,
+    )
+    .await;
+    assert_eq!(again.json()["inserted"], 0);
+    let list = call(
+        &a,
+        "GET",
+        "/api/leave/grants?employee_cd=1021",
+        Some(t),
+        ADMIN,
+        None,
+    )
+    .await;
+    assert_eq!(list.json()["data"][1]["days"], 12.0);
+
+    // 直すときの検証
+    for (body, code) in [
+        (
+            json!({"days": 1, "expires_on": "2025-01-01"}),
+            "expires_before_grant",
+        ),
+        (
+            json!({"days": 0.25, "expires_on": "2028-01-01"}),
+            "invalid_days",
+        ),
+        (json!({"days": 1}), "invalid_body"),
+    ] {
+        let got = call(
+            &a,
+            "PUT",
+            &format!("/api/leave/grants/{auto_id}"),
+            Some(t),
+            ADMIN,
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(
+            (got.status, got.json()),
+            (400, json!({"error": code})),
+            "{body}"
+        );
+    }
+    for id in [Uuid::new_v4().to_string(), "x".into()] {
+        let got = call(
+            &a,
+            "PUT",
+            &format!("/api/leave/grants/{id}"),
+            Some(t),
+            ADMIN,
+            Some(json!({"days": 1, "expires_on": "2028-01-01"})),
+        )
+        .await;
+        assert_eq!(got.status, 404);
+        let got = call(
+            &a,
+            "DELETE",
+            &format!("/api/leave/grants/{id}"),
+            Some(t),
+            ADMIN,
+            None,
+        )
+        .await;
+        assert_eq!(got.status, 404);
+    }
+
+    // 消す
+    let id = manual["id"].as_str().unwrap();
+    let got = call(
+        &a,
+        "DELETE",
+        &format!("/api/leave/grants/{id}"),
+        Some(t),
+        ADMIN,
+        None,
+    )
+    .await;
+    assert_eq!((got.status, got.body.len()), (204, 0));
+    let got = call(
+        &a,
+        "DELETE",
+        &format!("/api/leave/grants/{id}"),
+        Some(t),
+        ADMIN,
+        None,
+    )
+    .await;
+    assert_eq!(got.status, 404);
+}
+
+#[tokio::test]
+async fn calendar_matches_days_and_counts_rousai() {
+    let t = tenant().await;
+    let a = ledger_app(t).await;
+    call(
+        &a,
+        "POST",
+        "/api/leave/grants/auto?employee_cd=1021",
+        Some(t),
+        ADMIN,
+        None,
+    )
+    .await;
+    let p = page(t, &format!("{t}/c.pdf"), 1, "2026-10-08T00:00:00Z").await;
+    let link = json!({"employee_cd": "1021", "status": "linked", "periods": [
+        {"kind": "yukyu", "start_date": "2026-10-01", "end_date": "2026-10-01"},
+        {"kind": "yukyu", "start_date": "2026-10-05", "end_date": "2026-10-05", "half": "pm"},
+        {"kind": "kekkin", "start_date": "2026-10-06", "end_date": "2026-10-06"},
+        {"kind": "tokukyu", "start_date": "2026-10-08", "end_date": "2026-10-08"},
+        {"kind": "tokukyu", "start_date": "2026-11-02", "end_date": "2026-11-02"}]});
+    assert_eq!(
+        call(
+            &a,
+            "PUT",
+            &format!("/api/leave/pages/{p}"),
+            Some(t),
+            ADMIN,
+            Some(link)
+        )
+        .await
+        .status,
+        200
+    );
+    // 紐づけていないページの期間は出ない
+    let other = page(t, &format!("{t}/d.pdf"), 1, "2026-10-08T00:00:00Z").await;
+    let ignored = json!({"employee_cd": "1021", "status": "ignored", "periods": [{"kind": "kekkin", "start_date": "2026-10-09", "end_date": "2026-10-09"}]});
+    call(
+        &a,
+        "PUT",
+        &format!("/api/leave/pages/{other}"),
+        Some(t),
+        ADMIN,
+        Some(ignored),
+    )
+    .await;
+
+    let got = call(
+        &a,
+        "GET",
+        "/api/leave/calendar?employee_cd=1021&month=2026-10",
+        Some(t),
+        ADMIN,
+        None,
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    let v = got.json();
+    let pid = p.to_string();
+    assert_eq!(
+        v["days"],
+        json!([
+            {"date": "2026-10-01", "ichiban": [{"kind": "yukyu", "half": null}], "pdf": [{"kind": "yukyu", "half": null, "page_id": pid}], "status": "match"},
+            {"date": "2026-10-02", "ichiban": [{"kind": "yukyu", "half": null}], "pdf": [], "status": "ichiban_only"},
+            {"date": "2026-10-05", "ichiban": [{"kind": "yukyu", "half": "am"}], "pdf": [{"kind": "yukyu", "half": "pm", "page_id": pid}], "status": "match"},
+            {"date": "2026-10-06", "ichiban": [{"kind": "rousai", "half": null}], "pdf": [{"kind": "kekkin", "half": null, "page_id": pid}], "status": "mismatch"},
+            {"date": "2026-10-08", "ichiban": [], "pdf": [{"kind": "tokukyu", "half": null, "page_id": pid}], "status": "pdf_only"}
+        ])
+    );
+    assert_eq!(
+        v["yukyu"],
+        json!({"as_of": "2026-10-31", "remaining": 20.5, "expired": 8.5, "unallocated": 0.0, "consumption_from": "2024-04-01"})
+    );
+    assert_eq!(v["rousai"], json!({"year": 2, "month": 1}));
+    assert_eq!(
+        (
+            v["unknown_items"].as_u64(),
+            v["employee_name"].as_str(),
+            v["month"].as_str()
+        ),
+        (Some(1), Some("山田太郎"), Some("2026-10"))
+    );
+}
+
+#[tokio::test]
+async fn ledger_is_tenant_and_department_scoped() {
+    let (t1, t2) = (tenant().await, tenant().await);
+    let a = ledger_app(t1).await;
+    assert_eq!(
+        put_settings(&a, t2, json!({"dept_codes": ["10"]}))
+            .await
+            .status,
+        200
+    );
+    let body = json!({"employee_cd": "1021", "grant_date": "2026-04-01", "days": 1});
+    let g = call(&a, "POST", "/api/leave/grants", Some(t1), ADMIN, Some(body))
+        .await
+        .json();
+    let id = g["id"].as_str().unwrap();
+    // 他 tenant から付与は見えず、直せず、消せない
+    let list = call(
+        &a,
+        "GET",
+        "/api/leave/grants?employee_cd=1021",
+        Some(t2),
+        ADMIN,
+        None,
+    )
+    .await;
+    assert_eq!(list.json()["data"], json!([]));
+    let put = call(
+        &a,
+        "PUT",
+        &format!("/api/leave/grants/{id}"),
+        Some(t2),
+        ADMIN,
+        Some(json!({"days": 9, "expires_on": "2028-01-01"})),
+    )
+    .await;
+    assert_eq!(put.status, 404);
+    assert_eq!(
+        call(
+            &a,
+            "DELETE",
+            &format!("/api/leave/grants/{id}"),
+            Some(t2),
+            ADMIN,
+            None
+        )
+        .await
+        .status,
+        404
+    );
+    let list = call(
+        &a,
+        "GET",
+        "/api/leave/grants?employee_cd=1021",
+        Some(t1),
+        ADMIN,
+        None,
+    )
+    .await;
+    assert_eq!(list.json()["data"][0]["days"], 1.0);
+    // 自 tenant の部門に入らない乗務員・一番星に居ない乗務員は 404
+    for code in ["2001", "9999"] {
+        for (method, uri, body) in [
+            ("GET", format!("/api/leave/grants?employee_cd={code}"), None),
+            (
+                "GET",
+                format!("/api/leave/calendar?employee_cd={code}&month=2026-10"),
+                None,
+            ),
+            (
+                "POST",
+                format!("/api/leave/grants/auto?employee_cd={code}"),
+                None,
+            ),
+            (
+                "POST",
+                "/api/leave/grants".to_owned(),
+                Some(json!({"employee_cd": code, "grant_date": "2026-04-01", "days": 1})),
+            ),
+        ] {
+            let got = call(&a, method, &uri, Some(t1), ADMIN, body).await;
+            assert_eq!(
+                (got.status, got.json()),
+                (404, json!({"error": "not_found"})),
+                "{method} {uri}"
+            );
+        }
+    }
+    // 部門を選んでいない tenant には誰も居ない (一番星も呼ばない)
+    let t3 = tenant().await;
+    let before = a.ichiban.as_ref().unwrap().calls.lock().unwrap().len();
+    let got = call(
+        &a,
+        "GET",
+        "/api/leave/grants?employee_cd=1021",
+        Some(t3),
+        ADMIN,
+        None,
+    )
+    .await;
+    assert_eq!(got.status, 404);
+    assert_eq!(
+        a.ichiban.as_ref().unwrap().calls.lock().unwrap().len(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn ledger_rejects_bad_input_and_needs_ichiban() {
+    let t = tenant().await;
+    let a = ledger_app(t).await;
+    for (method, uri, body, code) in [
+        ("GET", "/api/leave/grants", None, "invalid_employee_cd"),
+        (
+            "GET",
+            "/api/leave/grants?employee_cd=1&employee_cd=2",
+            None,
+            "invalid_query",
+        ),
+        (
+            "POST",
+            "/api/leave/grants/auto?employee_cd=%20",
+            None,
+            "invalid_employee_cd",
+        ),
+        (
+            "GET",
+            "/api/leave/calendar?employee_cd=1021",
+            None,
+            "invalid_month",
+        ),
+        (
+            "GET",
+            "/api/leave/calendar?employee_cd=1021&month=2026-13",
+            None,
+            "invalid_month",
+        ),
+        (
+            "GET",
+            "/api/leave/calendar?month=2026-10",
+            None,
+            "invalid_employee_cd",
+        ),
+        (
+            "POST",
+            "/api/leave/grants",
+            Some(json!({"employee_cd": "1021"})),
+            "invalid_body",
+        ),
+        (
+            "POST",
+            "/api/leave/grants",
+            Some(json!({"employee_cd": "1021", "grant_date": "2026-04-01", "days": -1})),
+            "invalid_days",
+        ),
+    ] {
+        let got = call(&a, method, uri, Some(t), ADMIN, body).await;
+        assert_eq!(
+            (got.status, got.json()),
+            (400, json!({"error": code})),
+            "{method} {uri}"
+        );
+    }
+    // 一番星の binding が無い環境 (staging) では 503
+    let none = app(FakePdfs::default(), None).await;
+    for (method, uri, body) in [
+        ("GET", "/api/leave/grants?employee_cd=1021", None),
+        (
+            "GET",
+            "/api/leave/calendar?employee_cd=1021&month=2026-10",
+            None,
+        ),
+        ("POST", "/api/leave/grants/auto?employee_cd=1021", None),
+        (
+            "POST",
+            "/api/leave/grants",
+            Some(json!({"employee_cd": "1021", "grant_date": "2026-04-01", "days": 1})),
+        ),
+    ] {
+        let got = call(&none, method, uri, Some(t), ADMIN, body).await;
+        assert_eq!(
+            (got.status, got.json()),
+            (503, json!({"error": "ichiban_not_configured"})),
+            "{method} {uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn ledger_ichiban_failures_are_502() {
+    let t = tenant().await;
+    let a = ledger_app(t).await;
+    let cases: [(FakeIchiban, &str); 4] = [
+        (
+            ichiban_with(&[(EMPLOYEES_PATH, 500, json!({}))]),
+            "ichiban_upstream",
+        ),
+        (
+            ichiban_with(&[(EMPLOYEES_PATH, 200, json!({"rows": []}))]),
+            "ichiban_bad_response",
+        ),
+        // 休暇の口が無い (呼び出しの失敗)
+        (
+            ichiban_with(&[(EMPLOYEES_PATH, 200, ledger_employees())]),
+            "ichiban_unavailable",
+        ),
+        // 休暇の口の形が違う
+        (
+            {
+                let mut f = ichiban_with(&[(EMPLOYEES_PATH, 200, ledger_employees())]);
+                for p in leave::reconcile::days_paths(
+                    "2024-04-01".parse().unwrap(),
+                    "2026-10-31".parse().unwrap(),
+                )
+                .into_iter()
+                .chain(leave::reconcile::days_paths(
+                    "2024-04-01".parse().unwrap(),
+                    "2026-10-10".parse().unwrap(),
+                )) {
+                    f.responses.insert(
+                        p,
+                        leave::ichiban::IchibanResponse {
+                            status: 200,
+                            body: b"[]".to_vec(),
+                        },
+                    );
+                }
+                f
+            },
+            "ichiban_bad_response",
+        ),
+    ];
+    for (fake, code) in cases {
+        let b = app(FakePdfs::default(), Some(fake)).await;
+        for uri in [
+            "/api/leave/grants?employee_cd=1021",
+            "/api/leave/calendar?employee_cd=1021&month=2026-10",
+        ] {
+            let got = call(&b, "GET", uri, Some(t), ADMIN, None).await;
+            assert_eq!(
+                (got.status, got.json()),
+                (502, json!({"error": code})),
+                "{uri}"
+            );
+        }
+        for line in b.logs.lock().unwrap().iter() {
+            assert!(
+                !line.contains(&t.to_string()) && !line.contains("山田"),
+                "{line}"
+            );
+        }
+    }
+    drop(a);
+}
+
+#[tokio::test]
+async fn ledger_db_errors_are_500() {
+    let t = tenant().await;
+    let a = support::app_with_broken_db(Some(ledger_ichiban(&[]))).await;
+    let id = Uuid::new_v4();
+    for (method, uri, body) in [
+        ("GET", "/api/leave/grants?employee_cd=1021".to_owned(), None),
+        (
+            "GET",
+            "/api/leave/calendar?employee_cd=1021&month=2026-10".to_owned(),
+            None,
+        ),
+        (
+            "POST",
+            "/api/leave/grants/auto?employee_cd=1021".to_owned(),
+            None,
+        ),
+        (
+            "POST",
+            "/api/leave/grants".to_owned(),
+            Some(json!({"employee_cd": "1021", "grant_date": "2026-04-01", "days": 1})),
+        ),
+        (
+            "PUT",
+            format!("/api/leave/grants/{id}"),
+            Some(json!({"days": 1, "expires_on": "2028-01-01"})),
+        ),
+        ("DELETE", format!("/api/leave/grants/{id}"), None),
+    ] {
+        let got = call(&a, method, &uri, Some(t), ADMIN, body).await;
+        assert_eq!(
+            (got.status, got.json()),
+            (500, json!({"error": "internal_error"})),
+            "{method} {uri}"
+        );
+    }
+    for line in a.logs.lock().unwrap().iter() {
+        assert!(
+            !line.contains(&t.to_string()) && !line.contains(&id.to_string()),
             "{line}"
         );
     }
