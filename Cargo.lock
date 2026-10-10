@@ -1050,7 +1050,6 @@ dependencies = [
  "leave",
  "tokio-postgres",
  "tower-service",
- "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "worker",

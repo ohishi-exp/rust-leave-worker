@@ -40,7 +40,7 @@ use crate::auth::{actor, require_admin};
 use crate::ichiban::{filter_employees, IchibanApi, DEPARTMENTS_PATH, EMPLOYEES_PATH};
 use crate::ledger;
 use crate::pages::{validate_update, ListQuery, ListQueryRaw, PageUpdateInput};
-use crate::pg;
+use crate::pg::{self, PutSettings};
 use crate::settings::{validate, Settings, SettingsInput};
 use crate::store::PdfStore;
 
@@ -129,8 +129,9 @@ async fn put_settings(
     };
     let put = pg::put_settings(&mut *state.pg.lock().await, t.0, valid).await;
     match put {
-        Ok(Some(s)) => Json::<Settings>(s).into_response(),
-        Ok(None) => bad_request("unknown_lineworks_channel"),
+        Ok(PutSettings::Saved(s)) => Json::<Settings>(s).into_response(),
+        Ok(PutSettings::UnknownChannel) => bad_request("unknown_lineworks_channel"),
+        Ok(PutSettings::UnknownRecipient) => bad_request("unknown_notify_recipient"),
         // mailbox の UNIQUE (別の tenant が使っている)
         Err(e) if alc_worker_db::kind(&e) == "23505" => {
             error(StatusCode::CONFLICT, "mailbox_taken")

@@ -7,10 +7,9 @@
 //! このファイルは wasm 専用で、CI のテストと coverage の gate の外 (確かめるのは staging / 本番の実物)。
 
 use futures_util::future::BoxFuture;
-use leave::cron::{send_body, Notifier, NotifyError, LINEWORKS_SEND_URL};
+use leave::cron::{send_body, Notifier, NotifyError, NotifyTarget, LINEWORKS_SEND_URL};
 use leave::ichiban::{IchibanApi, IchibanError, IchibanResponse};
 use leave::store::{PdfStore, StoreError};
-use uuid::Uuid;
 use wasm_bindgen::JsValue;
 use worker::send::{SendFuture, SendWrapper};
 use worker::{Bucket, Fetcher, Headers, Method, Request, RequestInit};
@@ -108,7 +107,7 @@ impl AuthWorkerNotifier {
 impl Notifier for AuthWorkerNotifier {
     fn send<'a>(
         &'a self,
-        channel_id: Uuid,
+        target: NotifyTarget,
         text: &'a str,
     ) -> BoxFuture<'a, Result<(), NotifyError>> {
         Box::pin(SendFuture::new(async move {
@@ -122,7 +121,7 @@ impl Notifier for AuthWorkerNotifier {
             let mut init = RequestInit::new();
             init.with_method(Method::Post)
                 .with_headers(headers)
-                .with_body(Some(JsValue::from_str(&send_body(channel_id, text))));
+                .with_body(Some(JsValue::from_str(&send_body(target, text))));
             let req = Request::new_with_init(LINEWORKS_SEND_URL, &init)
                 .map_err(|_| NotifyError("request"))?;
             let resp = self
@@ -143,7 +142,7 @@ impl Notifier for AuthWorkerNotifier {
 pub struct NoNotifier;
 
 impl Notifier for NoNotifier {
-    fn send<'a>(&'a self, _: Uuid, _: &'a str) -> BoxFuture<'a, Result<(), NotifyError>> {
+    fn send<'a>(&'a self, _: NotifyTarget, _: &'a str) -> BoxFuture<'a, Result<(), NotifyError>> {
         Box::pin(async { Err(NotifyError("not_configured")) })
     }
 }

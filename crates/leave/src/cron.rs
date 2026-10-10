@@ -5,7 +5,8 @@
 //! 2. 紐づけ済みの期間を同じ窓で日ごとに展開する
 //! 3. (乗務員, 日, 区分) の差を取る (`今日 − grace_days` より後の日は待つ)
 //! 4. `leave_alerts` に書き、窓の中で今回ずれていない未解決の行を解決にする
-//! 5. 未通知の警告を乗務員ごとにまとめて LINE WORKS へ送り、送れた分だけ通知済みにする (チャネル未設定なら送らずに残す)
+//! 5. 未通知の警告を乗務員ごとにまとめて LINE WORKS (グループか個人) へ送り、送れた分だけ通知済みにする
+//!    (宛先が無い・個人の宛先が無効なら送らずに残す)
 //! 6. 有給の法定付与を全乗務員ぶん足す (在る付与日は飛ばす)
 //!
 //! 1 tenant の失敗で他の tenant を止めない。結果は 1 行のログ (tenant は順番の番号で出し、識別子・氏名は出さない。
@@ -33,21 +34,36 @@ pub const WINDOW_DAYS: i64 = 62;
 pub const LINEWORKS_SEND_URL: &str =
     "https://auth-worker.internal/alc-internal-proxy/api/internal/lineworks/send";
 
-/// 送信の本文 (`{"channel_id": "<lineworks_channels.id>", "text": "..."}`)。宛先は `Uuid` の型で受けるので形は常に正しい
-pub fn send_body(channel_id: Uuid, text: &str) -> String {
-    serde_json::json!({ "channel_id": channel_id, "text": text }).to_string()
+/// 警告の宛先 (`leave_settings` のグループか個人のどちらか 1 つ。rust-alc-api の `SendTarget` と同じ形)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NotifyTarget {
+    /// `lineworks_channels.id` (LINE WORKS の channelId ではない)
+    Channel(Uuid),
+    /// `notify_recipients.id` (LINE WORKS の有効な行)
+    Recipient(Uuid),
+}
+
+impl alc_worker_db::TxOutput for NotifyTarget {}
+
+/// 送信の本文 (`{"channel_id": "<id>", "text": "..."}` か `{"recipient_id": "<id>", "text": "..."}` の排他)。
+/// 宛先は `Uuid` の型で受けるので形は常に正しい
+pub fn send_body(target: NotifyTarget, text: &str) -> String {
+    match target {
+        NotifyTarget::Channel(id) => serde_json::json!({ "channel_id": id, "text": text }),
+        NotifyTarget::Recipient(id) => serde_json::json!({ "recipient_id": id, "text": text }),
+    }
+    .to_string()
 }
 
 /// 送信の失敗 (中身は持たない — 応答の本文やチャネルの識別子をログに出さない)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NotifyError(pub &'static str);
 
-/// LINE WORKS のトークルームへ 1 通送る (worker では auth-worker の Service Binding)
+/// LINE WORKS のトークルームか個人へ 1 通送る (worker では auth-worker の Service Binding)
 pub trait Notifier: Send + Sync {
-    /// `channel_id` は `lineworks_channels.id` (LINE WORKS の channelId ではない)
     fn send<'a>(
         &'a self,
-        channel_id: Uuid,
+        target: NotifyTarget,
         text: &'a str,
     ) -> BoxFuture<'a, Result<(), NotifyError>>;
 }
@@ -227,14 +243,17 @@ async fn run_tenant(
     result.upserted = upserted;
     result.resolved = resolved;
     result.pending = pending.len();
-    if let Some(channel) = t.lineworks_channel_id {
+    let target = pg::notify_target(pg, t.tenant_id)
+        .await
+        .map_err(|e| db_stage("notify_target", &e))?;
+    if let Some(target) = target {
         let names: BTreeMap<String, String> = employees
             .iter()
             .filter_map(|e| Some((e.employee_code.clone(), e.employee_name.clone()?)))
             .collect();
         let mut sent = Vec::new();
         for m in messages(&pending, &names) {
-            if notifier.send(channel, &m.text).await.is_ok() {
+            if notifier.send(target, &m.text).await.is_ok() {
                 result.sent_messages += 1;
                 sent.extend(m.alerts.iter().map(|&i| pending[i].id));
             }
@@ -299,11 +318,27 @@ mod tests {
 
     #[test]
     fn send_body_shape() {
-        let body: serde_json::Value =
-            serde_json::from_str(&send_body(Uuid::from_u128(1), "あ\n\"い\"")).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&send_body(
+            NotifyTarget::Channel(Uuid::from_u128(1)),
+            "あ\n\"い\"",
+        ))
+        .unwrap();
         assert_eq!(
             body,
             serde_json::json!({"channel_id": Uuid::from_u128(1).to_string(), "text": "あ\n\"い\""})
+        );
+    }
+
+    #[test]
+    fn send_body_recipient_shape() {
+        let body: serde_json::Value = serde_json::from_str(&send_body(
+            NotifyTarget::Recipient(Uuid::from_u128(2)),
+            "う",
+        ))
+        .unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"recipient_id": Uuid::from_u128(2).to_string(), "text": "う"})
         );
     }
 }
