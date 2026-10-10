@@ -357,6 +357,19 @@ impl Notifier for FakeNotifier {
     }
 }
 
+/// 送れない環境 (worker の `NoNotifier` と同じ。staging・local)
+pub struct UnavailableNotifier;
+
+impl Notifier for UnavailableNotifier {
+    fn available(&self) -> bool {
+        false
+    }
+
+    fn send<'a>(&'a self, _: NotifyTarget, _: &'a str) -> BoxFuture<'a, Result<(), NotifyError>> {
+        Box::pin(async { Err(NotifyError("not_configured")) })
+    }
+}
+
 /// 一番星の偽物の応答 (path → (状態, 本文))
 pub fn ichiban_with(pairs: &[(&str, u16, serde_json::Value)]) -> FakeIchiban {
     FakeIchiban {
@@ -409,12 +422,27 @@ pub struct App {
 
 /// worker の src/lib.rs と同じ組み立て (`/api` の下に nest し、tenant の layer を掛ける)
 pub async fn app(pdfs: FakePdfs, ichiban: Option<FakeIchiban>) -> App {
-    build(app_client().await, pdfs, ichiban)
+    build(
+        app_client().await,
+        pdfs,
+        ichiban,
+        Arc::new(FakeNotifier::default()),
+    )
+}
+
+/// 送信の口 (偽の送信か、送れない環境) を差して組み立てる
+pub async fn app_with_notifier(notifier: Arc<dyn Notifier>) -> App {
+    build(app_client().await, FakePdfs::default(), None, notifier)
 }
 
 /// 接続が切れた DB (backend を落とした接続) で組み立てる (DB のエラーの経路を通すため)
 pub async fn app_with_broken_db(ichiban: Option<FakeIchiban>) -> App {
-    build(broken_client().await, FakePdfs::default(), ichiban)
+    build(
+        broken_client().await,
+        FakePdfs::default(),
+        ichiban,
+        Arc::new(FakeNotifier::default()),
+    )
 }
 
 /// 接続が切れた `alc_api_app` の接続 (backend を落とした接続)
@@ -439,7 +467,12 @@ pub async fn broken_client() -> PgClient {
     pg
 }
 
-fn build(pg: PgClient, pdfs: FakePdfs, ichiban: Option<FakeIchiban>) -> App {
+fn build(
+    pg: PgClient,
+    pdfs: FakePdfs,
+    ichiban: Option<FakeIchiban>,
+    notifier: Arc<dyn Notifier>,
+) -> App {
     let pdfs = Arc::new(pdfs);
     let ichiban = ichiban.map(Arc::new);
     let logs = Arc::new(StdMutex::new(Vec::new()));
@@ -448,6 +481,7 @@ fn build(pg: PgClient, pdfs: FakePdfs, ichiban: Option<FakeIchiban>) -> App {
         pg: Arc::new(Mutex::new(pg)),
         pdfs: pdfs.clone(),
         ichiban: ichiban.clone().map(|i| i as Arc<dyn IchibanApi>),
+        notifier,
         log: Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_owned())),
         now: Arc::new(|| NOW.parse().unwrap()),
     };

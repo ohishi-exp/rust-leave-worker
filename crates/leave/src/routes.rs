@@ -1,4 +1,4 @@
-//! 管理 API の口 (12 本、worker が `/api` の下に nest するので実際の path は `/api/leave/…`)。
+//! 管理 API の口 (13 本、worker が `/api` の下に nest するので実際の path は `/api/leave/…`)。
 //!
 //! | method | path | 中身 |
 //! |---|---|---|
@@ -12,6 +12,7 @@
 //! | GET / POST | `/leave/grants` | 有給の付与台帳と残 / 手で付与を足す (`ledger`) |
 //! | POST | `/leave/grants/auto` | 法定付与を足す (`ledger`) |
 //! | PUT / DELETE | `/leave/grants/{id}` | 付与を直す / 消す (`ledger`) |
+//! | POST | `/leave/settings/test-notify` | 保存済みの通知先へ固定の文面を 1 通送る (毎朝の cron と同じ宛先・同じ送信) |
 //!
 //! **全部の口を [`require_admin`] が包む** (管理者でなければ 403。handler にも DB にも届かない)。
 //! tenant ヘッダーの検査 (`alc_core_wasm::require_tenant_header`、無ければ 401) は worker がこの外側に掛ける。
@@ -37,6 +38,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::auth::{actor, require_admin};
+use crate::cron::Notifier;
 use crate::ichiban::{filter_employees, IchibanApi, DEPARTMENTS_PATH, EMPLOYEES_PATH};
 use crate::ledger;
 use crate::pages::{validate_update, ListQuery, ListQueryRaw, PageUpdateInput};
@@ -56,13 +58,24 @@ pub struct LeaveState {
     pub pdfs: Arc<dyn PdfStore>,
     /// 一番星 Worker の binding。無い環境 (staging) では `None` で、部門・社員の口は 503
     pub ichiban: Option<Arc<dyn IchibanApi>>,
+    /// LINE WORKS への送信 (cron と同じもの)。テスト送信の口だけが使う。
+    /// 送れない環境 (staging など) では [`Notifier::available`] が `false` で、その口は 503
+    pub notifier: Arc<dyn Notifier>,
     pub log: LogSink,
     pub now: Clock,
 }
 
+/// テスト送信の口の path (worker が、この口へのリクエストでだけ送信の口を組み立てるのに使う)
+pub const TEST_NOTIFY_PATH: &str = "/api/leave/settings/test-notify";
+
+/// テスト送信の文面 (固定)
+pub const TEST_NOTIFY_TEXT: &str =
+    "勤怠申請システムからのテスト通知です。この通知が届けば毎朝の警告も届きます。";
+
 pub fn tenant_router() -> Router<LeaveState> {
     Router::new()
         .route("/leave/settings", get(get_settings).put(put_settings))
+        .route("/leave/settings/test-notify", post(test_notify))
         .route("/leave/departments", get(departments))
         .route("/leave/employees", get(employees))
         .route("/leave/pages", get(list_pages))
@@ -112,6 +125,30 @@ async fn get_settings(
     match got {
         Ok(s) => Json(s.unwrap_or_default()).into_response(),
         Err(e) => db_error(&state, "get_settings", &e),
+    }
+}
+
+/// 保存済みの通知先 (グループか個人) へ固定の文面を 1 通送る。宛先は cron と同じ [`pg::notify_target`]。
+/// 応答・ログは固定の語だけ (宛先・生のエラーは出さない)
+async fn test_notify(
+    State(state): State<LeaveState>,
+    Extension(t): Extension<TenantId>,
+) -> Response {
+    let got = pg::notify_target(&mut *state.pg.lock().await, t.0).await;
+    let target = match got {
+        Ok(Some(target)) => target,
+        Ok(None) => return bad_request("no_notify_target"),
+        Err(e) => return db_error(&state, "test_notify", &e),
+    };
+    if !state.notifier.available() {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "notify_unavailable");
+    }
+    match state.notifier.send(target, TEST_NOTIFY_TEXT).await {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => {
+            (state.log)(&format!("test_notify: send {}", e.0));
+            error(StatusCode::BAD_GATEWAY, "notify_failed")
+        }
     }
 }
 

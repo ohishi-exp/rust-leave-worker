@@ -142,6 +142,10 @@ impl Notifier for AuthWorkerNotifier {
 pub struct NoNotifier;
 
 impl Notifier for NoNotifier {
+    fn available(&self) -> bool {
+        false
+    }
+
     fn send<'a>(&'a self, _: NotifyTarget, _: &'a str) -> BoxFuture<'a, Result<(), NotifyError>> {
         Box::pin(async { Err(NotifyError("not_configured")) })
     }

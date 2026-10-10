@@ -5,11 +5,15 @@ mod support;
 
 use std::collections::HashMap;
 
+use std::sync::Arc;
+
+use leave::cron::NotifyTarget;
 use leave::ichiban::{DEPARTMENTS_PATH, EMPLOYEES_PATH};
+use leave::TEST_NOTIFY_TEXT;
 use serde_json::{json, Value};
 use support::{
-    app, call, ichiban_with, lineworks_channel, notify_recipient, page, tenant, App, FakeIchiban,
-    FakePdfs,
+    app, app_with_notifier, call, ichiban_with, lineworks_channel, notify_recipient, page, tenant,
+    App, FakeIchiban, FakeNotifier, FakePdfs, UnavailableNotifier,
 };
 use uuid::Uuid;
 
@@ -99,6 +103,37 @@ mod forbidden {
             Some(json!({"mailbox": "abc"})),
         )
         .await;
+    }
+
+    /// 管理者でなければ 403 で、送信の口にも DB にも届かない
+    #[tokio::test]
+    async fn test_notify() {
+        let t = tenant().await;
+        let r = notify_recipient(t, "lineworks", true).await;
+        let n = Arc::new(FakeNotifier::default());
+        let a = app_with_notifier(n.clone()).await;
+        let got = super::put_settings(&a, t, json!({"notify_recipient_id": r})).await;
+        assert_eq!(got.status, 200);
+        for role in [
+            None,
+            Some("viewer"),
+            Some("payroll"),
+            Some("Admin"),
+            Some(""),
+        ] {
+            let got = call(
+                &a,
+                "POST",
+                "/api/leave/settings/test-notify",
+                Some(t),
+                role,
+                None,
+            )
+            .await;
+            assert_eq!(got.status, 403, "role={role:?}");
+            assert_eq!(got.json(), json!({"error": "forbidden"}));
+        }
+        assert_eq!(*n.calls.lock().unwrap(), 0);
     }
 
     #[tokio::test]
@@ -334,6 +369,121 @@ async fn notify_targets_are_exclusive() {
         ),
         (Value::Null, json!(r.to_string()))
     );
+}
+
+// ---- テスト送信 (POST /leave/settings/test-notify) ----
+
+async fn test_notify(a: &App, t: Uuid) -> support::Got {
+    call(
+        a,
+        "POST",
+        "/api/leave/settings/test-notify",
+        Some(t),
+        ADMIN,
+        None,
+    )
+    .await
+}
+
+/// 保存済みの宛先 (個人もグループも) へ固定の文面を 1 通だけ送る。ほかの tenant の宛先へは送らない
+#[tokio::test]
+async fn test_notify_sends_the_fixed_text_to_the_saved_target() {
+    let t = tenant().await;
+    let other = tenant().await;
+    let other_r = notify_recipient(other, "lineworks", true).await;
+    let n = Arc::new(FakeNotifier::default());
+    let a = app_with_notifier(n.clone()).await;
+    put_settings(&a, other, json!({"notify_recipient_id": other_r})).await;
+
+    let r = notify_recipient(t, "lineworks", true).await;
+    assert_eq!(
+        put_settings(&a, t, json!({"notify_recipient_id": r}))
+            .await
+            .status,
+        200
+    );
+    let got = test_notify(&a, t).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json(), json!({"ok": true}));
+    assert_eq!(
+        *n.sent.lock().unwrap(),
+        vec![(NotifyTarget::Recipient(r), TEST_NOTIFY_TEXT.to_owned())]
+    );
+    assert_eq!(
+        TEST_NOTIFY_TEXT,
+        "勤怠申請システムからのテスト通知です。この通知が届けば毎朝の警告も届きます。"
+    );
+
+    let ch = lineworks_channel(t).await;
+    put_settings(&a, t, json!({"lineworks_channel_id": ch})).await;
+    let got = test_notify(&a, t).await;
+    assert_eq!(got.status, 200);
+    let sent = n.sent.lock().unwrap();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(
+        sent[1],
+        (NotifyTarget::Channel(ch), TEST_NOTIFY_TEXT.to_owned())
+    );
+}
+
+/// 宛先が無い (設定が無い・個人が LINE か無効) なら 400 `no_notify_target` で、送らない
+#[tokio::test]
+async fn test_notify_without_a_target_is_400() {
+    let t = tenant().await;
+    let n = Arc::new(FakeNotifier::default());
+    let a = app_with_notifier(n.clone()).await;
+    let got = test_notify(&a, t).await;
+    assert_eq!(got.status, 400);
+    assert_eq!(got.json(), json!({"error": "no_notify_target"}));
+
+    // 個人が送れない (LINE の個人・無効) 行は宛先にならない (設定に入るのは自 tenant の有効な LINE WORKS だけなので、
+    // 保存後に無効にして確かめる)
+    let r = notify_recipient(t, "lineworks", true).await;
+    put_settings(&a, t, json!({"notify_recipient_id": r})).await;
+    support::admin()
+        .await
+        .execute(
+            "UPDATE alc_api.notify_recipients SET enabled = false WHERE id = $1",
+            &[&r],
+        )
+        .await
+        .unwrap();
+    let got = test_notify(&a, t).await;
+    assert_eq!(got.status, 400);
+    assert_eq!(got.json(), json!({"error": "no_notify_target"}));
+    assert_eq!(*n.calls.lock().unwrap(), 0);
+}
+
+/// 送信に失敗したら 502 `notify_failed`。ログも応答も固定の語だけ
+#[tokio::test]
+async fn test_notify_send_failure_is_502() {
+    let t = tenant().await;
+    let r = notify_recipient(t, "lineworks", true).await;
+    let n = Arc::new(FakeNotifier {
+        fail_calls: vec![0],
+        ..Default::default()
+    });
+    let a = app_with_notifier(n.clone()).await;
+    put_settings(&a, t, json!({"notify_recipient_id": r})).await;
+    let got = test_notify(&a, t).await;
+    assert_eq!(got.status, 502);
+    assert_eq!(got.json(), json!({"error": "notify_failed"}));
+    assert!(n.sent.lock().unwrap().is_empty());
+    let logs = a.logs.lock().unwrap();
+    assert_eq!(*logs, vec!["test_notify: send status".to_owned()]);
+}
+
+/// 送れない環境 (staging・local) は 503 `notify_unavailable`
+#[tokio::test]
+async fn test_notify_unavailable_is_503() {
+    let t = tenant().await;
+    let r = notify_recipient(t, "lineworks", true).await;
+    let a = app_with_notifier(Arc::new(UnavailableNotifier)).await;
+    put_settings(&a, t, json!({"notify_recipient_id": r})).await;
+    let got = test_notify(&a, t).await;
+    assert_eq!(got.status, 503);
+    assert_eq!(got.json(), json!({"error": "notify_unavailable"}));
+    assert!(a.logs.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -764,6 +914,7 @@ async fn db_errors_are_500() {
     for (method, uri, body) in [
         ("GET", "/api/leave/settings".to_owned(), None),
         ("PUT", "/api/leave/settings".to_owned(), Some(json!({}))),
+        ("POST", "/api/leave/settings/test-notify".to_owned(), None),
         ("GET", "/api/leave/employees".to_owned(), None),
         ("GET", "/api/leave/pages".to_owned(), None),
         ("GET", format!("/api/leave/pages/{p}"), None),
@@ -775,7 +926,7 @@ async fn db_errors_are_500() {
         assert_eq!(got.json(), json!({"error": "internal_error"}));
     }
     let logs = a.logs.lock().unwrap();
-    assert_eq!(logs.len(), 7);
+    assert_eq!(logs.len(), 8);
     for line in logs.iter() {
         assert!(
             !line.contains(&t.to_string()) && !line.contains(&p.to_string()),

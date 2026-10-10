@@ -61,6 +61,12 @@ pub struct NotifyError(pub &'static str);
 
 /// LINE WORKS のトークルームか個人へ 1 通送る (worker では auth-worker の Service Binding)
 pub trait Notifier: Send + Sync {
+    /// 送れる環境か (binding か secret が無い環境は `false`)。cron は見ない (送れなければ警告が残るだけ)。
+    /// テスト送信の口が「送信に失敗した」(502) と「送れない環境」(503) を分けるのに使う
+    fn available(&self) -> bool {
+        true
+    }
+
     fn send<'a>(
         &'a self,
         target: NotifyTarget,
