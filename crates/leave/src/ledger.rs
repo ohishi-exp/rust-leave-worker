@@ -3,10 +3,15 @@
 //! | method | path | 中身 |
 //! |---|---|---|
 //! | GET | `/leave/calendar?employee_cd=&month=YYYY-MM` | 日ごとの一番星と申請書の突き合わせ・月末の有給残・労災日数 |
-//! | GET | `/leave/grants?employee_cd=` | 付与台帳と今日 (JST) の残 |
+//! | GET | `/leave/grants?employee_cd=` | 付与台帳と今日 (JST) の残・期首残 |
 //! | POST | `/leave/grants` | 手で付与を足す (source = manual) |
 //! | PUT / DELETE | `/leave/grants/{id}` | 付与を直す (source は manual になる) / 消す |
 //! | POST | `/leave/grants/auto?employee_cd=` | 法定付与を計算し、無い付与日だけ足す (manual は上書きしない) |
+//! | GET / PUT | `/leave/opening` | 全員分の期首残 / 一括保存 (両方 null の行は削除) |
+//!
+//! **期首残** (`leave_opening`、1 人 1 行): 期首日 X 時点の残 (繰越・今年度) が在り、残の基準日が X 以降なら、
+//! 付与日 <= X の付与台帳の行を外して (`superseded`) 合成の付与 2 件に置き換え、消化は X の翌日以降だけを数える
+//! (`grants::balance_with_opening`)。基準日が X より前なら従来の計算。
 //!
 //! `employee_cd` を取る口は、自 tenant の `dept_codes` に入る一番星の乗務員だけを通す (外れたら 404)。一番星の binding が
 //! 無い環境 (staging) では 503。
@@ -19,7 +24,7 @@
 // 口の途中の失敗をそのまま応答として返す (`Result<_, Response>`)。応答は 1 回作って返すだけなので box しない
 #![allow(clippy::result_large_err)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use alc_core_wasm::TenantId;
@@ -34,7 +39,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::grants::{
-    self, add_months, balance, statutory, valid_employee_cd, Grant, GrantUpdateInput, NewGrantInput,
+    self, add_months, balance_with_opening, opening_grants, statutory, valid_employee_cd, Grant,
+    GrantUpdateInput, NewGrantInput, Opening, OpeningGrants, OpeningPutInput,
 };
 use crate::ichiban::{IchibanApi, EMPLOYEES_PATH};
 use crate::pg;
@@ -65,13 +71,21 @@ pub fn parse_month(raw: &str) -> Option<(NaiveDate, NaiveDate)> {
     Some((start, end))
 }
 
-/// 消化を数え始める日 (`as_of` の 48 か月前の翌日と入社日の遅い方)
-fn consumption_from(as_of: NaiveDate, hire: Option<NaiveDate>) -> NaiveDate {
+/// 消化を数え始める日 (`as_of` の 48 か月前の翌日と入社日の遅い方。期首残を使うなら期首日の翌日とも比べる)
+fn consumption_from(
+    as_of: NaiveDate,
+    hire: Option<NaiveDate>,
+    opening: Option<&OpeningGrants>,
+) -> NaiveDate {
     let back = as_of
         .checked_sub_months(Months::new(CONSUMPTION_MONTHS))
         .and_then(|d| d.succ_opt())
         .unwrap_or(as_of);
-    hire.map_or(back, |h| h.max(back))
+    let from = hire.map_or(back, |h| h.max(back));
+    opening
+        .filter(|o| o.applies(as_of))
+        .and_then(|o| o.opening.as_of.succ_opt())
+        .map_or(from, |x| x.max(from))
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -94,6 +108,29 @@ fn ichiban_of(state: &LeaveState) -> Result<Arc<dyn IchibanApi>, Response> {
     state.ichiban.clone().ok_or_else(ichiban_not_configured)
 }
 
+/// 自 tenant の部門に入る一番星の乗務員 (部門を選んでいない tenant は空で、一番星も呼ばない)
+async fn tenant_employees(
+    state: &LeaveState,
+    api: &Arc<dyn IchibanApi>,
+    tenant_id: Uuid,
+) -> Result<Vec<Employee>, Response> {
+    let got = pg::get_settings(&mut *state.pg.lock().await, tenant_id).await;
+    let dept_codes = match got {
+        Ok(s) => s.unwrap_or_default().dept_codes,
+        Err(e) => return Err(db_error(state, "employee settings", &e)),
+    };
+    if dept_codes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let body = ichiban_get(state, api, EMPLOYEES_PATH)
+        .await
+        .map_err(bad_gateway)?;
+    parse_employees(&body, &dept_codes).map_err(|code| {
+        (state.log)(&format!("ichiban {EMPLOYEES_PATH}: {code}"));
+        bad_gateway(code)
+    })
+}
+
 /// 自 tenant の部門に入る乗務員 1 人 (外れたら 404)
 async fn find_employee(
     state: &LeaveState,
@@ -101,25 +138,27 @@ async fn find_employee(
     tenant_id: Uuid,
     code: &str,
 ) -> Result<Employee, Response> {
-    let got = pg::get_settings(&mut *state.pg.lock().await, tenant_id).await;
-    let dept_codes = match got {
-        Ok(s) => s.unwrap_or_default().dept_codes,
-        Err(e) => return Err(db_error(state, "employee settings", &e)),
-    };
-    if dept_codes.is_empty() {
-        return Err(not_found());
-    }
-    let body = ichiban_get(state, api, EMPLOYEES_PATH)
-        .await
-        .map_err(|code| error(StatusCode::BAD_GATEWAY, code))?;
-    let employees = parse_employees(&body, &dept_codes).map_err(|code| {
-        (state.log)(&format!("ichiban {EMPLOYEES_PATH}: {code}"));
-        error(StatusCode::BAD_GATEWAY, code)
-    })?;
-    employees
+    tenant_employees(state, api, tenant_id)
+        .await?
         .into_iter()
         .find(|e| e.employee_code == code)
         .ok_or_else(not_found)
+}
+
+/// 乗務員 1 人の期首残 (無ければ `None`)
+async fn opening_of(
+    state: &LeaveState,
+    tenant_id: Uuid,
+    emp: &Employee,
+) -> Result<Option<OpeningGrants>, Response> {
+    let got = pg::get_opening(
+        &mut *state.pg.lock().await,
+        tenant_id,
+        emp.employee_code.clone(),
+    )
+    .await
+    .map_err(|e| db_error(state, "opening", &e))?;
+    Ok(got.map(|o| opening_grants(o, emp.hire_date, emp.retire_date)))
 }
 
 /// 一番星の休暇を `from`〜`to` で取り、`codes` の乗務員だけを正規化する (92 日ごとに呼ぶ)
@@ -148,6 +187,8 @@ struct GrantView {
     used: f64,
     remaining: f64,
     expired: f64,
+    /// 期首残で置き換わった (期首残を使う基準日で、付与日 <= 期首日)。内訳は 0
+    superseded: bool,
 }
 
 /// 口の本体は `Result<Response, Response>` で書き、途中の失敗 (`Err` の応答) もそのまま返す
@@ -192,7 +233,8 @@ async fn calendar_inner(
     )
     .await
     .map_err(|e| db_error(&state, "calendar periods", &e))?;
-    let used_from = consumption_from(month_end, emp.hire_date);
+    let opening = opening_of(&state, tenant_id, &emp).await?;
+    let used_from = consumption_from(month_end, emp.hire_date, opening.as_ref());
     let year_start = NaiveDate::from_ymd_opt(month_start.year(), 1, 1).unwrap_or(month_start);
     let codes = BTreeSet::from([code.clone()]);
     let days = fetch_days(&state, &api, &codes, used_from.min(year_start), month_end)
@@ -209,7 +251,7 @@ async fn calendar_inner(
         .filter(|(d, _)| *d >= used_from)
         .collect();
     let inputs: Vec<_> = grant_rows.iter().map(Grant::input).collect();
-    let b = balance(&inputs, &usages, month_end);
+    let b = balance_with_opening(&inputs, &usages, month_end, opening.as_ref());
     Ok(Json(json!({
         "employee_cd": code,
         "employee_name": emp.employee_name,
@@ -250,18 +292,21 @@ async fn list_grants_inner(
     let grant_rows = pg::list_grants(&mut *state.pg.lock().await, tenant_id, code.clone())
         .await
         .map_err(|e| db_error(&state, "list_grants", &e))?;
+    let opening = opening_of(&state, tenant_id, &emp).await?;
     let today = jst_date((state.now)());
-    let used_from = consumption_from(today, emp.hire_date);
+    let used_from = consumption_from(today, emp.hire_date, opening.as_ref());
     let codes = BTreeSet::from([code.clone()]);
     let days = fetch_days(&state, &api, &codes, used_from, today)
         .await
         .map_err(bad_gateway)?;
     let inputs: Vec<_> = grant_rows.iter().map(Grant::input).collect();
-    let b = balance(&inputs, &yukyu_usages(&days.rows), today);
+    let b = balance_with_opening(&inputs, &yukyu_usages(&days.rows), today, opening.as_ref());
+    let applied = opening.filter(|o| o.applies(today));
     let data: Vec<GrantView> = grant_rows
         .into_iter()
         .zip(&b.grants)
         .map(|(grant, gb)| GrantView {
+            superseded: applied.is_some_and(|o| o.supersedes(grant.grant_date)),
             grant,
             used: grants::days(gb.used),
             remaining: grants::days(gb.remaining),
@@ -280,6 +325,7 @@ async fn list_grants_inner(
             "unallocated": v.unallocated,
             "consumption_from": used_from,
         },
+        "opening": opening.map(|o| o.view()),
         "data": data,
     }))
     .into_response())
@@ -389,6 +435,93 @@ async fn auto_grants_inner(
     .into_response())
 }
 
+/// 期首残の一覧の 1 行 (乗務員は自 tenant の部門に入る一番星の全員)
+#[derive(Serialize)]
+struct OpeningRowView {
+    employee_cd: String,
+    employee_name: Option<String>,
+    dept_code: Option<serde_json::Value>,
+    hire_date: Option<NaiveDate>,
+    retire_date: Option<NaiveDate>,
+    opening: Option<serde_json::Value>,
+}
+
+/// `GET /leave/opening`: 全員分の保存済みの期首残 (今の残は返さない。一番星 1 回 + DB)
+pub async fn list_openings(
+    State(state): State<LeaveState>,
+    Extension(t): Extension<TenantId>,
+) -> Response {
+    respond(list_openings_inner(state, t.0).await)
+}
+
+async fn list_openings_inner(state: LeaveState, tenant_id: Uuid) -> Result<Response, Response> {
+    let api = ichiban_of(&state)?;
+    let employees = tenant_employees(&state, &api, tenant_id).await?;
+    let saved: BTreeMap<String, Opening> =
+        pg::list_openings(&mut *state.pg.lock().await, tenant_id)
+            .await
+            .map_err(|e| db_error(&state, "list_openings", &e))?
+            .into_iter()
+            .collect();
+    let data: Vec<OpeningRowView> = employees
+        .into_iter()
+        .map(|e| OpeningRowView {
+            opening: saved.get(&e.employee_code).map(|o| {
+                json!({"as_of": o.as_of, "carryover": grants::days(o.carryover), "current": grants::days(o.current)})
+            }),
+            employee_cd: e.employee_code,
+            employee_name: e.employee_name,
+            dept_code: e.dept_code,
+            hire_date: e.hire_date,
+            retire_date: e.retire_date,
+        })
+        .collect();
+    Ok(Json(json!({ "data": data })).into_response())
+}
+
+/// `PUT /leave/opening`: 期首残の一括保存。1 行でも不正なら全体を 400 (一部だけ保存しない)
+pub async fn put_openings(
+    State(state): State<LeaveState>,
+    Extension(t): Extension<TenantId>,
+    body: Result<Json<OpeningPutInput>, JsonRejection>,
+) -> Response {
+    respond(put_openings_inner(state, t.0, body).await)
+}
+
+async fn put_openings_inner(
+    state: LeaveState,
+    tenant_id: Uuid,
+    body: Result<Json<OpeningPutInput>, JsonRejection>,
+) -> Result<Response, Response> {
+    let Json(input) = body.map_err(|_| bad_request("invalid_body"))?;
+    let put = grants::validate_opening(input).map_err(bad_request)?;
+    let api = ichiban_of(&state)?;
+    let employees: BTreeMap<String, Employee> = tenant_employees(&state, &api, tenant_id)
+        .await?
+        .into_iter()
+        .map(|e| (e.employee_code.clone(), e))
+        .collect();
+    let mut codes = put.upserts.iter().map(|(c, _, _)| c).chain(&put.deletes);
+    if codes.any(|c| !employees.contains_key(c)) {
+        return Err(bad_request("unknown_employee"));
+    }
+    for (code, carryover, current) in &put.upserts {
+        let e = &employees[code];
+        let o = Opening {
+            as_of: put.as_of,
+            carryover: *carryover,
+            current: *current,
+        };
+        if let Some(code) = opening_grants(o, e.hire_date, e.retire_date).error() {
+            return Err(bad_request(code));
+        }
+    }
+    let (saved, deleted) = pg::put_openings(&mut *state.pg.lock().await, tenant_id, put)
+        .await
+        .map_err(|e| db_error(&state, "put_openings", &e))?;
+    Ok(Json(json!({ "saved": saved, "deleted": deleted })).into_response())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,15 +555,36 @@ mod tests {
             jst_date("2026-10-09T14:59:59Z".parse().unwrap()),
             d("2026-10-09")
         );
-        assert_eq!(consumption_from(d("2026-10-31"), None), d("2022-11-01"));
         assert_eq!(
-            consumption_from(d("2026-10-31"), Some(d("2024-04-01"))),
+            consumption_from(d("2026-10-31"), None, None),
+            d("2022-11-01")
+        );
+        assert_eq!(
+            consumption_from(d("2026-10-31"), Some(d("2024-04-01")), None),
             d("2024-04-01")
         );
         assert_eq!(
-            consumption_from(d("2026-10-31"), Some(d("2001-04-01"))),
+            consumption_from(d("2026-10-31"), Some(d("2001-04-01")), None),
             d("2022-11-01")
         );
-        assert_eq!(consumption_from(NaiveDate::MIN, None), NaiveDate::MIN);
+        assert_eq!(consumption_from(NaiveDate::MIN, None, None), NaiveDate::MIN);
+        // 期首残を使うなら期首日の翌日から (基準日が期首日より前なら使わない)
+        let o = opening_grants(
+            Opening {
+                as_of: d("2026-09-30"),
+                carryover: 0,
+                current: 0,
+            },
+            Some(d("2024-04-01")),
+            None,
+        );
+        assert_eq!(
+            consumption_from(d("2026-10-31"), Some(d("2024-04-01")), Some(&o)),
+            d("2026-10-01")
+        );
+        assert_eq!(
+            consumption_from(d("2026-09-29"), Some(d("2024-04-01")), Some(&o)),
+            d("2024-04-01")
+        );
     }
 }

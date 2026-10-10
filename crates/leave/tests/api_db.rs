@@ -207,6 +207,17 @@ mod forbidden {
     async fn delete_grant() {
         assert_forbidden("DELETE", "/api/leave/grants/{id}", None).await;
     }
+
+    #[tokio::test]
+    async fn list_openings() {
+        assert_forbidden("GET", "/api/leave/opening", None).await;
+    }
+
+    #[tokio::test]
+    async fn put_openings() {
+        let body = json!({"as_of": "2026-09-30", "rows": [{"employee_cd": "1021", "carryover": 1, "current": 2}]});
+        assert_forbidden("PUT", "/api/leave/opening", Some(body)).await;
+    }
 }
 
 #[tokio::test]
@@ -1197,6 +1208,13 @@ async fn grants_auto_manual_edit_delete_and_balance() {
         (v["employee_name"].as_str(), v["hire_date"].as_str()),
         (Some("山田太郎"), Some("2024-04-01"))
     );
+    // 期首残が無ければ従来どおり (置き換えた行も無い)
+    assert_eq!(v["opening"], Value::Null);
+    assert!(v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|g| g["superseded"] == false));
 
     // auto を手で直すと manual になり、auto の再計算で上書きされない
     let auto_id = v["data"][1]["id"].as_str().unwrap().to_owned();
@@ -1692,6 +1710,423 @@ async fn ledger_db_errors_are_500() {
             "{line}"
         );
     }
+}
+
+async fn put_opening(app: &App, t: Uuid, body: Value) -> support::Got {
+    call(app, "PUT", "/api/leave/opening", Some(t), ADMIN, Some(body)).await
+}
+
+async fn openings(app: &App, t: Uuid) -> Value {
+    let got = call(app, "GET", "/api/leave/opening", Some(t), ADMIN, None).await;
+    assert_eq!(got.status, 200);
+    got.json()
+}
+
+/// 1021 (入社 2024-04-01) と 1030 (入社日なし) の期首残
+fn opening_of(v: &Value, code: &str) -> Value {
+    v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["employee_cd"] == code)
+        .unwrap()["opening"]
+        .clone()
+}
+
+#[tokio::test]
+async fn opening_list_put_and_delete() {
+    let t = tenant().await;
+    let a = ledger_app(t).await;
+    let calls = |a: &App| a.ichiban.as_ref().unwrap().calls.lock().unwrap().len();
+    let before = calls(&a);
+    // 自 tenant の部門の全員 (保存前は null)。一番星は 1 回だけ
+    let v = openings(&a, t).await;
+    assert_eq!(
+        v,
+        json!({"data": [
+            {"employee_cd": "1021", "employee_name": "山田太郎", "dept_code": "10", "hire_date": "2024-04-01", "retire_date": null, "opening": null},
+            {"employee_cd": "1030", "employee_name": "甲", "dept_code": "10", "hire_date": null, "retire_date": null, "opening": null}
+        ]})
+    );
+    assert_eq!(calls(&a), before + 1);
+
+    // 片方 null は 0。入社日の無い乗務員も 0 日なら入る
+    let got = put_opening(
+        &a,
+        t,
+        json!({"as_of": "2026-09-30", "rows": [
+            {"employee_cd": " 1021 ", "carryover": 1.5, "current": 8.5},
+            {"employee_cd": "1030", "carryover": 0, "current": null}]}),
+    )
+    .await;
+    assert_eq!(
+        (got.status, got.json()),
+        (200, json!({"saved": 2, "deleted": 0}))
+    );
+    let v = openings(&a, t).await;
+    assert_eq!(
+        opening_of(&v, "1021"),
+        json!({"as_of": "2026-09-30", "carryover": 1.5, "current": 8.5})
+    );
+    assert_eq!(
+        opening_of(&v, "1030"),
+        json!({"as_of": "2026-09-30", "carryover": 0.0, "current": 0.0})
+    );
+
+    // 置き換え (期首日も変わる) と、両方 null の行は削除 (無い行の削除は数えない)
+    let got = put_opening(
+        &a,
+        t,
+        json!({"as_of": "2026-10-01", "rows": [
+            {"employee_cd": "1021", "carryover": null, "current": 2},
+            {"employee_cd": "1030", "carryover": null, "current": null}]}),
+    )
+    .await;
+    assert_eq!(
+        (got.status, got.json()),
+        (200, json!({"saved": 1, "deleted": 1}))
+    );
+    let v = openings(&a, t).await;
+    assert_eq!(
+        opening_of(&v, "1021"),
+        json!({"as_of": "2026-10-01", "carryover": 0.0, "current": 2.0})
+    );
+    assert_eq!(opening_of(&v, "1030"), Value::Null);
+    let got = put_opening(
+        &a,
+        t,
+        json!({"as_of": "2026-10-01", "rows": [{"employee_cd": "1021"}, {"employee_cd": "1030"}]}),
+    )
+    .await;
+    assert_eq!(
+        (got.status, got.json()),
+        (200, json!({"saved": 0, "deleted": 1}))
+    );
+    assert_eq!(opening_of(&openings(&a, t).await, "1021"), Value::Null);
+    // 空の rows
+    let got = put_opening(&a, t, json!({"as_of": "2026-10-01", "rows": []})).await;
+    assert_eq!(
+        (got.status, got.json()),
+        (200, json!({"saved": 0, "deleted": 0}))
+    );
+}
+
+#[tokio::test]
+async fn opening_put_rejects_whole_body() {
+    let t = tenant().await;
+    let a = ledger_app(t).await;
+    let row =
+        |code: &str, c: Value, r: Value| json!({"employee_cd": code, "carryover": c, "current": r});
+    let ok = row("1021", json!(1), json!(2));
+    let many: Vec<Value> = (0..1001)
+        .map(|i| row(&i.to_string(), json!(1), json!(1)))
+        .collect();
+    for (body, code) in [
+        (json!({"as_of": "2026-09-30"}), "invalid_body"),
+        (
+            json!({"as_of": "2026-09-30", "rows": [], "x": 1}),
+            "invalid_body",
+        ),
+        (
+            json!({"as_of": "2026-09-30", "rows": [{"employee_cd": "1021", "days": 1}]}),
+            "invalid_body",
+        ),
+        (
+            json!({"as_of": "2026-09-30", "rows": [ok, row("1021", json!(1), Value::Null)]}),
+            "invalid_body",
+        ),
+        (json!({"as_of": "2026-9-30", "rows": [ok]}), "invalid_as_of"),
+        (
+            json!({"as_of": "2026-09-31", "rows": [ok]}),
+            "invalid_as_of",
+        ),
+        (
+            json!({"as_of": "2026-09-30", "rows": many}),
+            "too_many_rows",
+        ),
+        (
+            json!({"as_of": "2026-09-30", "rows": [ok, row("1030", json!(-1), json!(0))]}),
+            "invalid_days",
+        ),
+        (
+            json!({"as_of": "2026-09-30", "rows": [ok, row("1030", json!(0), json!(1000))]}),
+            "invalid_days",
+        ),
+        (
+            json!({"as_of": "2026-09-30", "rows": [ok, row("1030", json!(0.25), json!(0))]}),
+            "invalid_days",
+        ),
+        // 自 tenant の部門に入らない・一番星に居ない・空 (削除の行も同じ)
+        (
+            json!({"as_of": "2026-09-30", "rows": [ok, row("2001", json!(1), json!(1))]}),
+            "unknown_employee",
+        ),
+        (
+            json!({"as_of": "2026-09-30", "rows": [ok, row("9999", Value::Null, Value::Null)]}),
+            "unknown_employee",
+        ),
+        (
+            json!({"as_of": "2026-09-30", "rows": [ok, row(" ", json!(1), json!(1))]}),
+            "unknown_employee",
+        ),
+        // 入社日の無い乗務員 (G0 も G1 も無い)
+        (
+            json!({"as_of": "2026-09-30", "rows": [ok, row("1030", json!(1), json!(0))]}),
+            "opening_no_prior_grant",
+        ),
+        (
+            json!({"as_of": "2026-09-30", "rows": [ok, row("1030", json!(0), json!(0.5))]}),
+            "opening_no_current_grant",
+        ),
+        // 入社 2024-04-01: 2025-09-30 時点の付与は 2024-10-01 だけ (G1 だけ)。2024-09-30 時点は無い
+        (
+            json!({"as_of": "2025-09-30", "rows": [row("1021", json!(1), json!(5))]}),
+            "opening_no_prior_grant",
+        ),
+        (
+            json!({"as_of": "2024-09-30", "rows": [row("1021", json!(0), json!(1))]}),
+            "opening_no_current_grant",
+        ),
+    ] {
+        let got = put_opening(&a, t, body.clone()).await;
+        assert_eq!(
+            (got.status, got.json()),
+            (400, json!({"error": code})),
+            "{body}"
+        );
+    }
+    // どれも保存されていない (一部だけ保存しない)
+    let v = openings(&a, t).await;
+    assert!(v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|r| r["opening"].is_null()));
+    // G1 だけの時点でも、繰越 0 なら入る
+    let got = put_opening(
+        &a,
+        t,
+        json!({"as_of": "2025-09-30", "rows": [row("1021", json!(0), json!(5))]}),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+}
+
+#[tokio::test]
+async fn opening_is_tenant_scoped() {
+    let (t1, t2, t3) = (tenant().await, tenant().await, tenant().await);
+    let a = ledger_app(t1).await;
+    assert_eq!(
+        put_settings(&a, t2, json!({"dept_codes": ["10"]}))
+            .await
+            .status,
+        200
+    );
+    assert_eq!(
+        put_settings(&a, t3, json!({"dept_codes": ["20"]}))
+            .await
+            .status,
+        200
+    );
+    let body = json!({"as_of": "2026-09-30", "rows": [{"employee_cd": "1021", "carryover": 1, "current": 2}]});
+    assert_eq!(put_opening(&a, t1, body.clone()).await.status, 200);
+    // 他 tenant から見えず、消しても t1 の行は消えない
+    assert_eq!(opening_of(&openings(&a, t2).await, "1021"), Value::Null);
+    let del = put_opening(
+        &a,
+        t2,
+        json!({"as_of": "2026-09-30", "rows": [{"employee_cd": "1021"}]}),
+    )
+    .await;
+    assert_eq!(del.json(), json!({"saved": 0, "deleted": 0}));
+    assert_eq!(
+        opening_of(&openings(&a, t1).await, "1021"),
+        json!({"as_of": "2026-09-30", "carryover": 1.0, "current": 2.0})
+    );
+    // 部門の違う tenant には 1021 が居ない
+    let got = put_opening(&a, t3, body.clone()).await;
+    assert_eq!(
+        (got.status, got.json()),
+        (400, json!({"error": "unknown_employee"}))
+    );
+    let v = openings(&a, t3).await;
+    let codes: Vec<&str> = v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["employee_cd"].as_str().unwrap())
+        .collect();
+    assert_eq!(codes, vec!["2001"]);
+    // 部門を選んでいない tenant は空で、一番星も呼ばない
+    let t4 = tenant().await;
+    let before = a.ichiban.as_ref().unwrap().calls.lock().unwrap().len();
+    assert_eq!(openings(&a, t4).await, json!({"data": []}));
+    let got = put_opening(&a, t4, body).await;
+    assert_eq!(
+        (got.status, got.json()),
+        (400, json!({"error": "unknown_employee"}))
+    );
+    assert_eq!(
+        a.ichiban.as_ref().unwrap().calls.lock().unwrap().len(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn opening_needs_ichiban_and_db() {
+    let t = tenant().await;
+    let body = json!({"as_of": "2026-09-30", "rows": [{"employee_cd": "1021", "carryover": 1, "current": 2}]});
+    // 一番星の binding が無い環境は 503、一番星の失敗は 502
+    let none = app(FakePdfs::default(), None).await;
+    assert_eq!(
+        put_settings(&none, t, json!({"dept_codes": ["10"]}))
+            .await
+            .status,
+        200
+    );
+    let bad = app(
+        FakePdfs::default(),
+        Some(ichiban_with(&[(EMPLOYEES_PATH, 500, json!({}))])),
+    )
+    .await;
+    let broken = support::app_with_broken_db(Some(ledger_ichiban(&[]))).await;
+    for (a, status, code) in [
+        (&none, 503, "ichiban_not_configured"),
+        (&bad, 502, "ichiban_upstream"),
+        (&broken, 500, "internal_error"),
+    ] {
+        for (method, b) in [("GET", None), ("PUT", Some(body.clone()))] {
+            let got = call(a, method, "/api/leave/opening", Some(t), ADMIN, b).await;
+            assert_eq!(
+                (got.status, got.json()),
+                (status, json!({"error": code})),
+                "{method} {code}"
+            );
+        }
+    }
+    for line in broken.logs.lock().unwrap().iter() {
+        assert!(!line.contains(&t.to_string()), "{line}");
+    }
+}
+
+/// 期首残を使う一番星 (期首日 2026-09-30 の翌日から・2026 年の月のカレンダー・期首日より前の月の区間も登録する)
+fn opening_ichiban() -> FakeIchiban {
+    let rows = ledger_rows();
+    let mut f = ledger_ichiban(&rows);
+    support::add_days(&mut f, "2026-10-01", "2026-10-10", &rows);
+    support::add_days(&mut f, "2026-01-01", "2026-10-31", &rows);
+    support::add_days(&mut f, "2024-04-01", "2026-08-31", &rows);
+    f
+}
+
+#[tokio::test]
+async fn grants_and_calendar_use_opening() {
+    let t = tenant().await;
+    let a = app(FakePdfs::default(), Some(opening_ichiban())).await;
+    assert_eq!(
+        put_settings(&a, t, json!({"dept_codes": ["10"]}))
+            .await
+            .status,
+        200
+    );
+    call(
+        &a,
+        "POST",
+        "/api/leave/grants/auto?employee_cd=1021",
+        Some(t),
+        ADMIN,
+        None,
+    )
+    .await;
+    // 期首日 2026-09-30: 繰越 2 日 (G0 = 2024-10-01、2026-10-01 に失効)・今年度 9 日 (G1 = 2025-10-01)
+    let got = put_opening(
+        &a,
+        t,
+        json!({"as_of": "2026-09-30", "rows": [{"employee_cd": "1021", "carryover": 2, "current": 9}]}),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    let get = |uri: &'static str| {
+        let a = &a;
+        async move {
+            let got = call(a, "GET", uri, Some(t), ADMIN, None).await;
+            assert_eq!(got.status, 200, "{uri}");
+            got.json()
+        }
+    };
+    // 今日 = 2026-10-10。期首日の翌日以降の消化 (10/1・10/2・10/5 午前 = 2.5 日) は今年度から (繰越は 10/1 に失効)。
+    // 期首日以前の付与 (2024-10-01・2025-10-01 の auto) は置き換え、2026-10-01 の付与 (12 日) は従来どおり
+    let v = get("/api/leave/grants?employee_cd=1021").await;
+    assert_eq!(
+        v["opening"],
+        json!({"as_of": "2026-09-30", "carryover": 2.0, "current": 9.0,
+               "carryover_grant_date": "2024-10-01", "carryover_expires_on": "2026-10-01",
+               "current_grant_date": "2025-10-01", "current_expires_on": "2027-10-01"})
+    );
+    assert_eq!(
+        v["balance"],
+        json!({"as_of": "2026-10-10", "remaining": 18.5, "expired": 2.0, "unallocated": 0.0, "consumption_from": "2026-10-01"})
+    );
+    let rows: Vec<(String, bool, f64, f64, f64)> = v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| {
+            (
+                g["grant_date"].as_str().unwrap().to_owned(),
+                g["superseded"].as_bool().unwrap(),
+                g["used"].as_f64().unwrap(),
+                g["remaining"].as_f64().unwrap(),
+                g["expired"].as_f64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("2024-10-01".into(), true, 0.0, 0.0, 0.0),
+            ("2025-10-01".into(), true, 0.0, 0.0, 0.0),
+            ("2026-10-01".into(), false, 0.0, 12.0, 0.0)
+        ]
+    );
+    // カレンダーの有給残も同じ規則
+    let v = get("/api/leave/calendar?employee_cd=1021&month=2026-10").await;
+    assert_eq!(
+        v["yukyu"],
+        json!({"as_of": "2026-10-31", "remaining": 18.5, "expired": 2.0, "unallocated": 0.0, "consumption_from": "2026-10-01"})
+    );
+    // 期首日より前の月は従来の計算 (2024-10-01 の付与 10 日から 1.5 日、2025-10-01 の 11 日)
+    let v = get("/api/leave/calendar?employee_cd=1021&month=2026-08").await;
+    assert_eq!(
+        v["yukyu"],
+        json!({"as_of": "2026-08-31", "remaining": 19.5, "expired": 0.0, "unallocated": 0.0, "consumption_from": "2024-04-01"})
+    );
+
+    // 未来の期首日 (今日より後) は拒まない。今日の残は従来の計算で、置き換えも無い
+    let got = put_opening(
+        &a,
+        t,
+        json!({"as_of": "2026-10-20", "rows": [{"employee_cd": "1021", "carryover": 5, "current": 12}]}),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    let v = get("/api/leave/grants?employee_cd=1021").await;
+    assert_eq!(
+        (
+            v["opening"]["carryover_grant_date"].as_str(),
+            v["opening"]["current_grant_date"].as_str()
+        ),
+        (Some("2025-10-01"), Some("2026-10-01"))
+    );
+    assert_eq!(
+        v["balance"],
+        json!({"as_of": "2026-10-10", "remaining": 20.5, "expired": 8.5, "unallocated": 0.0, "consumption_from": "2024-04-01"})
+    );
+    assert!(v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|g| g["superseded"] == false));
 }
 
 /// メール取り込みの口 `POST /internal/ingest` (管理 API の外。共有 secret で守る)
