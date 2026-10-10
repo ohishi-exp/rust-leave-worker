@@ -32,3 +32,11 @@ path = "crates/leave/src/pg.rs"
 # 口 (400 / 403 / 404 / 409 / 500 / 502 / 503 の本文とログまで)
 [[files]]
 path = "crates/leave/src/routes.rs"
+
+# メール取り込みの口の入力の検証 (secret の constant-time 比較・mailbox・base64・サイズ・ページ数・送信元・R2 の key)
+[[files]]
+path = "crates/leave/src/ingest.rs"
+
+# メール取り込みの口 POST /internal/ingest (401 / 400 / 202 / 200 / 500 と R2 の取り消しまで。tests/api_db.rs が通す)
+[[files]]
+path = "crates/leave/src/internal.rs"

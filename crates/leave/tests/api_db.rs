@@ -705,3 +705,260 @@ async fn db_errors_are_500() {
         );
     }
 }
+
+/// メール取り込みの口 `POST /internal/ingest` (管理 API の外。共有 secret で守る)
+mod ingest {
+    use super::*;
+    use leave::ingest::{minimal_pdf, MAX_PAGES};
+    use support::{ingest, INGEST_SECRET};
+
+    const SENDER: &str = "Boss@Example.com";
+
+    /// tenant を作り、mailbox と許可リストで受信を有効にする
+    async fn enabled_tenant(allowed: &[&str]) -> (Uuid, String) {
+        let t = tenant().await;
+        let mailbox = format!("m-{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let a = app(FakePdfs::default(), None).await;
+        let got = put_settings(
+            &a,
+            t,
+            json!({"mailbox": mailbox, "allowed_senders": allowed, "enabled": true}),
+        )
+        .await;
+        assert_eq!(got.status, 200);
+        (t, mailbox)
+    }
+
+    fn body(mailbox: &str, from: &str, pdf: &[u8]) -> Vec<u8> {
+        use base64::Engine;
+        serde_json::to_vec(&json!({
+            "mailbox": mailbox,
+            "header_from": from,
+            "envelope_from": from,
+            "subject": "休暇申請",
+            "message_id": "<m1@example.com>",
+            "received_at": "2026-10-09T08:30:00Z",
+            "filename": "leave.pdf",
+            "pdf_base64": base64::engine::general_purpose::STANDARD.encode(pdf),
+        }))
+        .unwrap()
+    }
+
+    async fn page_count(t: Uuid) -> usize {
+        let a = app(FakePdfs::default(), None).await;
+        let got = call(&a, "GET", "/api/leave/pages", Some(t), ADMIN, None).await;
+        assert_eq!(got.status, 200);
+        got.json()["data"].as_array().unwrap().len()
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_or_wrong_secret() {
+        let (t, mailbox) = enabled_tenant(&[SENDER]).await;
+        let a = app(FakePdfs::default(), None).await;
+        let b = body(&mailbox, SENDER, &minimal_pdf(1));
+        for secret in [
+            None,
+            Some(""),
+            Some("wrong"),
+            Some("leave-test-ingest-secre"),
+        ] {
+            let got = ingest(&a, secret, Some(t), b.clone()).await;
+            assert_eq!(got.status, 401, "secret={secret:?}");
+            assert_eq!(got.json(), json!({"error": "unauthorized"}));
+        }
+        assert!(a.pdfs.stored.lock().unwrap().is_empty());
+        assert_eq!(page_count(t).await, 0);
+    }
+
+    #[tokio::test]
+    async fn stores_pages_for_the_mailbox_tenant_only() {
+        let (t, mailbox) = enabled_tenant(&[SENDER]).await;
+        let (other, _) = enabled_tenant(&[SENDER]).await;
+        let a = app(FakePdfs::default(), None).await;
+        // 他の tenant の X-Tenant-ID を付けても、body の mailbox の tenant に入る。mailbox は大文字でもよい
+        let pdf = minimal_pdf(3);
+        let b = body(&mailbox.to_uppercase(), SENDER, &pdf);
+        let got = ingest(&a, Some(INGEST_SECRET), Some(other), b).await;
+        assert_eq!(got.status, 200);
+        assert_eq!(got.json(), json!({"pages": 3}));
+
+        // R2 には tenant の下の key で 1 つだけ。中身は送った PDF
+        let stored = a.pdfs.stored.lock().unwrap().clone();
+        assert_eq!(stored.len(), 1);
+        let (key, bytes) = stored.iter().next().unwrap();
+        assert_eq!(bytes, &pdf);
+        let prefix = format!("{t}/2026/10/");
+        assert!(key.starts_with(&prefix) && key.ends_with(".pdf"), "{key}");
+
+        // 自 tenant には 3 ページ (未紐づけ、page_no 1..3、同じ key)。他 tenant には見えない
+        let a2 = app(FakePdfs::default(), None).await;
+        let got = call(&a2, "GET", "/api/leave/pages", Some(t), ADMIN, None).await;
+        let rows = got.json()["data"].clone();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        let mut nos: Vec<i64> = rows
+            .iter()
+            .map(|r| r["page_no"].as_i64().unwrap())
+            .collect();
+        nos.sort();
+        assert_eq!(nos, vec![1, 2, 3]);
+        for r in rows {
+            assert_eq!(r["status"], "unlinked");
+            assert_eq!(r["r2_key"], key.as_str());
+            assert_eq!(r["mail_from"], SENDER);
+            assert_eq!(r["subject"], "休暇申請");
+            assert_eq!(r["received_at"], "2026-10-09T08:30:00Z");
+        }
+        assert_eq!(page_count(other).await, 0);
+        let uri = format!("/api/leave/pages/{}", rows[0]["id"].as_str().unwrap());
+        let got = call(&a2, "GET", &uri, Some(other), ADMIN, None).await;
+        assert_eq!(got.status, 404);
+
+        // ログは tenant と枚数だけ (差出人のアドレスも PDF も出ない)
+        let logs = a.logs.lock().unwrap().clone();
+        assert_eq!(logs, vec![format!("ingest stored: tenant={t} pages=3")]);
+    }
+
+    #[tokio::test]
+    async fn drops_what_it_should_not_store() {
+        let (t, mailbox) = enabled_tenant(&["boss@example.com"]).await;
+        let (empty, empty_box) = enabled_tenant(&[]).await;
+        let off = tenant().await;
+        let off_box = format!("o-{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let a = app(FakePdfs::default(), None).await;
+        let s = json!({"mailbox": off_box, "allowed_senders": [SENDER]});
+        assert_eq!(put_settings(&a, off, s).await.status, 200);
+        let pdf = minimal_pdf(1);
+        let cases: Vec<(Vec<u8>, &str)> = vec![
+            (body("no-such-box", SENDER, &pdf), "unknown_mailbox"),
+            (body(&off_box, SENDER, &pdf), "unknown_mailbox"),
+            (
+                body(&mailbox, "other@example.com", &pdf),
+                "sender_not_allowed",
+            ),
+            (body(&empty_box, SENDER, &pdf), "sender_not_allowed"),
+            // 許可されない送信元の PDF は parser に掛けない (壊れていても、ページ数の理由ではなく送信元で捨てる)
+            (
+                body(&mailbox, "other@example.com", b"%PDF-1.4\nbroken"),
+                "sender_not_allowed",
+            ),
+            (body(&mailbox, SENDER, b"GIF89a"), "not_pdf"),
+            (
+                body(&mailbox, SENDER, b"%PDF-1.4\nbroken"),
+                "unreadable_pdf",
+            ),
+            (body(&mailbox, SENDER, &minimal_pdf(0)), "unreadable_pdf"),
+            (
+                body(&mailbox, SENDER, &minimal_pdf(MAX_PAGES + 1)),
+                "too_many_pages",
+            ),
+        ];
+        for (b, reason) in cases {
+            let got = ingest(&a, Some(INGEST_SECRET), None, b).await;
+            assert_eq!(got.status, 202, "{reason}");
+            assert_eq!(got.json(), json!({"dropped": reason}));
+        }
+        // 大文字小文字だけが違う送信元は通る
+        let b = body(&mailbox, "BOSS@example.COM", &pdf);
+        let got = ingest(&a, Some(INGEST_SECRET), None, b).await;
+        assert_eq!(got.status, 200);
+        assert_eq!(a.pdfs.stored.lock().unwrap().len(), 1);
+        assert_eq!(page_count(t).await, 1);
+        assert_eq!(page_count(empty).await, 0);
+        assert_eq!(page_count(off).await, 0);
+        let logs = a.logs.lock().unwrap().clone();
+        let denied = format!("ingest dropped: sender_not_allowed tenant={t}");
+        assert!(logs.contains(&denied), "{logs:?}");
+        assert!(logs.iter().all(|l| !l.contains("example.com")), "{logs:?}");
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_input_with_400() {
+        let (t, mailbox) = enabled_tenant(&[SENDER]).await;
+        let a = app(FakePdfs::default(), None).await;
+        let ok = serde_json::from_slice::<Value>(&body(&mailbox, SENDER, b"x")).unwrap();
+        let mut not_base64 = ok.clone();
+        not_base64["pdf_base64"] = json!("***");
+        let mut no_received_at = ok.clone();
+        no_received_at
+            .as_object_mut()
+            .unwrap()
+            .remove("received_at");
+        let mut too_large = ok.clone();
+        too_large["pdf_base64"] = json!("A".repeat(14_000_000));
+        let cases: Vec<(Vec<u8>, &str)> = vec![
+            (b"not json".to_vec(), "invalid_body"),
+            (serde_json::to_vec(&no_received_at).unwrap(), "invalid_body"),
+            (body("ab", SENDER, &minimal_pdf(1)), "invalid_mailbox"),
+            (body("a_b_c", SENDER, &minimal_pdf(1)), "invalid_mailbox"),
+            (serde_json::to_vec(&not_base64).unwrap(), "invalid_base64"),
+            (serde_json::to_vec(&too_large).unwrap(), "pdf_too_large"),
+            // body の大きさの上限 (16 MiB) を超える
+            (vec![b' '; 17 * 1024 * 1024], "invalid_body"),
+        ];
+        for (b, code) in cases {
+            let got = ingest(&a, Some(INGEST_SECRET), None, b).await;
+            assert_eq!(got.status, 400, "{code}");
+            assert_eq!(got.json(), json!({"error": code}));
+        }
+        assert!(a.pdfs.stored.lock().unwrap().is_empty());
+        assert_eq!(page_count(t).await, 0);
+    }
+
+    /// R2 に置いた後の INSERT が失敗したら、置いた object を消してから 500 (消すのも失敗しても 500)
+    #[tokio::test]
+    async fn failed_insert_removes_the_object() {
+        for fail_delete in [false, true] {
+            let (t, mailbox) = enabled_tenant(&[SENDER]).await;
+            // put の途中で tenant を消す → leave_pages の INSERT が外部キーで失敗する
+            let a = app(
+                FakePdfs {
+                    drop_tenant_on_put: Some(t),
+                    fail_delete,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await;
+            let b = body(&mailbox, SENDER, &minimal_pdf(2));
+            let got = ingest(&a, Some(INGEST_SECRET), None, b).await;
+            assert_eq!(got.status, 500);
+            assert_eq!(got.json(), json!({"error": "internal_error"}));
+            let deleted = a.pdfs.deleted.lock().unwrap().clone();
+            assert_eq!(deleted.len(), 1);
+            assert!(deleted[0].starts_with(&format!("{t}/")));
+            // 消せたときは R2 に残らない (消せなかった回は残るが、それを log に出す)
+            assert_eq!(
+                a.pdfs.stored.lock().unwrap().len(),
+                usize::from(fail_delete)
+            );
+            let logs = a.logs.lock().unwrap().clone();
+            assert_eq!(logs[0], "ingest insert: 23503");
+            assert_eq!(logs.len(), if fail_delete { 2 } else { 1 });
+            assert!(logs.iter().all(|l| !l.contains(&t.to_string())), "{logs:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn store_and_db_errors_are_500() {
+        let (t, mailbox) = enabled_tenant(&[SENDER]).await;
+        let fail_put = FakePdfs {
+            fail_put: true,
+            ..Default::default()
+        };
+        let a = app(fail_put, None).await;
+        let b = body(&mailbox, SENDER, &minimal_pdf(1));
+        let got = ingest(&a, Some(INGEST_SECRET), None, b.clone()).await;
+        assert_eq!(got.status, 500);
+        assert_eq!(got.json(), json!({"error": "internal_error"}));
+        assert_eq!(*a.logs.lock().unwrap(), vec!["ingest: r2 put failed"]);
+        assert_eq!(page_count(t).await, 0);
+
+        let a = support::app_with_broken_db(None).await;
+        let got = ingest(&a, Some(INGEST_SECRET), None, b).await;
+        assert_eq!(got.status, 500);
+        assert_eq!(got.json(), json!({"error": "internal_error"}));
+        assert_eq!(a.logs.lock().unwrap().len(), 1);
+        assert!(a.pdfs.stored.lock().unwrap().is_empty());
+    }
+}

@@ -14,17 +14,19 @@ unexpected_cfgs = { level = "allow", check-cfg = ['cfg(coverage)'] }
 alc-core-wasm = { workspace = true }
 alc-worker-db = { workspace = true }
 axum = { version = "0.8", default-features = false, features = ["json", "query"] }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 chrono = { version = "0.4", default-features = false, features = ["serde"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# PDF のページ数を数える (nom の parser だけ。chrono・rayon・画像は切る。wasm32-unknown-unknown でビルドできる)
+lopdf = { version = "0.34", default-features = false, features = ["nom_parser"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # 型付きの文の型 (`Type`) と `Row`。接続は張らない (wasm 用の feature `js` は直下の worker と alc-worker-db が付ける)
 tokio-postgres = { version = "0.7", default-features = false, features = ["with-chrono-0_4", "with-uuid-1"] }
-uuid = { version = "1", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync"] }
 # tests/ の実 DB の接続 (runtime 付き)。dev-dependency なので wasm のビルドには入らない
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"] }
 tower = { version = "0.5", features = ["util"] }
-uuid = { version = "1", features = ["v4"] }
