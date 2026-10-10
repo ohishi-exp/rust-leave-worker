@@ -24,7 +24,7 @@ use axum::body::Body;
 use axum::http::{HeaderValue, Response, StatusCode};
 use axum::{middleware, Router};
 use futures_util::lock::Mutex;
-use leave::{tenant_router, LeaveState, LogSink};
+use leave::{ingest_router, tenant_router, IngestState, LeaveState, LogSink, INGEST_PATH};
 use tower_service::Service;
 use worker::{console_error, event, Context, Env, HttpRequest, Result, WorkerVersionMetadata};
 
@@ -34,13 +34,30 @@ use crate::bindings::{IchibanBinding, R2Pdfs};
 const LEAVE_R2_BINDING: &str = "LEAVE_R2";
 /// 一番星 Worker の Service Binding (本番だけ。staging には置かない — 部門・社員の口は 503)
 const ICHIBAN_DB_BINDING: &str = "ICHIBAN_DB";
+/// メール取り込みの口の共有 secret (Secrets Store の binding。`.get()` で実値にする)
+const INGEST_SECRET_BINDING: &str = "INTERNAL_SHARED_SECRET";
 
-/// 口は `/api` の下にだけ出す。tenant の layer は nest の中の全 route (と、その下で当たらない path) に掛かる
-fn router(state: LeaveState) -> Router {
+/// 管理 API は `/api` の下にだけ出す。tenant の layer は nest の中の全 route (と、その下で当たらない path) に掛かる。
+/// メール取り込みの口 `/internal/ingest` は nest の外 (tenant・admin の layer の外で、共有 secret で守る)
+fn router(state: LeaveState, ingest: IngestState) -> Router {
     let leave = tenant_router()
         .layer(middleware::from_fn(require_tenant_header))
         .with_state(state);
-    Router::new().nest("/api", leave)
+    Router::new()
+        .nest("/api", leave)
+        .merge(ingest_router().with_state(ingest))
+}
+
+/// 共有 secret の実値。取り込みの口へのリクエストでだけ引く。取れなければ `None` (口は全部 401)
+async fn ingest_secret(env: &Env) -> Option<Arc<str>> {
+    let store = env.secret_store(INGEST_SECRET_BINDING).ok()?;
+    match store.get().await {
+        Ok(Some(v)) => Some(Arc::from(v)),
+        _ => {
+            console_error!("leave: no {INGEST_SECRET_BINDING} value");
+            None
+        }
+    }
 }
 
 fn log_sink() -> LogSink {
@@ -87,13 +104,26 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
         .service(ICHIBAN_DB_BINDING)
         .ok()
         .map(|f| Arc::new(IchibanBinding::new(f)) as Arc<dyn leave::ichiban::IchibanApi>);
+    let secret = if req.uri().path() == INGEST_PATH {
+        ingest_secret(&env).await
+    } else {
+        None
+    };
+    let pg = Arc::new(Mutex::new(pg));
+    let pdfs = Arc::new(R2Pdfs::new(bucket));
+    let ingest = IngestState {
+        pg: pg.clone(),
+        pdfs: pdfs.clone(),
+        secret,
+        log: log_sink(),
+    };
     let state = LeaveState {
-        pg: Arc::new(Mutex::new(pg)),
-        pdfs: Arc::new(R2Pdfs::new(bucket)),
+        pg,
+        pdfs,
         ichiban,
         log: log_sink(),
     };
-    let mut resp = match router(state).call(req).await {
+    let mut resp = match router(state, ingest).call(req).await {
         Ok(r) => r,
         Err(e) => match e {},
     };

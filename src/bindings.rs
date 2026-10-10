@@ -32,6 +32,19 @@ impl PdfStore for R2Pdfs {
             Ok(Some(bytes))
         }))
     }
+
+    fn put<'a>(&'a self, key: &'a str, bytes: Vec<u8>) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(SendFuture::new(async move {
+            let put = self.0.put(key, bytes).execute().await;
+            put.map(|_| ()).map_err(|_| StoreError("put"))
+        }))
+    }
+
+    fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(SendFuture::new(async move {
+            self.0.delete(key).await.map_err(|_| StoreError("delete"))
+        }))
+    }
 }
 
 /// 一番星 Worker (binding `ICHIBAN_DB`)。URL の host は名目の値 (binding は host で経路が決まらない。

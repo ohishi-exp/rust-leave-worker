@@ -66,6 +66,15 @@ pub mod sql {
     pub const PERIOD_INSERT: &str = "INSERT INTO alc_api.leave_periods \
          (tenant_id, page_id, kind, start_date, end_date, half) VALUES ($1, $2, $3, $4, $5, $6)";
 
+    /// mailbox から tenant と許可リストを引く。SECURITY DEFINER で tenant をまたぐ (無効な設定・未知の mailbox は 0 行)
+    pub const MAILBOX_RESOLVE: &str =
+        "SELECT tenant_id, allowed_senders FROM alc_api.leave_resolve_mailbox($1)";
+
+    /// 1 通の PDF の全ページ (page_no 1..=$6) を 1 文で入れる
+    pub const PAGES_INSERT: &str = "INSERT INTO alc_api.leave_pages \
+         (tenant_id, r2_key, page_no, mail_from, subject, received_at, status) \
+         SELECT $1, $2, g, $3, $4, $5, 'unlinked' FROM generate_series(1, $6::int) AS g";
+
     pub const PAGE_R2_KEY: &str =
         "SELECT r2_key FROM alc_api.leave_pages WHERE tenant_id = $1 AND id = $2";
 }
@@ -297,6 +306,56 @@ pub async fn page_r2_key(
                 )
                 .await?;
             Ok(row.map(|r| r.get(0)))
+        })
+    })
+    .await
+}
+
+/// mailbox が指す tenant と、許可された送信元 (小文字化は呼び手)。未知・無効なら `None`。
+///
+/// tenant が決まる前の照会。alc-vein-worker・alc-dtako-worker に前例が無く、`PgClient` にはテナントを設定しない
+/// transaction の口が無いので、`tenant_tx(Uuid::nil(), ..)` の中でこの関数だけを呼ぶ。関数は SECURITY DEFINER
+/// (`SET search_path = alc_api`) で、tenant をまたいで `leave_settings` を引くため、設定した tenant には依存しない
+/// (nil UUID はどの tenant にも当たらない値)。
+pub async fn resolve_mailbox(
+    pg: &mut PgClient,
+    mailbox: String,
+) -> Result<Option<(Uuid, Vec<String>)>, Error> {
+    pg.tenant_tx(Uuid::nil(), move |tx| {
+        Box::pin(async move {
+            let row = tx
+                .query_typed_opt(sql::MAILBOX_RESOLVE, &[(&mailbox, Type::TEXT)])
+                .await?;
+            Ok(row.map(|r| (r.get::<_, Uuid>(0), r.get::<_, Vec<String>>(1))))
+        })
+    })
+    .await
+}
+
+/// 取り込んだ PDF のページ (1..=`pages`) を未紐づけで入れる。1 文 = 全ページ (途中までは入らない)
+pub struct NewPages {
+    pub r2_key: String,
+    pub mail_from: String,
+    pub subject: Option<String>,
+    pub received_at: DateTime<Utc>,
+    pub pages: i32,
+}
+
+pub async fn insert_pages(pg: &mut PgClient, tenant_id: Uuid, p: NewPages) -> Result<u64, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(
+                sql::PAGES_INSERT,
+                &[
+                    (&tenant_id, Type::UUID),
+                    (&p.r2_key, Type::TEXT),
+                    (&p.mail_from, Type::TEXT),
+                    (&p.subject, Type::TEXT),
+                    (&p.received_at, Type::TIMESTAMPTZ),
+                    (&p.pages, Type::INT4),
+                ],
+            )
+            .await
         })
     })
     .await

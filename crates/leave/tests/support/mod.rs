@@ -25,7 +25,7 @@ use futures_util::future::BoxFuture;
 use futures_util::lock::Mutex;
 use leave::ichiban::{IchibanApi, IchibanError, IchibanResponse};
 use leave::store::{PdfStore, StoreError};
-use leave::{tenant_router, LeaveState};
+use leave::{ingest_router, tenant_router, IngestState, LeaveState, INGEST_PATH};
 use tokio::sync::OnceCell;
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Config, NoTls};
@@ -239,6 +239,13 @@ pub struct FakePdfs {
     pub objects: HashMap<String, Vec<u8>>,
     pub fail: bool,
     pub reads: StdMutex<Vec<String>>,
+    /// 書き込みの口 (`put`)。`fail_put` なら失敗し、`drop_tenant_on_put` が在れば put の途中でその tenant を消す
+    /// (put の後の INSERT を外部キーで失敗させる)
+    pub stored: StdMutex<HashMap<String, Vec<u8>>>,
+    pub deleted: StdMutex<Vec<String>>,
+    pub fail_put: bool,
+    pub fail_delete: bool,
+    pub drop_tenant_on_put: Option<Uuid>,
 }
 
 impl PdfStore for FakePdfs {
@@ -249,6 +256,34 @@ impl PdfStore for FakePdfs {
                 return Err(StoreError("get"));
             }
             Ok(self.objects.get(key).cloned())
+        })
+    }
+
+    fn put<'a>(&'a self, key: &'a str, bytes: Vec<u8>) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            if self.fail_put {
+                return Err(StoreError("put"));
+            }
+            self.stored.lock().unwrap().insert(key.to_owned(), bytes);
+            if let Some(t) = self.drop_tenant_on_put {
+                admin()
+                    .await
+                    .execute("DELETE FROM alc_api.tenants WHERE id = $1", &[&t])
+                    .await
+                    .unwrap();
+            }
+            Ok(())
+        })
+    }
+
+    fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            self.deleted.lock().unwrap().push(key.to_owned());
+            if self.fail_delete {
+                return Err(StoreError("delete"));
+            }
+            self.stored.lock().unwrap().remove(key);
+            Ok(())
         })
     }
 }
@@ -314,11 +349,19 @@ fn build(pg: PgClient, pdfs: FakePdfs, ichiban: Option<FakeIchiban>) -> App {
         ichiban: ichiban.clone().map(|i| i as Arc<dyn IchibanApi>),
         log: Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_owned())),
     };
+    let ingest_state = IngestState {
+        pg: state.pg.clone(),
+        pdfs: pdfs.clone(),
+        secret: Some(INGEST_SECRET.into()),
+        log: state.log.clone(),
+    };
     let leave = tenant_router()
         .layer(middleware::from_fn(require_tenant_header))
         .with_state(state);
     App {
-        router: Router::new().nest("/api", leave),
+        router: Router::new()
+            .nest("/api", leave)
+            .merge(ingest_router().with_state(ingest_state)),
         pdfs,
         ichiban,
         logs,
@@ -380,6 +423,45 @@ pub async fn call(
     Got {
         status,
         content_type,
+        body,
+    }
+}
+
+/// テストの共有 secret (使い捨てで、秘密ではない)
+pub const INGEST_SECRET: &str = "leave-test-ingest-secret";
+
+/// `POST /internal/ingest` を 1 回打つ。`secret` が `None` ならヘッダーを付けない。`tenant_header` は
+/// 管理 API 向けのヘッダー (取り込みの口は見ない) を付けて確かめるための値
+pub async fn ingest(
+    app: &App,
+    secret: Option<&str>,
+    tenant_header: Option<Uuid>,
+    body: Vec<u8>,
+) -> Got {
+    let mut b = Request::builder()
+        .method("POST")
+        .uri(INGEST_PATH)
+        .header("content-type", "application/json");
+    if let Some(s) = secret {
+        b = b.header("X-Internal-Shared-Secret", s);
+    }
+    if let Some(t) = tenant_header {
+        b = b.header("X-Tenant-ID", t.to_string());
+    }
+    let resp = app
+        .router
+        .clone()
+        .oneshot(b.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    Got {
+        status,
+        content_type: None,
         body,
     }
 }

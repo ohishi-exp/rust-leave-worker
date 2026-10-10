@@ -51,6 +51,13 @@ bucket_name = "leave-pdfs"
 binding = "ICHIBAN_DB"
 service = "ichibanboshi-ichiban"
 
+# メール取り込みの口 (/internal/ingest) の共有 secret。ippoan/email-receiver の wrangler.toml と同じ Secrets Store の
+# secret (値は repo に無い。worker では `.get()` で実値にする)。binding は env に継承されないので staging にも書く
+[[secrets_store_secrets]]
+binding = "INTERNAL_SHARED_SECRET"
+store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
+secret_name = "INTERNAL_SHARED_SECRET"
+
 # staging: DB は ippoan/alc-vein-worker の staging と同じもの (Workers VPC の binding LEAVE_DB_VPC から
 # 既存の Tunnel 経由で PgBouncer へ繋ぐ。src/db.rs)。Hyperdrive は通さない。ICHIBAN_DB は無い (部門・社員の口は 503)。
 [env.staging]
@@ -81,6 +88,11 @@ remote = true
 [[env.staging.r2_buckets]]
 binding = "LEAVE_R2"
 bucket_name = "leave-pdfs-staging"
+
+[[env.staging.secrets_store_secrets]]
+binding = "INTERNAL_SHARED_SECRET"
+store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
+secret_name = "INTERNAL_SHARED_SECRET"
 
 # ローカル (`wrangler dev --env local`) 専用。deploy しない。
 # binding を持たない (binding は env に継承されない) ので、src/db.rs は文字列 DATABASE_URL の段で繋ぐ
