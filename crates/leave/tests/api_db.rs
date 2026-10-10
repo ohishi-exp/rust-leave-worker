@@ -230,7 +230,7 @@ async fn settings_default_then_upsert() {
     assert_eq!(
         got.json(),
         json!({"mailbox": null, "allowed_senders": [], "dept_codes": [], "lineworks_channel_id": null,
-               "notify_recipient_id": null, "grace_days": 7, "enabled": false, "updated_at": null})
+               "notify_recipient_id": null, "notify_bot_config_id": null, "grace_days": 7, "enabled": false, "updated_at": null})
     );
 
     let mailbox = format!("Leave-{}", &t.simple().to_string()[..12]);
@@ -407,7 +407,10 @@ async fn test_notify_sends_the_fixed_text_to_the_saved_target() {
     assert_eq!(got.json(), json!({"ok": true}));
     assert_eq!(
         *n.sent.lock().unwrap(),
-        vec![(NotifyTarget::Recipient(r), TEST_NOTIFY_TEXT.to_owned())]
+        vec![(
+            NotifyTarget::Recipient { id: r, bot: None },
+            TEST_NOTIFY_TEXT.to_owned()
+        )]
     );
     assert_eq!(
         TEST_NOTIFY_TEXT,
@@ -484,6 +487,97 @@ async fn test_notify_unavailable_is_503() {
     assert_eq!(got.status, 503);
     assert_eq!(got.json(), json!({"error": "notify_unavailable"}));
     assert!(a.logs.lock().unwrap().is_empty());
+}
+
+/// 個人宛てに使う bot は自 tenant の有効な LINE WORKS だけ。個人なしの bot は 400。拒んだ PUT は何も書かない
+#[tokio::test]
+async fn notify_bot_must_be_own_enabled_lineworks_with_recipient() {
+    let (t1, t2) = (tenant().await, tenant().await);
+    let r = notify_recipient(t1, "lineworks", true).await;
+    let own = support::bot_config(t1, "lineworks", true).await;
+    let other = support::bot_config(t2, "lineworks", true).await;
+    let disabled = support::bot_config(t1, "lineworks", false).await;
+    let line = support::bot_config(t1, "line", true).await;
+    let a = app(FakePdfs::default(), None).await;
+
+    let got = put_settings(
+        &a,
+        t1,
+        json!({"notify_recipient_id": r, "notify_bot_config_id": own}),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json()["notify_bot_config_id"], own.to_string());
+    let got = call(&a, "GET", "/api/leave/settings", Some(t1), ADMIN, None).await;
+    assert_eq!(got.json()["notify_bot_config_id"], own.to_string());
+
+    for bot in [other, disabled, line, Uuid::new_v4()] {
+        let got = put_settings(
+            &a,
+            t1,
+            json!({"notify_recipient_id": r, "notify_bot_config_id": bot, "grace_days": 1}),
+        )
+        .await;
+        assert_eq!(got.status, 400);
+        assert_eq!(got.json(), json!({"error": "unknown_notify_bot"}));
+    }
+    // 個人を選んでいないのに bot だけ指定
+    let got = put_settings(&a, t1, json!({"notify_bot_config_id": own})).await;
+    assert_eq!(got.status, 400);
+    assert_eq!(got.json(), json!({"error": "notify_bot_without_recipient"}));
+
+    // 拒んだ PUT は何も書いていない
+    let got = call(&a, "GET", "/api/leave/settings", Some(t1), ADMIN, None).await;
+    assert_eq!(got.json()["notify_bot_config_id"], own.to_string());
+    assert_eq!(got.json()["grace_days"], 7);
+
+    // bot を外せば (個人のまま) bot 無しに戻る
+    let got = put_settings(&a, t1, json!({"notify_recipient_id": r})).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json()["notify_bot_config_id"], Value::Null);
+}
+
+/// テスト送信は設定した bot を載せて送る。bot が使えなくなったら (無効にした) 送らない — 別の bot へ戻らない
+#[tokio::test]
+async fn test_notify_uses_the_configured_bot_and_never_falls_back() {
+    let t = tenant().await;
+    let r = notify_recipient(t, "lineworks", true).await;
+    let bot = support::bot_config(t, "lineworks", true).await;
+    let n = Arc::new(FakeNotifier::default());
+    let a = app_with_notifier(n.clone()).await;
+    put_settings(
+        &a,
+        t,
+        json!({"notify_recipient_id": r, "notify_bot_config_id": bot}),
+    )
+    .await;
+
+    let got = test_notify(&a, t).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(
+        *n.sent.lock().unwrap(),
+        vec![(
+            NotifyTarget::Recipient {
+                id: r,
+                bot: Some(bot)
+            },
+            TEST_NOTIFY_TEXT.to_owned()
+        )]
+    );
+
+    support::admin()
+        .await
+        .execute(
+            "UPDATE alc_api.bot_configs SET enabled = false WHERE id = $1",
+            &[&bot],
+        )
+        .await
+        .unwrap();
+    let got = test_notify(&a, t).await;
+    assert_eq!(got.status, 400);
+    assert_eq!(got.json(), json!({"error": "no_notify_target"}));
+    assert_eq!(n.sent.lock().unwrap().len(), 1);
+    assert_eq!(*n.calls.lock().unwrap(), 1);
 }
 
 #[tokio::test]

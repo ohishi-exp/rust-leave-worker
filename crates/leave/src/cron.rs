@@ -39,18 +39,25 @@ pub const LINEWORKS_SEND_URL: &str =
 pub enum NotifyTarget {
     /// `lineworks_channels.id` (LINE WORKS の channelId ではない)
     Channel(Uuid),
-    /// `notify_recipients.id` (LINE WORKS の有効な行)
-    Recipient(Uuid),
+    /// `notify_recipients.id` (LINE WORKS の有効な行) と、その送信に使う bot (`bot_configs.id`)。
+    /// bot が `None` なら送信側の既定 (設定が無い従来の形)。tenant に bot が複数あるとき、bot を指定しないと
+    /// 別用途の bot から届くので、設定した bot が使えないときは宛先にせず送らない (`pg::notify_target`)
+    Recipient { id: Uuid, bot: Option<Uuid> },
 }
 
 impl alc_worker_db::TxOutput for NotifyTarget {}
 
-/// 送信の本文 (`{"channel_id": "<id>", "text": "..."}` か `{"recipient_id": "<id>", "text": "..."}` の排他)。
-/// 宛先は `Uuid` の型で受けるので形は常に正しい
+/// 送信の本文 (`{"channel_id": "<id>", "text": "..."}` か `{"recipient_id": "<id>", "text": "..."}` の排他。
+/// 個人宛てで bot があれば `"bot_config_id"` も載せる)。宛先は `Uuid` の型で受けるので形は常に正しい
 pub fn send_body(target: NotifyTarget, text: &str) -> String {
     match target {
         NotifyTarget::Channel(id) => serde_json::json!({ "channel_id": id, "text": text }),
-        NotifyTarget::Recipient(id) => serde_json::json!({ "recipient_id": id, "text": text }),
+        NotifyTarget::Recipient { id, bot: None } => {
+            serde_json::json!({ "recipient_id": id, "text": text })
+        }
+        NotifyTarget::Recipient { id, bot: Some(bot) } => {
+            serde_json::json!({ "recipient_id": id, "bot_config_id": bot, "text": text })
+        }
     }
     .to_string()
 }
@@ -338,13 +345,36 @@ mod tests {
     #[test]
     fn send_body_recipient_shape() {
         let body: serde_json::Value = serde_json::from_str(&send_body(
-            NotifyTarget::Recipient(Uuid::from_u128(2)),
+            NotifyTarget::Recipient {
+                id: Uuid::from_u128(2),
+                bot: None,
+            },
             "う",
         ))
         .unwrap();
         assert_eq!(
             body,
             serde_json::json!({"recipient_id": Uuid::from_u128(2).to_string(), "text": "う"})
+        );
+    }
+
+    #[test]
+    fn send_body_recipient_with_bot_shape() {
+        let body: serde_json::Value = serde_json::from_str(&send_body(
+            NotifyTarget::Recipient {
+                id: Uuid::from_u128(2),
+                bot: Some(Uuid::from_u128(3)),
+            },
+            "え",
+        ))
+        .unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "recipient_id": Uuid::from_u128(2).to_string(),
+                "bot_config_id": Uuid::from_u128(3).to_string(),
+                "text": "え"
+            })
         );
     }
 }

@@ -25,6 +25,6 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
 - DB は `PgClient::tenant_tx` + `query_typed` 系だけ。SQL は `crates/leave/src/pg.rs` の 1 か所。
   名前付き prepared statement 禁止。WHERE に tenant_id も明示する。
 - 応答・ログには固定の語だけ (識別子・入力値・生のエラー文を出さない)。
-- `coverage_100.toml` の登録を外さない。CI の本数 (lib 66・api_db 48・cron_db 8) はテストを足したら上げる。
+- `coverage_100.toml` の登録を外さない。CI の本数 (lib 67・api_db 50・cron_db 10) はテストを足したら上げる。
 - public repo: ホスト名・tenant UUID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (alc-vein-worker と同じ rev)。

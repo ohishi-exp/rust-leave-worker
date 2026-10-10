@@ -17,7 +17,7 @@ use crate::settings::{Settings, ValidSettings};
 pub mod sql {
     pub const SETTINGS_SELECT: &str =
         "SELECT mailbox, allowed_senders, dept_codes, lineworks_channel_id, notify_recipient_id, \
-         grace_days, enabled, updated_at \
+         notify_bot_config_id, grace_days, enabled, updated_at \
          FROM alc_api.leave_settings WHERE tenant_id = $1";
 
     /// lineworks_channels は FORCE RLS で、自 tenant の行しか見えない。tenant も明示する
@@ -28,14 +28,19 @@ pub mod sql {
     pub const RECIPIENT_EXISTS: &str = "SELECT 1 FROM alc_api.notify_recipients \
          WHERE id = $1 AND tenant_id = $2 AND provider = 'lineworks' AND enabled";
 
+    /// 個人宛てに使う bot は LINE WORKS の有効な行だけ。tenant も明示する
+    pub const BOT_EXISTS: &str = "SELECT 1 FROM alc_api.bot_configs \
+         WHERE id = $1 AND tenant_id = $2 AND provider = 'lineworks' AND enabled";
+
     pub const SETTINGS_UPSERT: &str = "INSERT INTO alc_api.leave_settings \
-         (tenant_id, mailbox, allowed_senders, dept_codes, lineworks_channel_id, notify_recipient_id, grace_days, enabled, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) \
+         (tenant_id, mailbox, allowed_senders, dept_codes, lineworks_channel_id, notify_recipient_id, notify_bot_config_id, grace_days, enabled, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW()) \
          ON CONFLICT (tenant_id) DO UPDATE SET mailbox = EXCLUDED.mailbox, allowed_senders = EXCLUDED.allowed_senders, \
          dept_codes = EXCLUDED.dept_codes, lineworks_channel_id = EXCLUDED.lineworks_channel_id, \
-         notify_recipient_id = EXCLUDED.notify_recipient_id, \
+         notify_recipient_id = EXCLUDED.notify_recipient_id, notify_bot_config_id = EXCLUDED.notify_bot_config_id, \
          grace_days = EXCLUDED.grace_days, enabled = EXCLUDED.enabled, updated_at = NOW() \
-         RETURNING mailbox, allowed_senders, dept_codes, lineworks_channel_id, notify_recipient_id, grace_days, enabled, updated_at";
+         RETURNING mailbox, allowed_senders, dept_codes, lineworks_channel_id, notify_recipient_id, \
+         notify_bot_config_id, grace_days, enabled, updated_at";
 
     const PAGE_COLUMNS: &str =
         "id, r2_key, page_no, mail_from, subject, received_at, employee_cd, status, \
@@ -139,10 +144,14 @@ pub mod sql {
     pub const ENABLED_TENANTS: &str =
         "SELECT tenant_id, dept_codes, grace_days FROM alc_api.leave_enabled_tenants()";
 
-    /// 警告の宛先 (グループ, 個人)。個人は LINE WORKS の有効な行のときだけ返す (無効になった宛先に毎朝送り続けない)
-    pub const NOTIFY_TARGET: &str = "SELECT s.lineworks_channel_id, r.id FROM alc_api.leave_settings s \
+    /// 警告の宛先 (グループ, 個人, 設定した bot, その bot が使えるか)。個人は LINE WORKS の有効な行のときだけ返す
+    /// (無効になった宛先に毎朝送り続けない)。bot は設定されていて使える (自 tenant・lineworks・有効) ときだけ 4 列目が入る
+    pub const NOTIFY_TARGET: &str = "SELECT s.lineworks_channel_id, r.id, s.notify_bot_config_id, b.id \
+         FROM alc_api.leave_settings s \
          LEFT JOIN alc_api.notify_recipients r ON r.id = s.notify_recipient_id AND r.tenant_id = $1 \
          AND r.provider = 'lineworks' AND r.enabled \
+         LEFT JOIN alc_api.bot_configs b ON b.id = s.notify_bot_config_id AND b.tenant_id = $1 \
+         AND b.provider = 'lineworks' AND b.enabled \
          WHERE s.tenant_id = $1";
 
     /// ずれを入れる。解決済みの行が再びずれたら未解決・未通知に戻す
@@ -368,7 +377,8 @@ pub async fn enabled_tenants(pg: &mut PgClient) -> Result<Vec<EnabledTenant>, Er
     .await
 }
 
-/// tenant の警告の宛先 (グループか個人)。無い・個人が送れない行なら `None`
+/// tenant の警告の宛先 (グループか個人)。無い・個人が送れない行・設定した bot が使えない (消えた・無効) なら `None`
+/// (bot を名前順の最初に戻して別用途の bot から送ることはしない)
 pub async fn notify_target(
     pg: &mut PgClient,
     tenant_id: Uuid,
@@ -379,9 +389,16 @@ pub async fn notify_target(
                 .query_typed_opt(sql::NOTIFY_TARGET, &[(&tenant_id, Type::UUID)])
                 .await?;
             Ok(row.and_then(|r| {
-                r.get::<_, Option<Uuid>>(0)
-                    .map(NotifyTarget::Channel)
-                    .or_else(|| r.get::<_, Option<Uuid>>(1).map(NotifyTarget::Recipient))
+                if let Some(channel) = r.get::<_, Option<Uuid>>(0) {
+                    return Some(NotifyTarget::Channel(channel));
+                }
+                let id = r.get::<_, Option<Uuid>>(1)?;
+                let configured = r.get::<_, Option<Uuid>>(2).is_some();
+                let bot = r.get::<_, Option<Uuid>>(3);
+                if configured && bot.is_none() {
+                    return None;
+                }
+                Some(NotifyTarget::Recipient { id, bot })
             }))
         })
     })
@@ -473,9 +490,10 @@ fn settings_from_row(row: &Row) -> Settings {
         dept_codes: row.get(2),
         lineworks_channel_id: row.get(3),
         notify_recipient_id: row.get(4),
-        grace_days: row.get(5),
-        enabled: row.get(6),
-        updated_at: Some(row.get::<_, DateTime<Utc>>(7)),
+        notify_bot_config_id: row.get(5),
+        grace_days: row.get(6),
+        enabled: row.get(7),
+        updated_at: Some(row.get::<_, DateTime<Utc>>(8)),
     }
 }
 
@@ -524,6 +542,7 @@ pub enum PutSettings {
     Saved(Settings),
     UnknownChannel,
     UnknownRecipient,
+    UnknownBot,
 }
 
 impl TxOutput for PutSettings {}
@@ -547,6 +566,11 @@ pub async fn put_settings(
                     sql::RECIPIENT_EXISTS,
                     PutSettings::UnknownRecipient,
                 ),
+                (
+                    s.notify_bot_config_id,
+                    sql::BOT_EXISTS,
+                    PutSettings::UnknownBot,
+                ),
             ] {
                 let Some(id) = id else { continue };
                 let seen = tx
@@ -566,6 +590,7 @@ pub async fn put_settings(
                         (&s.dept_codes, Type::TEXT_ARRAY),
                         (&s.lineworks_channel_id, Type::UUID),
                         (&s.notify_recipient_id, Type::UUID),
+                        (&s.notify_bot_config_id, Type::UUID),
                         (&s.grace_days, Type::INT4),
                         (&s.enabled, Type::BOOL),
                     ],

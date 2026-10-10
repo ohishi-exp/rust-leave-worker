@@ -18,6 +18,8 @@ pub struct Settings {
     pub lineworks_channel_id: Option<Uuid>,
     /// 個人の宛先 (`notify_recipients.id`、LINE WORKS の行)。グループ (`lineworks_channel_id`) とどちらか 1 つ
     pub notify_recipient_id: Option<Uuid>,
+    /// 個人宛てに使う LINE WORKS の bot (`bot_configs.id`)。個人を選んだときだけ。無ければ送信側の既定の bot
+    pub notify_bot_config_id: Option<Uuid>,
     pub grace_days: i32,
     pub enabled: bool,
     pub updated_at: Option<DateTime<Utc>>,
@@ -33,6 +35,7 @@ impl Default for Settings {
             dept_codes: Vec::new(),
             lineworks_channel_id: None,
             notify_recipient_id: None,
+            notify_bot_config_id: None,
             grace_days: DEFAULT_GRACE_DAYS,
             enabled: false,
             updated_at: None,
@@ -55,6 +58,8 @@ pub struct SettingsInput {
     #[serde(default)]
     pub notify_recipient_id: Option<Uuid>,
     #[serde(default)]
+    pub notify_bot_config_id: Option<Uuid>,
+    #[serde(default)]
     pub grace_days: Option<i32>,
     #[serde(default)]
     pub enabled: bool,
@@ -68,6 +73,7 @@ pub struct ValidSettings {
     pub dept_codes: Vec<String>,
     pub lineworks_channel_id: Option<Uuid>,
     pub notify_recipient_id: Option<Uuid>,
+    pub notify_bot_config_id: Option<Uuid>,
     pub grace_days: i32,
     pub enabled: bool,
 }
@@ -117,12 +123,17 @@ pub fn validate(input: SettingsInput) -> Result<ValidSettings, &'static str> {
     if input.lineworks_channel_id.is_some() && input.notify_recipient_id.is_some() {
         return Err("both_notify_targets");
     }
+    // bot は個人宛てのときだけ (表の CHECK と同じ)
+    if input.notify_bot_config_id.is_some() && input.notify_recipient_id.is_none() {
+        return Err("notify_bot_without_recipient");
+    }
     Ok(ValidSettings {
         mailbox,
         allowed_senders: clean_list(input.allowed_senders, true),
         dept_codes: clean_list(input.dept_codes, false),
         lineworks_channel_id: input.lineworks_channel_id,
         notify_recipient_id: input.notify_recipient_id,
+        notify_bot_config_id: input.notify_bot_config_id,
         grace_days,
         enabled: input.enabled,
     })
@@ -178,6 +189,7 @@ mod tests {
                 dept_codes: vec![],
                 lineworks_channel_id: None,
                 notify_recipient_id: None,
+                notify_bot_config_id: None,
                 grace_days: DEFAULT_GRACE_DAYS,
                 enabled: false,
             }
@@ -229,6 +241,25 @@ mod tests {
             (v.lineworks_channel_id, v.notify_recipient_id),
             (None, Some(Uuid::from_u128(2)))
         );
+        // bot だけ (個人なし) は弾く。個人と一緒なら通る
+        let r = validate(SettingsInput {
+            notify_bot_config_id: Some(Uuid::from_u128(3)),
+            ..Default::default()
+        });
+        assert_eq!(r, Err("notify_bot_without_recipient"));
+        let r = validate(SettingsInput {
+            lineworks_channel_id: Some(Uuid::from_u128(1)),
+            notify_bot_config_id: Some(Uuid::from_u128(3)),
+            ..Default::default()
+        });
+        assert_eq!(r, Err("notify_bot_without_recipient"));
+        let v = validate(SettingsInput {
+            notify_recipient_id: Some(Uuid::from_u128(2)),
+            notify_bot_config_id: Some(Uuid::from_u128(3)),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(v.notify_bot_config_id, Some(Uuid::from_u128(3)));
         assert!(validate(SettingsInput {
             grace_days: Some(GRACE_DAYS_MAX),
             ..Default::default()
@@ -243,7 +274,7 @@ mod tests {
             json,
             serde_json::json!({
                 "mailbox": null, "allowed_senders": [], "dept_codes": [],
-                "lineworks_channel_id": null, "notify_recipient_id": null, "grace_days": 7, "enabled": false, "updated_at": null
+                "lineworks_channel_id": null, "notify_recipient_id": null, "notify_bot_config_id": null, "grace_days": 7, "enabled": false, "updated_at": null
             })
         );
     }

@@ -377,7 +377,7 @@ async fn recipient_target_is_sent() {
     assert_eq!(
         *n.sent.lock().unwrap(),
         vec![(
-            NotifyTarget::Recipient(r),
+            NotifyTarget::Recipient { id: r, bot: None },
             "【勤怠申請】一番星と申請書のずれ 1 件\n1021 山田太郎: 10/03 有休 — 申請書なし"
                 .to_owned()
         )]
@@ -420,8 +420,82 @@ async fn unusable_recipient_keeps_alerts_pending() {
     assert_eq!(s.tenants[0].sent_messages, 1);
     assert!(matches!(
         n.sent.lock().unwrap()[0].0,
-        NotifyTarget::Recipient(_)
+        NotifyTarget::Recipient { .. }
     ));
+}
+
+/// 個人宛ての bot を設定する (個人は `set_recipient` で先に入れる)
+async fn set_bot(t: Uuid, bot: Uuid) {
+    admin()
+        .await
+        .execute(
+            "UPDATE alc_api.leave_settings SET notify_bot_config_id = $2 WHERE tenant_id = $1",
+            &[&t, &bot],
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn recipient_with_bot_is_sent_through_that_bot() {
+    let _g = serial().await;
+    let (t, _) = enabled_tenant("10", false).await;
+    let r = notify_recipient(t, "lineworks", true).await;
+    let bot = support::bot_config(t, "lineworks", true).await;
+    set_recipient(t, r).await;
+    set_bot(t, bot).await;
+    let f = ichiban(
+        vec![employee("1021", "山田太郎", "10", None)],
+        &[day("1021", "2026-10-03", "有休")],
+    );
+    let n = FakeNotifier::default();
+    let s = run_once(&f, &n).await;
+    assert_eq!((s.tenants[0].sent_messages, s.tenants[0].notified), (1, 1));
+    assert_eq!(
+        n.sent.lock().unwrap()[0].0,
+        NotifyTarget::Recipient {
+            id: r,
+            bot: Some(bot)
+        }
+    );
+}
+
+#[tokio::test]
+async fn unusable_bot_keeps_alerts_pending_without_falling_back() {
+    let _g = serial().await;
+    let (t, _) = enabled_tenant("10", false).await;
+    let r = notify_recipient(t, "lineworks", true).await;
+    set_recipient(t, r).await;
+    let f = ichiban(
+        vec![employee("1021", "山田太郎", "10", None)],
+        &[day("1021", "2026-10-03", "有休")],
+    );
+    // 無効の bot・LINE の bot には送らない (bot 無しの Recipient に戻って別の bot から届くことも無い)
+    for bot in [
+        support::bot_config(t, "lineworks", false).await,
+        support::bot_config(t, "line", true).await,
+    ] {
+        set_bot(t, bot).await;
+        let n = FakeNotifier::default();
+        let s = run_once(&f, &n).await;
+        assert_eq!((s.tenants[0].pending, s.tenants[0].sent_messages), (1, 0));
+        assert!(n.sent.lock().unwrap().is_empty());
+        assert_eq!(*n.calls.lock().unwrap(), 0);
+    }
+    assert!(alerts(t).await.iter().all(|x| !x.4));
+    // 使える bot にすれば次の回に送る
+    let ok = support::bot_config(t, "lineworks", true).await;
+    set_bot(t, ok).await;
+    let n = FakeNotifier::default();
+    let s = run_once(&f, &n).await;
+    assert_eq!(s.tenants[0].sent_messages, 1);
+    assert_eq!(
+        n.sent.lock().unwrap()[0].0,
+        NotifyTarget::Recipient {
+            id: r,
+            bot: Some(ok)
+        }
+    );
 }
 
 #[tokio::test]
