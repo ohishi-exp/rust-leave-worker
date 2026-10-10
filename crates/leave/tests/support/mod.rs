@@ -188,25 +188,32 @@ pub async fn tenant() -> Uuid {
     id
 }
 
-/// tenant の LINE WORKS のチャネルを 1 つ作る (bot の設定も合わせて。値は固定のダミー)
-pub async fn lineworks_channel(tenant_id: Uuid) -> Uuid {
-    let su = admin().await;
-    let bot: Uuid = su
+/// tenant の bot の設定を 1 つ作る (`provider` = lineworks / line、値は固定のダミー)
+pub async fn bot_config(tenant_id: Uuid, provider: &str, enabled: bool) -> Uuid {
+    admin()
+        .await
         .query_one(
-            "INSERT INTO alc_api.bot_configs (tenant_id, name, client_id, client_secret_encrypted, service_account, private_key_encrypted, bot_id) \
-             VALUES ($1, 'test', 'c', 's', 'sa', 'k', $2) RETURNING id",
-            &[&tenant_id, &Uuid::new_v4().to_string()],
+            "INSERT INTO alc_api.bot_configs (tenant_id, provider, name, client_id, client_secret_encrypted, service_account, private_key_encrypted, bot_id, enabled) \
+             VALUES ($1, $2, 'test', 'c', 's', 'sa', 'k', $3, $4) RETURNING id",
+            &[&tenant_id, &provider, &Uuid::new_v4().to_string(), &enabled],
         )
         .await
         .unwrap()
-        .get(0);
-    su.query_one(
-        "INSERT INTO alc_api.lineworks_channels (tenant_id, bot_config_id, channel_id) VALUES ($1, $2, $3) RETURNING id",
-        &[&tenant_id, &bot, &Uuid::new_v4().to_string()],
-    )
-    .await
-    .unwrap()
-    .get(0)
+        .get(0)
+}
+
+/// tenant の LINE WORKS のチャネルを 1 つ作る (bot の設定も合わせて。値は固定のダミー)
+pub async fn lineworks_channel(tenant_id: Uuid) -> Uuid {
+    let bot = bot_config(tenant_id, "lineworks", true).await;
+    admin()
+        .await
+        .query_one(
+            "INSERT INTO alc_api.lineworks_channels (tenant_id, bot_config_id, channel_id) VALUES ($1, $2, $3) RETURNING id",
+            &[&tenant_id, &bot, &Uuid::new_v4().to_string()],
+        )
+        .await
+        .unwrap()
+        .get(0)
 }
 
 /// tenant の通知先 (個人) を 1 つ作る (`provider` = lineworks / line、値は固定のダミー)
