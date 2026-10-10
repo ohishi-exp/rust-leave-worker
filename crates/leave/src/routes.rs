@@ -1,4 +1,4 @@
-//! 管理 API の口 (7 本、worker が `/api` の下に nest するので実際の path は `/api/leave/…`)。
+//! 管理 API の口 (12 本、worker が `/api` の下に nest するので実際の path は `/api/leave/…`)。
 //!
 //! | method | path | 中身 |
 //! |---|---|---|
@@ -8,6 +8,10 @@
 //! | GET | `/leave/pages` | ページの一覧 (`status`・`employee_cd`・`limit`・`offset`) |
 //! | GET / PUT | `/leave/pages/{id}` | ページ + 期間 / 紐づけの更新 |
 //! | GET | `/leave/pages/{id}/pdf` | そのページの PDF (自 tenant に見える行だけ) |
+//! | GET | `/leave/calendar` | 乗務員の月のカレンダー (`ledger`) |
+//! | GET / POST | `/leave/grants` | 有給の付与台帳と残 / 手で付与を足す (`ledger`) |
+//! | POST | `/leave/grants/auto` | 法定付与を足す (`ledger`) |
+//! | PUT / DELETE | `/leave/grants/{id}` | 付与を直す / 消す (`ledger`) |
 //!
 //! **全部の口を [`require_admin`] が包む** (管理者でなければ 403。handler にも DB にも届かない)。
 //! tenant ヘッダーの検査 (`alc_core_wasm::require_tenant_header`、無ければ 401) は worker がこの外側に掛ける。
@@ -25,14 +29,16 @@ use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post, put};
 use axum::{middleware, Extension, Json, Router};
+use chrono::{DateTime, Utc};
 use futures_util::lock::Mutex;
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::auth::{actor, require_admin};
 use crate::ichiban::{filter_employees, IchibanApi, DEPARTMENTS_PATH, EMPLOYEES_PATH};
+use crate::ledger;
 use crate::pages::{validate_update, ListQuery, ListQueryRaw, PageUpdateInput};
 use crate::pg;
 use crate::settings::{validate, Settings, SettingsInput};
@@ -41,6 +47,9 @@ use crate::store::PdfStore;
 /// ログの出し先 (Workers では console_error)。渡す文は段の名前と kind だけ
 pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// 今の時刻 (Workers では JS の Date。テストは固定の値を差す)。「今日」は日本時間で決める
+pub type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct LeaveState {
     pub pg: Arc<Mutex<PgClient>>,
@@ -48,6 +57,7 @@ pub struct LeaveState {
     /// 一番星 Worker の binding。無い環境 (staging) では `None` で、部門・社員の口は 503
     pub ichiban: Option<Arc<dyn IchibanApi>>,
     pub log: LogSink,
+    pub now: Clock,
 }
 
 pub fn tenant_router() -> Router<LeaveState> {
@@ -58,29 +68,39 @@ pub fn tenant_router() -> Router<LeaveState> {
         .route("/leave/pages", get(list_pages))
         .route("/leave/pages/{id}", get(get_page).put(put_page))
         .route("/leave/pages/{id}/pdf", get(get_pdf))
+        .route("/leave/calendar", get(ledger::calendar))
+        .route(
+            "/leave/grants",
+            get(ledger::list_grants).post(ledger::create_grant),
+        )
+        .route("/leave/grants/auto", post(ledger::auto_grants))
+        .route(
+            "/leave/grants/{id}",
+            put(ledger::update_grant).delete(ledger::delete_grant),
+        )
         .route_layer(middleware::from_fn(require_admin))
 }
 
-fn error(status: StatusCode, code: &str) -> Response {
+pub(crate) fn error(status: StatusCode, code: &str) -> Response {
     (status, Json(json!({ "error": code }))).into_response()
 }
 
-fn bad_request(code: &str) -> Response {
+pub(crate) fn bad_request(code: &str) -> Response {
     error(StatusCode::BAD_REQUEST, code)
 }
 
-fn not_found() -> Response {
+pub(crate) fn not_found() -> Response {
     error(StatusCode::NOT_FOUND, "not_found")
 }
 
 /// DB のエラー: kind (SQLSTATE か固定の語) だけをログに出し、500
-fn db_error(state: &LeaveState, stage: &str, e: &tokio_postgres::Error) -> Response {
+pub(crate) fn db_error(state: &LeaveState, stage: &str, e: &tokio_postgres::Error) -> Response {
     (state.log)(&format!("{stage}: {}", alc_worker_db::kind(e)));
     error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
 }
 
 /// path の id。UUID でなければその行は在り得ないので 404
-fn parse_id(id: &str) -> Option<Uuid> {
+pub(crate) fn parse_id(id: &str) -> Option<Uuid> {
     Uuid::parse_str(id).ok()
 }
 
@@ -119,12 +139,12 @@ async fn put_settings(
     }
 }
 
-fn ichiban_not_configured() -> Response {
+pub(crate) fn ichiban_not_configured() -> Response {
     error(StatusCode::SERVICE_UNAVAILABLE, "ichiban_not_configured")
 }
 
 /// 一番星を 1 回呼び、2xx の本文だけを返す (それ以外は 502 の本文の語)
-async fn ichiban_get(
+pub(crate) async fn ichiban_get(
     state: &LeaveState,
     api: &Arc<dyn IchibanApi>,
     path: &str,

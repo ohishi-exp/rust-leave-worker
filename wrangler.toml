@@ -51,6 +51,16 @@ bucket_name = "leave-pdfs"
 binding = "ICHIBAN_DB"
 service = "ichibanboshi-ichiban"
 
+# auth-worker (Service Binding)。定時実行の LINE WORKS 通知を内部 proxy 経由で送る (src/bindings.rs)。本番だけに置く
+[[services]]
+binding = "AUTH_WORKER"
+service = "auth-worker"
+
+# 毎朝 7:00 JST に一番星と申請書を突き合わせる (src/lib.rs の scheduled)。本番だけ — staging / local は下で空にする
+# (triggers は env に継承されるため。staging には一番星の binding が無い)
+[triggers]
+crons = ["0 22 * * *"]
+
 # staging: DB は ippoan/alc-vein-worker の staging と同じもの (Workers VPC の binding LEAVE_DB_VPC から
 # 既存の Tunnel 経由で PgBouncer へ繋ぐ。src/db.rs)。Hyperdrive は通さない。ICHIBAN_DB は無い (部門・社員の口は 503)。
 [env.staging]
@@ -82,9 +92,16 @@ remote = true
 binding = "LEAVE_R2"
 bucket_name = "leave-pdfs-staging"
 
+# 定時実行は本番だけ (トップレベルの triggers を継承させない)
+[env.staging.triggers]
+crons = []
+
 # ローカル (`wrangler dev --env local`) 専用。deploy しない。
 # binding を持たない (binding は env に継承されない) ので、src/db.rs は文字列 DATABASE_URL の段で繋ぐ
 [env.local]
 name = "rust-leave-worker-local"
 workers_dev = false
 preview_urls = false
+
+[env.local.triggers]
+crons = []
