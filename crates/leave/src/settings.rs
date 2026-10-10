@@ -151,11 +151,8 @@ mod tests {
             "あいう",
             "a b c",
         ] {
-            assert_eq!(
-                normalize_mailbox(Some(bad)),
-                Err("invalid_mailbox"),
-                "{bad:?}"
-            );
+            let got = normalize_mailbox(Some(bad));
+            assert_eq!(got, Err("invalid_mailbox"), "{bad:?}");
         }
     }
 
