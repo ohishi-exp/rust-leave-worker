@@ -193,8 +193,8 @@ pub async fn bot_config(tenant_id: Uuid, provider: &str, enabled: bool) -> Uuid 
     admin()
         .await
         .query_one(
-            "INSERT INTO alc_api.bot_configs (tenant_id, provider, name, client_id, client_secret_encrypted, service_account, private_key_encrypted, bot_id, enabled) \
-             VALUES ($1, $2, 'test', 'c', 's', 'sa', 'k', $3, $4) RETURNING id",
+            "INSERT INTO alc_api.bot_configs (tenant_id, provider, name, client_id, client_secret_encrypted, service_account, bot_id, enabled) \
+             VALUES ($1, $2, 'test', 'c', 's', 'sa', $3, $4) RETURNING id",
             &[&tenant_id, &provider, &Uuid::new_v4().to_string(), &enabled],
         )
         .await
