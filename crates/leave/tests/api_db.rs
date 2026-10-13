@@ -132,6 +132,11 @@ mod forbidden {
     }
 
     #[tokio::test]
+    async fn list_alerts() {
+        assert_forbidden("GET", "/api/leave/alerts", None).await;
+    }
+
+    #[tokio::test]
     async fn departments() {
         assert_forbidden("GET", "/api/leave/departments", None).await;
     }
@@ -1224,6 +1229,87 @@ async fn pdf_served_from_store() {
     assert_eq!(*a.logs.lock().unwrap(), vec!["get_pdf: store get"]);
 }
 
+/// 警告を 1 行入れる (superuser で。毎朝の突き合わせの代わり)
+async fn alert_row(
+    t: Uuid,
+    emp: &str,
+    day: &str,
+    (kind, direction): (&str, &str),
+    notified_at: Option<&str>,
+    resolved: bool,
+) {
+    let day: chrono::NaiveDate = day.parse().unwrap();
+    let notified_at: Option<chrono::DateTime<chrono::Utc>> =
+        notified_at.map(|v| v.parse().unwrap());
+    support::admin()
+        .await
+        .execute(
+            "INSERT INTO alc_api.leave_alerts (tenant_id, employee_cd, day, kind, direction, first_seen_at, notified_at, resolved_at) \
+             VALUES ($1, $2, $3, $4, $5, '2026-10-01T00:00:00Z', $6, CASE WHEN $7 THEN now() END)",
+            &[&t, &emp, &day, &kind, &direction, &notified_at, &resolved],
+        )
+        .await
+        .unwrap();
+}
+
+/// 未解消の警告の一覧: 未解決かつ窓 (今日 2026-10-10 (JST) − 62 日 〜 昨日) の中だけを乗務員・日の順で。
+/// 解決済み・窓の外 (未解決のまま表に残る行)・他の tenant の行は出ない
+#[tokio::test]
+async fn list_alerts_open_in_window_only() {
+    let (t, other) = (tenant().await, tenant().await);
+    let a = app(FakePdfs::default(), None).await;
+    let get = |t: Uuid| {
+        let a = &a;
+        async move { call(a, "GET", "/api/leave/alerts", Some(t), ADMIN, None).await }
+    };
+    // 1 件も無ければ空の配列
+    let got = get(t).await;
+    assert_eq!((got.status, got.json()), (200, json!({"alerts": []})));
+
+    let ichiban_only = ("yukyu", "ichiban_only");
+    alert_row(t, "1022", "2026-10-03", ichiban_only, None, false).await;
+    alert_row(
+        t,
+        "1021",
+        "2026-10-09",
+        ("rousai", "pdf_only"),
+        Some("2026-10-09T23:00:00Z"),
+        false,
+    )
+    .await;
+    alert_row(t, "1021", "2026-08-09", ichiban_only, None, false).await;
+    // 窓の外 (前日・今日) と解決済み
+    alert_row(t, "1021", "2026-08-08", ichiban_only, None, false).await;
+    alert_row(t, "1021", "2026-10-10", ichiban_only, None, false).await;
+    alert_row(
+        t,
+        "1021",
+        "2026-10-01",
+        ichiban_only,
+        Some("2026-10-02T00:00:00Z"),
+        true,
+    )
+    .await;
+    // 他の tenant
+    alert_row(other, "1021", "2026-10-03", ichiban_only, None, false).await;
+
+    let got = get(t).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(
+        got.json(),
+        json!({"alerts": [
+            {"employee_cd": "1021", "day": "2026-08-09", "kind": "yukyu", "direction": "ichiban_only",
+             "first_seen_at": "2026-10-01T00:00:00Z", "notified_at": null},
+            {"employee_cd": "1021", "day": "2026-10-09", "kind": "rousai", "direction": "pdf_only",
+             "first_seen_at": "2026-10-01T00:00:00Z", "notified_at": "2026-10-09T23:00:00Z"},
+            {"employee_cd": "1022", "day": "2026-10-03", "kind": "yukyu", "direction": "ichiban_only",
+             "first_seen_at": "2026-10-01T00:00:00Z", "notified_at": null}
+        ]})
+    );
+    let got = get(other).await;
+    assert_eq!(got.json()["alerts"].as_array().unwrap().len(), 1);
+}
+
 /// 接続が切れた DB では、どの口も 500 の固定の語で、ログは段の名前と kind だけ
 #[tokio::test]
 async fn db_errors_are_500() {
@@ -1236,6 +1322,7 @@ async fn db_errors_are_500() {
         ("GET", "/api/leave/settings".to_owned(), None),
         ("PUT", "/api/leave/settings".to_owned(), Some(json!({}))),
         ("POST", "/api/leave/settings/test-notify".to_owned(), None),
+        ("GET", "/api/leave/alerts".to_owned(), None),
         ("GET", "/api/leave/employees".to_owned(), None),
         ("GET", "/api/leave/pages".to_owned(), None),
         ("GET", "/api/leave/documents".to_owned(), None),
@@ -1248,7 +1335,7 @@ async fn db_errors_are_500() {
         assert_eq!(got.json(), json!({"error": "internal_error"}));
     }
     let logs = a.logs.lock().unwrap();
-    assert_eq!(logs.len(), 9);
+    assert_eq!(logs.len(), 10);
     for line in logs.iter() {
         assert!(
             !line.contains(&t.to_string()) && !line.contains(&p.to_string()),

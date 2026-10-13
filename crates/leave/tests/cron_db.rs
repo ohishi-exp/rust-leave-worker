@@ -224,7 +224,8 @@ async fn detects_notifies_and_grants() {
     // ログに tenant の識別子・氏名を出さない
     assert!(!s.line().contains(&t.to_string()) && !s.line().contains("山田"));
 
-    // 2 回目: 何も増えず、送らない
+    // 2 回目: 何も増えないが、未解消は毎朝全部 (新規と継続を区別せず) 同じ文面で送り、最後に送った時刻を進める
+    let before = notified_at(t).await;
     let n2 = FakeNotifier::default();
     let s = run_once(&f, &n2).await;
     let r = &s.tenants[0];
@@ -238,9 +239,30 @@ async fn detects_notifies_and_grants() {
             r.notified,
             r.grants
         ),
-        (3, 0, 0, 0, 0, 0, 0)
+        (3, 0, 0, 3, 1, 3, 0)
     );
-    assert!(n2.sent.lock().unwrap().is_empty());
+    assert_eq!(*n2.sent.lock().unwrap(), sent);
+    let after = notified_at(t).await;
+    assert_eq!(after.len(), 3);
+    assert!(
+        before.iter().zip(&after).all(|(b, a)| a > b),
+        "{before:?} {after:?}"
+    );
+}
+
+/// tenant の警告の最後に送った時刻 ([`alerts`] と同じ並び)
+async fn notified_at(t: Uuid) -> Vec<chrono::DateTime<chrono::Utc>> {
+    admin()
+        .await
+        .query(
+            "SELECT notified_at FROM alc_api.leave_alerts WHERE tenant_id = $1 ORDER BY employee_cd, day, kind, direction",
+            &[&t],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect()
 }
 
 #[tokio::test]
@@ -279,7 +301,7 @@ async fn resolved_then_reopened_is_notified_again() {
         vec![a("1021", "2026-10-03", "yukyu", "ichiban_only", true, true)]
     );
     assert_eq!(n.sent.lock().unwrap().len(), 1);
-    // 紐づけを外したら再発: 未解決・未通知に戻り、もう一度送る
+    // 紐づけを外したら再発: 未解決に戻り、もう一度送る
     admin()
         .await
         .execute(
@@ -538,22 +560,53 @@ async fn long_lists_are_split_and_failed_parts_resent() {
         .sum();
     assert_eq!(notified, lines);
     assert_eq!(alerts(t).await.iter().filter(|x| x.4).count(), notified);
-    // 次の回は残りだけを 1 通で送る
+    // 次の回は (前の回に送れたものも含めて) 未解消の 120 件を全部、同じ 3 通に分けて送り直す
     let n2 = FakeNotifier::default();
     let s = run_once(&f, &n2).await;
     assert_eq!(
         (
             s.tenants[0].pending,
             s.tenants[0].sent_messages,
-            s.tenants[0].notified as usize
+            s.tenants[0].notified
         ),
-        (120 - notified, 1, 120 - notified)
+        (120, 3, 120)
     );
-    assert!(n2.sent.lock().unwrap()[0].1.starts_with(&format!(
-        "【勤怠申請】一番星と申請書のずれ {} 件\n",
-        120 - notified
-    )));
+    assert_eq!(n2.sent.lock().unwrap()[0].1, first);
     assert!(alerts(t).await.iter().all(|x| x.4));
+}
+
+#[tokio::test]
+async fn unresolved_rows_outside_the_window_are_not_sent() {
+    let _g = serial().await;
+    let (t, _) = enabled_tenant("10", true).await;
+    // 窓 (FROM〜TO) の外へ出た未解決の行: 解決にもならず表に残るが、送らない (窓の 1 日前と今日)
+    for d in ["2026-08-08", TODAY] {
+        let d: NaiveDate = d.parse().unwrap();
+        admin()
+            .await
+            .execute(
+                "INSERT INTO alc_api.leave_alerts (tenant_id, employee_cd, day, kind, direction) VALUES ($1, '1021', $2, 'yukyu', 'ichiban_only')",
+                &[&t, &d],
+            )
+            .await
+            .unwrap();
+    }
+    let f = ichiban(vec![employee("1021", "山田太郎", "10", None)], &[]);
+    let n = FakeNotifier::default();
+    let s = run_once(&f, &n).await;
+    let r = &s.tenants[0];
+    assert_eq!(
+        (r.mismatches, r.resolved, r.pending, r.sent_messages),
+        (0, 0, 0, 0)
+    );
+    assert!(n.sent.lock().unwrap().is_empty());
+    assert_eq!(
+        alerts(t).await,
+        vec![
+            a("1021", "2026-08-08", "yukyu", "ichiban_only", false, false),
+            a("1021", TODAY, "yukyu", "ichiban_only", false, false)
+        ]
+    );
 }
 
 #[tokio::test]
