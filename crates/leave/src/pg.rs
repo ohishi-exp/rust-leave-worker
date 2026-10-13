@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::cron::NotifyTarget;
 use crate::grants::{self, AutoGrant, Grant, GrantWrite, Opening, OpeningPut};
-use crate::pages::{ListQuery, Page, PageDetail, PageUpdate, Period};
+use crate::pages::{Document, DocumentsQuery, ListQuery, Page, PageDetail, PageUpdate, Period};
 use crate::reconcile::{LinkedPeriod, Mismatch, PendingAlert};
 use crate::settings::{Settings, ValidSettings};
 
@@ -56,8 +56,26 @@ pub mod sql {
         format!(
             "SELECT {PAGE_COLUMNS} FROM alc_api.leave_pages \
              WHERE tenant_id = $1 AND ($2::text IS NULL OR status = $2) AND ($3::text IS NULL OR employee_cd = $3) \
-             AND {} ORDER BY received_at DESC, page_no, id LIMIT $4 OFFSET $5",
+             AND ($7::text IS NULL OR r2_key = $7) AND {} \
+             ORDER BY (CASE WHEN $7::text IS NULL THEN received_at END) DESC, page_no, id LIMIT $4 OFFSET $5",
             visible(6)
+        )
+    }
+
+    /// PDF (同じ `r2_key`) ごとの集約。`$3` = open (未紐づけが 1 ページでも在る) / done (無い) / all
+    pub fn documents_list() -> String {
+        format!(
+            "SELECT r2_key, (array_agg(id ORDER BY page_no, id))[1], min(received_at), min(mail_from), min(subject), \
+             count(*)::int8, \
+             (count(*) FILTER (WHERE status = 'unlinked'))::int8, \
+             (count(*) FILTER (WHERE status = 'linked'))::int8, \
+             (count(*) FILTER (WHERE status = 'ignored'))::int8 \
+             FROM alc_api.leave_pages WHERE tenant_id = $1 AND {} GROUP BY r2_key \
+             HAVING $3::text = 'all' \
+             OR ($3::text = 'open' AND count(*) FILTER (WHERE status = 'unlinked') > 0) \
+             OR ($3::text = 'done' AND count(*) FILTER (WHERE status = 'unlinked') = 0) \
+             ORDER BY min(received_at) DESC, r2_key LIMIT $4 OFFSET $5",
+            visible(2)
         )
     }
 
@@ -746,10 +764,52 @@ pub async fn list_pages(
                         (&q.limit, Type::INT8),
                         (&q.offset, Type::INT8),
                         (&visible_since, Type::TIMESTAMPTZ),
+                        (&q.r2_key, Type::TEXT),
                     ],
                 )
                 .await?;
             Ok(rows.iter().map(page_from_row).collect())
+        })
+    })
+    .await
+}
+
+fn document_from_row(row: &Row) -> Document {
+    Document {
+        r2_key: row.get(0),
+        first_page_id: row.get(1),
+        received_at: row.get(2),
+        mail_from: row.get(3),
+        subject: row.get(4),
+        page_count: row.get(5),
+        unlinked_count: row.get(6),
+        linked_count: row.get(7),
+        ignored_count: row.get(8),
+    }
+}
+
+/// PDF 単位の一覧。`visible_since` は [`list_pages`] と同じ (見えないページは数えない)
+pub async fn list_documents(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    q: DocumentsQuery,
+    visible_since: Option<DateTime<Utc>>,
+) -> Result<Vec<Document>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(
+                    &sql::documents_list(),
+                    &[
+                        (&tenant_id, Type::UUID),
+                        (&visible_since, Type::TIMESTAMPTZ),
+                        (&q.state, Type::TEXT),
+                        (&q.limit, Type::INT8),
+                        (&q.offset, Type::INT8),
+                    ],
+                )
+                .await?;
+            Ok(rows.iter().map(document_from_row).collect())
         })
     })
     .await

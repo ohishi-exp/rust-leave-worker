@@ -152,6 +152,11 @@ mod forbidden {
     }
 
     #[tokio::test]
+    async fn list_documents() {
+        assert_forbidden("GET", "/api/leave/documents", None).await;
+    }
+
+    #[tokio::test]
     async fn get_page() {
         assert_forbidden("GET", "/api/leave/pages/{id}", None).await;
     }
@@ -799,6 +804,244 @@ async fn list_pages_order_filters_and_isolation() {
     assert_eq!(got.json(), json!({"error": "invalid_query"}));
 }
 
+/// `r2_key` の絞り (完全一致・並びは page_no, id・status と併用・長さ超過は固定の語の 400)
+#[tokio::test]
+async fn list_pages_filters_by_r2_key() {
+    let (t, other) = (tenant().await, tenant().await);
+    let key = format!("{t}/mail.pdf");
+    // 他の key の方が新しい。同じ key のページは挿入順と page_no 順が逆
+    let p3 = page(t, &key, 3, "2026-10-01T00:00:00Z").await;
+    let p1 = page(t, &key, 1, "2026-10-01T00:00:00Z").await;
+    let p2 = page(t, &key, 2, "2026-10-01T00:00:00Z").await;
+    page(t, &format!("{t}/mail.pdf.bak"), 1, "2026-10-05T00:00:00Z").await;
+    page(other, &format!("{other}/x.pdf"), 1, "2026-10-05T00:00:00Z").await;
+    let a = app(FakePdfs::default(), None).await;
+    let ids = |v: Value| -> Vec<String> {
+        v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let get = |q: String| {
+        let a = &a;
+        async move {
+            call(
+                a,
+                "GET",
+                &format!("/api/leave/pages?{q}"),
+                Some(t),
+                ADMIN,
+                None,
+            )
+            .await
+        }
+    };
+
+    let got = get(format!("r2_key={key}")).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(
+        ids(got.json()),
+        vec![p1.to_string(), p2.to_string(), p3.to_string()]
+    );
+    // 他の tenant の key は 0 件 (在ることも漏れない)
+    let got = get(format!("r2_key={other}/x.pdf")).await;
+    assert_eq!(got.status, 200);
+    assert!(ids(got.json()).is_empty());
+    // status と併用
+    let body = json!({"status": "ignored"});
+    let put = call(
+        &a,
+        "PUT",
+        &format!("/api/leave/pages/{p2}"),
+        Some(t),
+        ADMIN,
+        Some(body),
+    )
+    .await;
+    assert_eq!(put.status, 200);
+    let got = get(format!("r2_key={key}&status=ignored")).await;
+    assert_eq!(ids(got.json()), vec![p2.to_string()]);
+    let got = get(format!("r2_key={key}&limit=1&offset=1")).await;
+    assert_eq!(ids(got.json()), vec![p2.to_string()]);
+
+    // 長さ超過は固定の語。入力の値は応答に載らない
+    let long = "k".repeat(leave::pages::MAX_R2_KEY_LEN + 1);
+    let got = get(format!("r2_key={long}")).await;
+    assert_eq!(got.status, 400);
+    assert_eq!(got.json(), json!({"error": "invalid_r2_key"}));
+    assert!(!String::from_utf8_lossy(&got.body).contains(&long));
+}
+
+/// PDF 単位の一覧: state 3 種・集約の値・tenant 分離・limit/offset・不正値の 400
+#[tokio::test]
+async fn list_documents_states_counts_and_isolation() {
+    let (t, other) = (tenant().await, tenant().await);
+    let (ka, kb, kc) = (
+        format!("{t}/a.pdf"),
+        format!("{t}/b.pdf"),
+        format!("{t}/c.pdf"),
+    );
+    // A: 3 ページとも未紐づけ (挿入は page_no 順でない) / B: linked + ignored (全部済み) / C: linked + unlinked
+    page(t, &ka, 2, "2026-10-01T00:00:00Z").await;
+    page(t, &ka, 3, "2026-10-01T00:00:00Z").await;
+    let a1 = page(t, &ka, 1, "2026-10-01T00:00:00Z").await;
+    let b1 = page(t, &kb, 1, "2026-10-02T00:00:00Z").await;
+    let b2 = page(t, &kb, 2, "2026-10-02T00:00:00Z").await;
+    let c1 = page(t, &kc, 1, "2026-09-01T00:00:00Z").await;
+    page(t, &kc, 2, "2026-09-01T00:00:00Z").await;
+    // 他の tenant の PDF (未紐づけ) は一覧に出ない
+    page(other, &format!("{other}/x.pdf"), 1, "2026-10-09T00:00:00Z").await;
+    let app = app(FakePdfs::default(), None).await;
+    let put = |id: Uuid, body: Value| {
+        let app = &app;
+        async move {
+            let got = call(
+                app,
+                "PUT",
+                &format!("/api/leave/pages/{id}"),
+                Some(t),
+                ADMIN,
+                Some(body),
+            )
+            .await;
+            assert_eq!(got.status, 200);
+        }
+    };
+    let link = json!({"employee_cd": "1021", "status": "linked",
+                      "periods": [{"kind": "yukyu", "start_date": "2026-10-02", "end_date": "2026-10-02"}]});
+    put(b1, link.clone()).await;
+    put(b2, json!({"status": "ignored"})).await;
+    put(c1, link).await;
+
+    let get = |q: &str| {
+        let (app, q) = (&app, q.to_owned());
+        async move {
+            call(
+                app,
+                "GET",
+                &format!("/api/leave/documents{q}"),
+                Some(t),
+                ADMIN,
+                None,
+            )
+            .await
+        }
+    };
+    let keys = |v: Value| -> Vec<String> {
+        v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["r2_key"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    // 既定は open。受信の新しい順
+    let got = get("").await;
+    assert_eq!(got.status, 200);
+    assert_eq!(keys(got.json()), vec![ka.clone(), kc.clone()]);
+    let got = get("?state=done").await;
+    assert_eq!(keys(got.json()), vec![kb.clone()]);
+    let got = get("?state=all").await;
+    assert_eq!(keys(got.json()), vec![kb.clone(), ka.clone(), kc.clone()]);
+
+    // 集約の値
+    let data = got.json()["data"].clone();
+    assert_eq!(
+        data[1],
+        json!({"r2_key": ka, "first_page_id": a1, "received_at": "2026-10-01T00:00:00Z",
+               "mail_from": "sender@example.com", "subject": "休暇申請",
+               "page_count": 3, "unlinked_count": 3, "linked_count": 0, "ignored_count": 0})
+    );
+    assert_eq!(data[0]["first_page_id"], json!(b1));
+    assert_eq!(
+        [
+            &data[0]["page_count"],
+            &data[0]["unlinked_count"],
+            &data[0]["linked_count"],
+            &data[0]["ignored_count"]
+        ],
+        [&json!(2), &json!(0), &json!(1), &json!(1)]
+    );
+    assert_eq!(
+        [
+            &data[2]["page_count"],
+            &data[2]["unlinked_count"],
+            &data[2]["linked_count"]
+        ],
+        [&json!(2), &json!(1), &json!(1)]
+    );
+
+    // limit / offset (上限を超える指定は 400 でなく上限に寄る)
+    let got = get("?state=all&limit=1&offset=1").await;
+    assert_eq!(keys(got.json()), vec![ka.clone()]);
+    let got = get("?state=all&limit=100000").await;
+    assert_eq!(got.status, 200);
+    assert_eq!(keys(got.json()).len(), 3);
+
+    // 他の tenant からは自分の PDF だけ
+    let got = call(
+        &app,
+        "GET",
+        "/api/leave/documents?state=all",
+        Some(other),
+        ADMIN,
+        None,
+    )
+    .await;
+    assert_eq!(keys(got.json()), vec![format!("{other}/x.pdf")]);
+
+    for (q, code) in [
+        ("?state=linked", "invalid_state"),
+        ("?limit=0", "invalid_limit"),
+        ("?offset=-1", "invalid_offset"),
+        ("?state=open&state=done", "invalid_query"),
+    ] {
+        let got = get(q).await;
+        assert_eq!(got.status, 400, "{q}");
+        assert_eq!(got.json(), json!({"error": code}));
+    }
+}
+
+/// staging の表示制限は PDF 単位の一覧にも掛かる (見えないページは数えず、全部見えない PDF は出ない)
+#[tokio::test]
+async fn list_documents_respects_visible_minutes() {
+    let t = tenant().await;
+    // NOW = 2026-10-10T00:00:00Z。10 分前ちょうどまでは見える
+    let (kmix, kold) = (format!("{t}/mix.pdf"), format!("{t}/old.pdf"));
+    page(t, &kmix, 1, "2026-10-09T23:50:00Z").await;
+    page(t, &kmix, 2, "2026-10-09T23:49:59Z").await;
+    page(t, &kold, 1, "2026-10-09T23:49:00Z").await;
+    let staging = support::app_with_visible_minutes(FakePdfs::default(), "10").await;
+    let got = call(
+        &staging,
+        "GET",
+        "/api/leave/documents?state=all",
+        Some(t),
+        ADMIN,
+        None,
+    )
+    .await;
+    let v = got.json();
+    assert_eq!(v["data"].as_array().unwrap().len(), 1);
+    assert_eq!(v["data"][0]["r2_key"], kmix);
+    assert_eq!(v["data"][0]["page_count"], 1);
+
+    let prod = app(FakePdfs::default(), None).await;
+    let got = call(
+        &prod,
+        "GET",
+        "/api/leave/documents?state=all",
+        Some(t),
+        ADMIN,
+        None,
+    )
+    .await;
+    assert_eq!(got.json()["data"].as_array().unwrap().len(), 2);
+}
+
 #[tokio::test]
 async fn link_page_replaces_periods_in_one_tx() {
     let t = tenant().await;
@@ -1022,6 +1265,7 @@ async fn db_errors_are_500() {
         ("POST", "/api/leave/settings/test-notify".to_owned(), None),
         ("GET", "/api/leave/employees".to_owned(), None),
         ("GET", "/api/leave/pages".to_owned(), None),
+        ("GET", "/api/leave/documents".to_owned(), None),
         ("GET", format!("/api/leave/pages/{p}"), None),
         ("PUT", format!("/api/leave/pages/{p}"), Some(link)),
         ("GET", format!("/api/leave/pages/{p}/pdf"), None),
@@ -1031,7 +1275,7 @@ async fn db_errors_are_500() {
         assert_eq!(got.json(), json!({"error": "internal_error"}));
     }
     let logs = a.logs.lock().unwrap();
-    assert_eq!(logs.len(), 8);
+    assert_eq!(logs.len(), 9);
     for line in logs.iter() {
         assert!(
             !line.contains(&t.to_string()) && !line.contains(&p.to_string()),

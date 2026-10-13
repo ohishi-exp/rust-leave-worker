@@ -16,6 +16,10 @@ pub const MAX_LIMIT: i64 = 200;
 /// 1 ページに付けられる期間の行数の上限
 pub const MAX_PERIODS: usize = 50;
 pub const MAX_EMPLOYEE_CD_LEN: usize = 32;
+/// `r2_key` の絞りの長さ (バイト) の上限。object key (`ingest::seeded_object_key`) より十分長く取る
+pub const MAX_R2_KEY_LEN: usize = 512;
+/// `GET /api/leave/documents` の `state` の値 (open = 未紐づけのページが 1 つでも在る PDF / done = 無い PDF)
+pub const DOCUMENT_STATES: [&str; 3] = ["open", "done", "all"];
 pub const MAX_NOTE_CHARS: usize = 2000;
 
 /// ページ 1 行 (応答の形)
@@ -58,11 +62,28 @@ pub struct PageDetail {
 
 impl TxOutput for PageDetail {}
 
+/// PDF 1 件 (同じ `r2_key` のページの集約。応答の形)
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct Document {
+    pub r2_key: String,
+    pub first_page_id: Uuid,
+    pub received_at: DateTime<Utc>,
+    pub mail_from: Option<String>,
+    pub subject: Option<String>,
+    pub page_count: i64,
+    pub unlinked_count: i64,
+    pub linked_count: i64,
+    pub ignored_count: i64,
+}
+
+impl TxOutput for Document {}
+
 /// `GET /api/leave/pages` の条件 (query の生の文字列。検証は [`ListQuery::parse`])
 #[derive(Deserialize, Debug, Default)]
 pub struct ListQueryRaw {
     pub status: Option<String>,
     pub employee_cd: Option<String>,
+    pub r2_key: Option<String>,
     pub limit: Option<String>,
     pub offset: Option<String>,
 }
@@ -71,6 +92,22 @@ pub struct ListQueryRaw {
 pub struct ListQuery {
     pub status: Option<String>,
     pub employee_cd: Option<String>,
+    pub r2_key: Option<String>,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// `GET /api/leave/documents` の条件 (query の生の文字列。検証は [`DocumentsQuery::parse`])
+#[derive(Deserialize, Debug, Default)]
+pub struct DocumentsQueryRaw {
+    pub state: Option<String>,
+    pub limit: Option<String>,
+    pub offset: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocumentsQuery {
+    pub state: String,
     pub limit: i64,
     pub offset: i64,
 }
@@ -79,29 +116,55 @@ pub(crate) fn non_empty(v: Option<String>) -> Option<String> {
     v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
 }
 
+/// `limit` (既定・上限あり) と `offset` の検証。一覧の 2 つの口で同じ
+fn parse_paging(limit: Option<String>, offset: Option<String>) -> Result<(i64, i64), &'static str> {
+    let limit = match non_empty(limit) {
+        None => DEFAULT_LIMIT,
+        Some(s) => match s.parse::<i64>() {
+            Ok(n) if n >= 1 => n.min(MAX_LIMIT),
+            _ => return Err("invalid_limit"),
+        },
+    };
+    let offset = match non_empty(offset) {
+        None => 0,
+        Some(s) => match s.parse::<i64>() {
+            Ok(n) if n >= 0 => n,
+            _ => return Err("invalid_offset"),
+        },
+    };
+    Ok((limit, offset))
+}
+
 impl ListQuery {
     pub fn parse(raw: ListQueryRaw) -> Result<Self, &'static str> {
         let status = non_empty(raw.status);
         if status.as_deref().is_some_and(|s| !STATUSES.contains(&s)) {
             return Err("invalid_status");
         }
-        let limit = match non_empty(raw.limit) {
-            None => DEFAULT_LIMIT,
-            Some(s) => match s.parse::<i64>() {
-                Ok(n) if n >= 1 => n.min(MAX_LIMIT),
-                _ => return Err("invalid_limit"),
-            },
-        };
-        let offset = match non_empty(raw.offset) {
-            None => 0,
-            Some(s) => match s.parse::<i64>() {
-                Ok(n) if n >= 0 => n,
-                _ => return Err("invalid_offset"),
-            },
-        };
+        let r2_key = non_empty(raw.r2_key);
+        if r2_key.as_deref().is_some_and(|k| k.len() > MAX_R2_KEY_LEN) {
+            return Err("invalid_r2_key");
+        }
+        let (limit, offset) = parse_paging(raw.limit, raw.offset)?;
         Ok(Self {
             status,
             employee_cd: non_empty(raw.employee_cd),
+            r2_key,
+            limit,
+            offset,
+        })
+    }
+}
+
+impl DocumentsQuery {
+    pub fn parse(raw: DocumentsQueryRaw) -> Result<Self, &'static str> {
+        let state = non_empty(raw.state).unwrap_or_else(|| "open".to_owned());
+        if !DOCUMENT_STATES.contains(&state.as_str()) {
+            return Err("invalid_state");
+        }
+        let (limit, offset) = parse_paging(raw.limit, raw.offset)?;
+        Ok(Self {
+            state,
             limit,
             offset,
         })
@@ -343,6 +406,7 @@ mod tests {
             ListQuery {
                 status: None,
                 employee_cd: None,
+                r2_key: None,
                 limit: DEFAULT_LIMIT,
                 offset: 0
             }
@@ -350,12 +414,14 @@ mod tests {
         let q = ListQuery::parse(ListQueryRaw {
             status: Some("linked".into()),
             employee_cd: Some(" 1021 ".into()),
+            r2_key: Some(" inbox/a.pdf ".into()),
             limit: Some("1000".into()),
             offset: Some("40".into()),
         })
         .unwrap();
         assert_eq!(q.status.as_deref(), Some("linked"));
         assert_eq!(q.employee_cd.as_deref(), Some("1021"));
+        assert_eq!(q.r2_key.as_deref(), Some("inbox/a.pdf"));
         assert_eq!(q.limit, MAX_LIMIT);
         assert_eq!(q.offset, 40);
         // 空の値は省いたのと同じ
@@ -364,6 +430,7 @@ mod tests {
             limit: Some("".into()),
             offset: Some("".into()),
             employee_cd: Some("".into()),
+            r2_key: Some("".into()),
         })
         .unwrap();
         assert_eq!(q, ListQuery::parse(ListQueryRaw::default()).unwrap());
@@ -374,6 +441,7 @@ mod tests {
         let raw = |status: Option<&str>, limit: Option<&str>, offset: Option<&str>| ListQueryRaw {
             status: status.map(Into::into),
             employee_cd: None,
+            r2_key: None,
             limit: limit.map(Into::into),
             offset: offset.map(Into::into),
         };
@@ -393,6 +461,70 @@ mod tests {
                 Err("invalid_offset")
             );
         }
+    }
+
+    #[test]
+    fn list_query_r2_key_length() {
+        let raw = |k: String| ListQueryRaw {
+            r2_key: Some(k),
+            ..Default::default()
+        };
+        assert!(ListQuery::parse(raw("k".repeat(MAX_R2_KEY_LEN))).is_ok());
+        assert_eq!(
+            ListQuery::parse(raw("k".repeat(MAX_R2_KEY_LEN + 1))),
+            Err("invalid_r2_key")
+        );
+    }
+
+    #[test]
+    fn documents_query_defaults_and_clamp() {
+        let q = DocumentsQuery::parse(DocumentsQueryRaw::default()).unwrap();
+        assert_eq!(
+            q,
+            DocumentsQuery {
+                state: "open".into(),
+                limit: DEFAULT_LIMIT,
+                offset: 0
+            }
+        );
+        for s in DOCUMENT_STATES {
+            let q = DocumentsQuery::parse(DocumentsQueryRaw {
+                state: Some(format!(" {s} ")),
+                limit: Some("1000".into()),
+                offset: Some("40".into()),
+            })
+            .unwrap();
+            assert_eq!((q.state.as_str(), q.limit, q.offset), (s, MAX_LIMIT, 40));
+        }
+        // 空の state は既定の open
+        let q = DocumentsQuery::parse(DocumentsQueryRaw {
+            state: Some("".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(q.state, "open");
+    }
+
+    #[test]
+    fn documents_query_rejects() {
+        let raw =
+            |state: Option<&str>, limit: Option<&str>, offset: Option<&str>| DocumentsQueryRaw {
+                state: state.map(Into::into),
+                limit: limit.map(Into::into),
+                offset: offset.map(Into::into),
+            };
+        assert_eq!(
+            DocumentsQuery::parse(raw(Some("linked"), None, None)),
+            Err("invalid_state")
+        );
+        assert_eq!(
+            DocumentsQuery::parse(raw(None, Some("0"), None)),
+            Err("invalid_limit")
+        );
+        assert_eq!(
+            DocumentsQuery::parse(raw(None, None, Some("-1"))),
+            Err("invalid_offset")
+        );
     }
 
     #[test]
