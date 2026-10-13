@@ -13,7 +13,7 @@
 //! - 取り込めない object (チケットが無い・不正・sha256 の不一致・PDF でない・読めない) は消して ack (再試行しない)
 //! - **DB の接続は検証の後**: batch の全メッセージの検証 (R2・RPC) を済ませ、通ったものがあるときだけ 1 本張る
 //!   ([`handle_batch`]。RPC の先が同じ DB に繋ぎにいっても、こちらが先に握っていないので詰まらない)
-//! - R2・DB・RPC の一時的な失敗は retry (Queue の max_retries の後は dead letter queue)。object が既に無ければ ack
+//! - R2・DB・RPC の一時的な失敗 (`verifyTicket` の `{error: "unavailable"}` を含む) は retry (Queue の max_retries の後は dead letter queue)。object が既に無ければ ack
 //! - ログは段の名前と固定の語だけ (チケット・PDF の中身・object key は出さない。tenant は取り込み後のログに出す)
 
 use std::fmt::Display;
@@ -72,7 +72,7 @@ pub trait Inbox: Send + Sync {
 pub struct VerifyError;
 
 /// auth-worker の `verifyTicket(ticket, purpose)`。戻り値は JSON のまま (`null` か `{tenantId, username, sha256}`)。
-/// 形の解釈は [`parse_ticket`] (形が違えば不正なチケットとして扱う)
+/// 形の解釈は [`parse_ticket`] (`{error: "unavailable"}` は一時的な失敗、形が違えば不正なチケット)
 pub trait TicketVerifier: Send + Sync {
     fn verify<'a>(
         &'a self,
@@ -90,9 +90,22 @@ pub struct Ticket {
     pub sha256: String,
 }
 
-/// `verifyTicket` の戻りの解釈。`null`・形の違うものは `None`
-pub fn parse_ticket(v: serde_json::Value) -> Option<Ticket> {
-    serde_json::from_value(v).ok()
+/// `verifyTicket` の戻りの解釈
+#[derive(Debug, PartialEq)]
+pub enum TicketCheck {
+    Valid(Ticket),
+    /// `null`・形の違うもの (消して ack)
+    Invalid,
+    /// `{ "error": "unavailable" }` (auth-worker が資格情報を引けなかった一時的な失敗。retry)
+    Unavailable,
+}
+
+/// `verifyTicket` の戻りの解釈。`{error: "unavailable"}` は一時的な失敗、`null`・ほかの形は不正
+pub fn parse_ticket(v: serde_json::Value) -> TicketCheck {
+    if v.get("error").and_then(serde_json::Value::as_str) == Some("unavailable") {
+        return TicketCheck::Unavailable;
+    }
+    serde_json::from_value(v).map_or(TicketCheck::Invalid, TicketCheck::Valid)
 }
 
 /// メッセージの扱い
@@ -178,8 +191,13 @@ pub async fn verify(d: &InboxDeps<'_>, body: serde_json::Value) -> Verdict {
             return Verdict::Done(Outcome::Retry);
         }
     };
-    let Some(ticket) = ticket else {
-        return discard(d, key, "ticket_invalid").await;
+    let ticket = match ticket {
+        TicketCheck::Valid(t) => t,
+        TicketCheck::Invalid => return discard(d, key, "ticket_invalid").await,
+        TicketCheck::Unavailable => {
+            (d.log)("inbox: verify unavailable");
+            return Verdict::Done(Outcome::Retry);
+        }
     };
     if sha256_hex(&object.bytes) != ticket.sha256 {
         return discard(d, key, "sha256_mismatch").await;
@@ -273,16 +291,22 @@ mod tests {
         let ok = json!({ "tenantId": t, "username": "scan", "sha256": "ab" });
         assert_eq!(
             parse_ticket(ok),
-            Some(Ticket {
+            TicketCheck::Valid(Ticket {
                 tenant_id: t,
                 sha256: "ab".to_owned()
             })
         );
-        assert_eq!(parse_ticket(serde_json::Value::Null), None);
+        let invalid = TicketCheck::Invalid;
+        assert_eq!(parse_ticket(serde_json::Value::Null), invalid);
         assert_eq!(
             parse_ticket(json!({ "tenantId": "x", "sha256": "ab" })),
-            None
+            invalid
         );
-        assert_eq!(parse_ticket(json!({ "tenantId": t })), None);
+        assert_eq!(parse_ticket(json!({ "tenantId": t })), invalid);
+        // 一時的な失敗だけが Unavailable (ほかの error・形は不正)
+        let unavailable = json!({ "error": "unavailable" });
+        assert_eq!(parse_ticket(unavailable), TicketCheck::Unavailable);
+        assert_eq!(parse_ticket(json!({ "error": "other" })), invalid);
+        assert_eq!(parse_ticket(json!({ "error": 1 })), invalid);
     }
 }
