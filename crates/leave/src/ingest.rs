@@ -82,25 +82,6 @@ pub fn normalize_mailbox(raw: &str) -> Option<String> {
     ok.then_some(m)
 }
 
-/// `POST /internal/scan-check` の body の上限 (mailbox と UUID だけ)
-pub const MAX_SCAN_CHECK_BODY_BYTES: usize = 1024;
-
-/// スキャンの受け取り (nuxt-leave の /dav) が、パスの受信アドレスと資格情報の tenant を照合するための body
-#[derive(Debug, Deserialize)]
-pub struct ScanCheckInput {
-    pub mailbox: String,
-    pub tenant_id: String,
-}
-
-/// 照合の入力の検証。JSON でない・項目欠けは `invalid_body`、形の不正は `invalid_mailbox` / `invalid_tenant_id`。
-/// 返す mailbox は小文字
-pub fn check_scan_check(body: &[u8]) -> Result<(String, Uuid), &'static str> {
-    let input: ScanCheckInput = serde_json::from_slice(body).map_err(|_| "invalid_body")?;
-    let mailbox = normalize_mailbox(&input.mailbox).ok_or("invalid_mailbox")?;
-    let tenant_id = Uuid::parse_str(&input.tenant_id).map_err(|_| "invalid_tenant_id")?;
-    Ok((mailbox, tenant_id))
-}
-
 /// base64 を decode する。大きさの上限は decode の前に (長さから) も見る
 pub fn decode_pdf(b64: &str) -> Result<Vec<u8>, &'static str> {
     if b64.len() > MAX_PDF_BYTES.div_ceil(3) * 4 {
@@ -248,31 +229,6 @@ mod tests {
         assert!(!secret_matches("s3cret", None));
         assert!(!secret_matches("s3cret", Some("")));
         assert!(!secret_matches("", Some("")));
-    }
-
-    #[test]
-    fn scan_check_input_is_validated() {
-        let id = Uuid::from_u128(0x1234);
-        let t = id.to_string();
-        let ok = format!(r#"{{"mailbox":"Fake-Box-01","tenant_id":"{t}"}}"#);
-        assert_eq!(
-            check_scan_check(ok.as_bytes()),
-            Ok(("fake-box-01".to_owned(), id))
-        );
-        let bad_box = format!(r#"{{"mailbox":"a b","tenant_id":"{t}"}}"#);
-        assert_eq!(check_scan_check(bad_box.as_bytes()), Err("invalid_mailbox"));
-        let bad_tenant = br#"{"mailbox":"fake-box-01","tenant_id":"nope"}"#;
-        assert_eq!(check_scan_check(bad_tenant), Err("invalid_tenant_id"));
-        let tenant_only = format!(r#"{{"tenant_id":"{t}"}}"#);
-        for raw in [
-            &b"not json"[..],
-            b"{}",
-            br#"{"mailbox":"fake-box-01"}"#,
-            tenant_only.as_bytes(),
-            br#"{"mailbox":1,"tenant_id":"x"}"#,
-        ] {
-            assert_eq!(check_scan_check(raw), Err("invalid_body"));
-        }
     }
 
     #[test]

@@ -30,7 +30,7 @@ pub mod routes;
 pub mod settings;
 pub mod store;
 
-pub use internal::{ingest_router, IngestState, INGEST_PATH, SCAN_CHECK_PATH};
+pub use internal::{ingest_router, IngestState, INGEST_PATH};
 pub use routes::{
     tenant_router, visible_minutes, Clock, LeaveState, LogSink, TEST_NOTIFY_PATH, TEST_NOTIFY_TEXT,
 };
