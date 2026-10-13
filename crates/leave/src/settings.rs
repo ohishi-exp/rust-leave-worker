@@ -12,8 +12,6 @@ pub const GRACE_DAYS_MAX: i32 = 60;
 /// 設定 1 行 (応答の形)。行が無い tenant には [`Settings::default`] を返す (`updated_at` = null)
 #[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct Settings {
-    pub mailbox: Option<String>,
-    pub allowed_senders: Vec<String>,
     pub dept_codes: Vec<String>,
     pub lineworks_channel_id: Option<Uuid>,
     /// 個人の宛先 (`notify_recipients.id`、LINE WORKS の行)。グループ (`lineworks_channel_id`) とどちらか 1 つ
@@ -30,8 +28,6 @@ impl TxOutput for Settings {}
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            mailbox: None,
-            allowed_senders: Vec::new(),
             dept_codes: Vec::new(),
             lineworks_channel_id: None,
             notify_recipient_id: None,
@@ -47,10 +43,6 @@ impl Default for Settings {
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
 pub struct SettingsInput {
-    #[serde(default)]
-    pub mailbox: Option<String>,
-    #[serde(default)]
-    pub allowed_senders: Vec<String>,
     #[serde(default)]
     pub dept_codes: Vec<String>,
     #[serde(default)]
@@ -68,8 +60,6 @@ pub struct SettingsInput {
 /// 検証済みの設定 (DB へ書く値)
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidSettings {
-    pub mailbox: Option<String>,
-    pub allowed_senders: Vec<String>,
     pub dept_codes: Vec<String>,
     pub lineworks_channel_id: Option<Uuid>,
     pub notify_recipient_id: Option<Uuid>,
@@ -78,33 +68,11 @@ pub struct ValidSettings {
     pub enabled: bool,
 }
 
-/// mailbox (受信アドレスの local-part) を小文字にして `^[a-z0-9-]{3,64}$` を確かめる。
-/// 前後の空白は落とし、空なら `None` (受信しない)
-pub fn normalize_mailbox(raw: Option<&str>) -> Result<Option<String>, &'static str> {
-    let Some(v) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
-        return Ok(None);
-    };
-    let v = v.to_ascii_lowercase();
-    let ok = (3..=64).contains(&v.len())
-        && v.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    if ok {
-        Ok(Some(v))
-    } else {
-        Err("invalid_mailbox")
-    }
-}
-
 /// 前後の空白を落とし、空を捨て、重複を最初の 1 つに寄せる (順は保つ)
-fn clean_list(items: Vec<String>, lower: bool) -> Vec<String> {
+fn clean_list(items: Vec<String>) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(items.len());
     for item in items {
-        let item = item.trim();
-        let item = if lower {
-            item.to_ascii_lowercase()
-        } else {
-            item.to_owned()
-        };
+        let item = item.trim().to_owned();
         if !item.is_empty() && !out.contains(&item) {
             out.push(item);
         }
@@ -114,7 +82,6 @@ fn clean_list(items: Vec<String>, lower: bool) -> Vec<String> {
 
 /// 入力を検証して DB へ書く値にする。エラーは 400 の本文の語
 pub fn validate(input: SettingsInput) -> Result<ValidSettings, &'static str> {
-    let mailbox = normalize_mailbox(input.mailbox.as_deref())?;
     let grace_days = input.grace_days.unwrap_or(DEFAULT_GRACE_DAYS);
     if !(0..=GRACE_DAYS_MAX).contains(&grace_days) {
         return Err("invalid_grace_days");
@@ -128,9 +95,7 @@ pub fn validate(input: SettingsInput) -> Result<ValidSettings, &'static str> {
         return Err("notify_bot_without_recipient");
     }
     Ok(ValidSettings {
-        mailbox,
-        allowed_senders: clean_list(input.allowed_senders, true),
-        dept_codes: clean_list(input.dept_codes, false),
+        dept_codes: clean_list(input.dept_codes),
         lineworks_channel_id: input.lineworks_channel_id,
         notify_recipient_id: input.notify_recipient_id,
         notify_bot_config_id: input.notify_bot_config_id,
@@ -144,48 +109,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mailbox_lowercased_and_trimmed() {
-        assert_eq!(
-            normalize_mailbox(Some("  Ohishi-Leave1 ")),
-            Ok(Some("ohishi-leave1".to_owned()))
-        );
-        assert_eq!(normalize_mailbox(Some("abc")), Ok(Some("abc".to_owned())));
-        let max = "a".repeat(64);
-        assert_eq!(normalize_mailbox(Some(&max)), Ok(Some(max.clone())));
-    }
-
-    #[test]
-    fn mailbox_empty_is_none() {
-        assert_eq!(normalize_mailbox(None), Ok(None));
-        assert_eq!(normalize_mailbox(Some("")), Ok(None));
-        assert_eq!(normalize_mailbox(Some("   ")), Ok(None));
-    }
-
-    #[test]
-    fn mailbox_rejects_bad_shapes() {
-        let long = "a".repeat(65);
-        for bad in [
-            "ab",
-            long.as_str(),
-            "a_b_c",
-            "a.b.c",
-            "abc@x",
-            "あいう",
-            "a b c",
-        ] {
-            let got = normalize_mailbox(Some(bad));
-            assert_eq!(got, Err("invalid_mailbox"), "{bad:?}");
-        }
-    }
-
-    #[test]
     fn validate_defaults() {
         let v = validate(SettingsInput::default()).unwrap();
         assert_eq!(
             v,
             ValidSettings {
-                mailbox: None,
-                allowed_senders: vec![],
                 dept_codes: vec![],
                 lineworks_channel_id: None,
                 notify_recipient_id: None,
@@ -199,14 +127,12 @@ mod tests {
     #[test]
     fn validate_cleans_lists() {
         let v = validate(SettingsInput {
-            allowed_senders: vec![" A@X.example ".into(), "a@x.example".into(), "".into()],
             dept_codes: vec!["10".into(), " 10".into(), "".into(), "20".into()],
             grace_days: Some(0),
             enabled: true,
             ..Default::default()
         })
         .unwrap();
-        assert_eq!(v.allowed_senders, vec!["a@x.example"]);
         assert_eq!(v.dept_codes, vec!["10", "20"]);
         assert_eq!(v.grace_days, 0);
         assert!(v.enabled);
@@ -221,11 +147,6 @@ mod tests {
             });
             assert_eq!(r, Err("invalid_grace_days"));
         }
-        let r = validate(SettingsInput {
-            mailbox: Some("x".into()),
-            ..Default::default()
-        });
-        assert_eq!(r, Err("invalid_mailbox"));
         let r = validate(SettingsInput {
             lineworks_channel_id: Some(Uuid::from_u128(1)),
             notify_recipient_id: Some(Uuid::from_u128(2)),
@@ -273,7 +194,7 @@ mod tests {
         assert_eq!(
             json,
             serde_json::json!({
-                "mailbox": null, "allowed_senders": [], "dept_codes": [],
+                "dept_codes": [],
                 "lineworks_channel_id": null, "notify_recipient_id": null, "notify_bot_config_id": null, "grace_days": 7, "enabled": false, "updated_at": null
             })
         );

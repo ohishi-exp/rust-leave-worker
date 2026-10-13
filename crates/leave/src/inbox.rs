@@ -8,8 +8,8 @@
 //! [`check_pdf_bytes`] → [`ingest_pdf`] (key は inbox の object key から決定的に作る = 再配送でも二重にならない) →
 //! inbox の object を消して ack。
 //!
-//! - **tenant はチケットの検証結果だけから取る** (inbox の key・メタデータからは読まない)。送信元の許可リストは見ない
-//!   (メール経路だけのもの。スキャンは資格情報で会社が確定している)
+//! - **tenant はチケットの検証結果だけから取る** (inbox の key・メタデータからは読まない)。会社は機械用資格情報で
+//!   確定している (送信元の照合は無い)
 //! - 取り込めない object (チケットが無い・不正・sha256 の不一致・PDF でない・読めない) は消して ack (再試行しない)
 //! - **DB の接続は検証の後**: batch の全メッセージの検証 (R2・RPC) を済ませ、通ったものがあるときだけ 1 本張る
 //!   ([`handle_batch`]。RPC の先が同じ DB に繋ぎにいっても、こちらが先に握っていないので詰まらない)
@@ -227,7 +227,7 @@ async fn ingest(d: &InboxDeps<'_>, pg: &Mutex<PgClient>, v: Verified) -> Outcome
         received_at,
         mail_from: None,
         subject: None,
-        key_seed: Some(key.clone()),
+        key_seed: key.clone(),
     };
     match ingest_pdf(pg, d.pdfs, d.log, pdf).await {
         Ok(pages) => {

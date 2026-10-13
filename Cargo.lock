@@ -668,7 +668,6 @@ dependencies = [
  "alc-core-wasm",
  "alc-worker-db",
  "axum",
- "base64",
  "chrono",
  "futures-util",
  "lopdf",

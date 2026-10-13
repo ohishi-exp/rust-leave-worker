@@ -13,7 +13,7 @@
 [[files]]
 path = "crates/leave/src/auth.rs"
 
-# 設定の入力の検証 (mailbox・grace_days・一覧の掃除)
+# 設定の入力の検証 (grace_days・通知の宛先・一覧の掃除)
 [[files]]
 path = "crates/leave/src/settings.rs"
 
@@ -33,11 +33,11 @@ path = "crates/leave/src/pg.rs"
 [[files]]
 path = "crates/leave/src/routes.rs"
 
-# メール取り込みの口の入力の検証 (secret の constant-time 比較・mailbox・base64・サイズ・ページ数・送信元・R2 の key)
+# 取り込む PDF の検査 (サイズ・`%PDF-`・ページ数) と決定的な R2 の key
 [[files]]
 path = "crates/leave/src/ingest.rs"
 
-# メール取り込みの口 POST /internal/ingest (401 / 400 / 202 / 200 / 500 と R2 の取り消しまで。tests/api_db.rs が通す)
+# 取り込みの本体 ingest_pdf (R2 の put・INSERT の失敗まで。tests/api_db.rs の inbox のテストが通す)
 [[files]]
 path = "crates/leave/src/internal.rs"
 
