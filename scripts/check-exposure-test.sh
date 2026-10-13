@@ -56,8 +56,30 @@ mutate "staging に route を足す" \
   's = s.replace("[env.staging.observability]", "route = \"leave.example.com/*\"\n\n[env.staging.observability]", 1)'
 mutate "本番に vpc_services (平文の DB 経路) を足す" \
   's = s.replace("[build]", "[[vpc_services]]\nbinding = \"LEAVE_DB_VPC\"\nservice_id = \"x\"\nremote = true\n\n[build]", 1)'
-mutate "staging に durable_objects を足す (この worker は DO も Container も持たない)" \
-  's = s.replace("[env.staging.observability]", "[[env.staging.durable_objects.bindings]]\nname = \"LEAVE_DB\"\nclass_name = \"LeaveDb\"\n\n[env.staging.observability]", 1)'
+# DO の binding は env.staging の STAGING_DB 1 件 (name・class_name・script_name の完全一致) だけ許す。
+# 元の wrangler.toml が持つその 1 件を崩す / 別の形を足す
+mutate "staging の DO の script_name が別名" \
+  's = s.replace("script_name = \"alc-staging-db-staging\"", "script_name = \"alc-staging-db\"", 1)'
+mutate "staging の DO に script_name が無い (この worker 自身の class を指す)" \
+  's = s.replace("script_name = \"alc-staging-db-staging\"\n", "", 1)'
+mutate "staging の DO の class_name が違う" \
+  's = s.replace("class_name = \"StagingDb\"", "class_name = \"LeaveDb\"", 1)'
+mutate "staging の DO の binding 名が違う" \
+  's = s.replace("name = \"STAGING_DB\"", "name = \"LEAVE_DB\"", 1)'
+mutate "staging の DO を 2 件にする" \
+  's = s.replace("[env.staging.version_metadata]", "[[env.staging.durable_objects.bindings]]\nname = \"OTHER_DB\"\nclass_name = \"OtherDb\"\nscript_name = \"alc-staging-db-staging\"\n\n[env.staging.version_metadata]", 1)'
+mutate "トップレベル (本番) に DO の binding を足す" \
+  's = s.replace("[build]", "[[durable_objects.bindings]]\nname = \"STAGING_DB\"\nclass_name = \"StagingDb\"\nscript_name = \"alc-staging-db-staging\"\n\n[build]", 1)'
+mutate "staging 以外の env (local) に DO の binding を足す" \
+  's += "\n[[env.local.durable_objects.bindings]]\nname = \"STAGING_DB\"\nclass_name = \"StagingDb\"\nscript_name = \"alc-staging-db-staging\"\n"'
+mutate "トップレベルに migrations (DO の class の定義) を足す" \
+  's = s.replace("[build]", "[[migrations]]\ntag = \"v1\"\nnew_sqlite_classes = [\"LeaveDb\"]\n\n[build]", 1)'
+mutate "staging に migrations を足す" \
+  's = s.replace("[env.staging.version_metadata]", "[[env.staging.migrations]]\ntag = \"v1\"\nnew_sqlite_classes = [\"LeaveDb\"]\n\n[env.staging.version_metadata]", 1)'
+mutate "本番に containers を足す" \
+  's = s.replace("[build]", "[[containers]]\nclass_name = \"X\"\nimage = \"./x\"\n\n[build]", 1)'
+mutate "staging に containers を足す" \
+  's = s.replace("[env.staging.version_metadata]", "[[env.staging.containers]]\nclass_name = \"X\"\nimage = \"./x\"\n\n[env.staging.version_metadata]", 1)'
 mutate "staging に hyperdrive (本番の DB へ届く binding) を足す" \
   's = s.replace("[env.staging.observability]", "[[env.staging.hyperdrive]]\nbinding = \"LEAVE_HYPERDRIVE\"\nid = \"x\"\n\n[env.staging.observability]", 1)'
 

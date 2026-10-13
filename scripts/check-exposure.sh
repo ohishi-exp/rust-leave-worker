@@ -13,8 +13,11 @@
 #     vpc_networks (Workers VPC)。src/db.rs はこの binding を Hyperdrive の binding LEAVE_HYPERDRIVE →
 #     文字列 DATABASE_URL より先に見るので、本番に紛れると TLS を強制する経路を飛ばして平文に落ちる。
 #     env.staging にだけ置く
-#   - どの階層にも (トップレベル・env 配下とも) durable_objects と containers が無い
-#     (この worker は Durable Object も Container も持たない)
+#   - containers はどの階層にも無い。migrations (Durable Object の class の定義) もどの階層にも無い
+#     (class は別 Worker のもの。この worker は Durable Object の class も Container も持たない)
+#   - durable_objects はトップレベルに無い。env 配下で許すのは env.staging の binding 1 件だけで、
+#     name = STAGING_DB・class_name = StagingDb・script_name = alc-staging-db-staging の完全一致
+#     (staging の DB = ippoan/alc-staging-db の DO。本番がテスト用の DB に繋がらないよう staging にだけ置く)
 #   - env 配下 (env.staging を含む) に hyperdrive が無い (ippoan/rust-alc-api#723)。Hyperdrive の binding は本番の DB へ
 #     届くので、トップレベル (本番) にだけ置く (staging に置かない)
 #   - env 配下の r2_buckets に本番の bucket (bucket_name = "leave-pdfs" / "leave-inbox" 完全一致) が無い
@@ -73,11 +76,25 @@ for key in ("vpc_services", "vpc_networks"):
     if cfg.get(key):
         err(f"トップレベルに {key} がある (本番の DB 接続が平文の VPC 経路に落ちる。env.staging にだけ置く)")
 
-# この worker は Durable Object も Container も持たない (どの階層にも置かない)
+# この worker は Container も DO の class (migrations) も持たない (どの階層にも置かない)
 for scope, table in [("トップレベル", cfg)] + [(f"env.{n}", e) for n, e in envs.items()]:
-    for key in ("durable_objects", "containers"):
+    for key in ("containers", "migrations"):
         if key in table:
-            err(f"{scope} に {key} がある (この worker は Durable Object も Container も持たない)")
+            err(f"{scope} に {key} がある (この worker は Container も Durable Object の class も持たない)")
+
+# Durable Object の binding は env.staging の STAGING_DB 1 件だけ (別 Worker alc-staging-db-staging の class StagingDb)。
+# トップレベル (本番) に置くと本番がテスト用の DB に繋がる。env.staging 以外 (local 等) にも置かない
+ALLOWED_DO = {"name": "STAGING_DB", "class_name": "StagingDb", "script_name": "alc-staging-db-staging"}
+if "durable_objects" in cfg:
+    err("トップレベルに durable_objects がある (本番の DB 接続が staging の DB に落ちる。env.staging にだけ置く)")
+for name, e in envs.items():
+    if "durable_objects" not in e:
+        continue
+    do = e["durable_objects"]
+    if name != "staging":
+        err(f"env.{name} に durable_objects がある (env.staging の STAGING_DB 1 件だけを許す)")
+    elif set(do) != {"bindings"} or do["bindings"] != [ALLOWED_DO]:
+        err("env.staging の durable_objects が STAGING_DB (class_name = StagingDb・script_name = alc-staging-db-staging) の 1 件だけでない")
 
 # Hyperdrive の binding は本番の DB へ届く。staging を含め、env 配下には置かない
 for name, e in envs.items():

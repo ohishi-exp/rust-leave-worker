@@ -20,6 +20,11 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
   `crates/leave/src/cron.rs`。tenant をまたぐのは `leave_enabled_tenants()` だけ)と、スキャンの inbox の Queue
   (`#[event(queue)]`、`crates/leave/src/inbox.rs`。tenant は auth-worker の `verifyTicket` の結果だけから取る)。
 - 公開範囲を弱めない: 本番・staging とも Service Binding だけ (どの env も `workers_dev`/`preview_urls` = false、route 無し)。
+- DB の経路 (`src/db.rs`、上から見て最初にあるもの): staging は **DO の binding `STAGING_DB`** (別 Worker
+  `alc-staging-db-staging` の `StagingDb` = PGlite。user は本番と同じ `alc_api_rt`) が最優先 → `LEAVE_DB_VPC` (docker の
+  PgBouncer。**切り戻し用**) → 本番 Hyperdrive → ローカル `DATABASE_URL`。**切り戻しは `STAGING_DB` の binding を外すだけ**。
+  binding が在るのに繋がらないときは次の段へ落とさず 500。DO の binding は **env.staging に 1 件だけ**
+  (name/class_name/script_name 完全一致。トップレベル・他の env・migrations は禁止。`check-exposure.sh`)。
   `ICHIBAN_DB`・`AUTH_WORKER` (LINE WORKS 送信)・Hyperdrive・`[triggers]` (cron) は本番だけ (staging / local の crons は空)、
   staging の R2・Queue は staging のもの、env 下の services は `-staging` の service だけ (一番星用は置かない)。
   `wrangler.toml` の表の順を変えない (新しい表は placement より後)。
