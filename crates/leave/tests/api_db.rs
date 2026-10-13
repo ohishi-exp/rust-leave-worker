@@ -2630,6 +2630,137 @@ mod ingest {
     }
 }
 
+/// 受信アドレスと会社の照合の口 `POST /internal/scan-check` (管理 API の外。共有 secret で守る)。
+/// mailbox は実在しない合成した名前だけを使う
+mod scan_check {
+    use super::*;
+    use support::{scan_check, INGEST_SECRET};
+
+    async fn with_mailbox(enabled: bool) -> (Uuid, String) {
+        let t = tenant().await;
+        let mailbox = format!("fake-{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let a = app(FakePdfs::default(), None).await;
+        let got = put_settings(
+            &a,
+            t,
+            json!({"mailbox": mailbox, "allowed_senders": ["a@example.com"], "enabled": enabled}),
+        )
+        .await;
+        assert_eq!(got.status, 200);
+        (t, mailbox)
+    }
+
+    fn body(mailbox: &str, tenant_id: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({"mailbox": mailbox, "tenant_id": tenant_id})).unwrap()
+    }
+
+    fn mismatch() -> Value {
+        json!({"error": "mailbox_mismatch"})
+    }
+
+    #[tokio::test]
+    async fn matching_mailbox_and_tenant_is_204() {
+        let (t, mailbox) = with_mailbox(true).await;
+        let a = app(FakePdfs::default(), None).await;
+        let got = scan_check(&a, Some(INGEST_SECRET), body(&mailbox, &t.to_string())).await;
+        assert_eq!(got.status, 204);
+        assert!(got.body.is_empty());
+        // mailbox は大文字でも同じ
+        let got = scan_check(
+            &a,
+            Some(INGEST_SECRET),
+            body(&mailbox.to_uppercase(), &t.to_string()),
+        )
+        .await;
+        assert_eq!(got.status, 204);
+        assert!(a.logs.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_disabled_and_other_tenant_are_the_same_403() {
+        let (t, mailbox) = with_mailbox(true).await;
+        let (off_t, off_mailbox) = with_mailbox(false).await;
+        let (other, _) = with_mailbox(true).await;
+        let a = app(FakePdfs::default(), None).await;
+        let cases = [
+            ("unknown", "fake-no-such-box", t),
+            ("disabled", off_mailbox.as_str(), off_t),
+            ("other tenant", mailbox.as_str(), other),
+        ];
+        for (name, m, tid) in cases {
+            let got = scan_check(&a, Some(INGEST_SECRET), body(m, &tid.to_string())).await;
+            assert_eq!(got.status, 403, "{name}");
+            assert_eq!(got.json(), mismatch(), "{name}");
+        }
+        // ログは固定の語だけ (mailbox・tenant を出さない)
+        let logs = a.logs.lock().unwrap().clone();
+        assert_eq!(logs, vec!["scan-check: mailbox_mismatch"; 3]);
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_or_wrong_secret() {
+        let (t, mailbox) = with_mailbox(true).await;
+        let a = app(FakePdfs::default(), None).await;
+        for secret in [
+            None,
+            Some(""),
+            Some("wrong"),
+            Some("leave-test-ingest-secre"),
+        ] {
+            let got = scan_check(&a, secret, body(&mailbox, &t.to_string())).await;
+            assert_eq!(got.status, 401, "secret={secret:?}");
+            assert_eq!(got.json(), json!({"error": "unauthorized"}));
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_input_is_400() {
+        let (t, mailbox) = with_mailbox(true).await;
+        let a = app(FakePdfs::default(), None).await;
+        let tid = t.to_string();
+        let big = vec![b' '; 2048];
+        let cases: [(&str, Vec<u8>, &str); 7] = [
+            ("mailbox", body("a b", &tid), "invalid_mailbox"),
+            ("mailbox short", body("ab", &tid), "invalid_mailbox"),
+            (
+                "tenant_id",
+                body(&mailbox, "not-a-uuid"),
+                "invalid_tenant_id",
+            ),
+            ("not json", b"nope".to_vec(), "invalid_body"),
+            (
+                "missing tenant_id",
+                serde_json::to_vec(&json!({"mailbox": mailbox})).unwrap(),
+                "invalid_body",
+            ),
+            (
+                "missing mailbox",
+                serde_json::to_vec(&json!({"tenant_id": tid})).unwrap(),
+                "invalid_body",
+            ),
+            ("too large", big, "invalid_body"),
+        ];
+        for (name, b, code) in cases {
+            let got = scan_check(&a, Some(INGEST_SECRET), b).await;
+            assert_eq!(got.status, 400, "{name}");
+            assert_eq!(got.json(), json!({"error": code}), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn db_failure_is_500_with_fixed_words() {
+        let (t, mailbox) = with_mailbox(true).await;
+        let a = support::app_with_broken_db(None).await;
+        let got = scan_check(&a, Some(INGEST_SECRET), body(&mailbox, &t.to_string())).await;
+        assert_eq!(got.status, 500);
+        assert_eq!(got.json(), json!({"error": "internal_error"}));
+        let logs = a.logs.lock().unwrap().clone();
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].starts_with("scan-check resolve: "), "{logs:?}");
+        assert!(!logs[0].contains(&mailbox) && !logs[0].contains(&t.to_string()));
+    }
+}
+
 /// staging の表示制限 (vars `STAGING_VISIBLE_MINUTES`): 受信から N 分を過ぎたページは一覧・詳細・更新・PDF で 404。
 /// vars が無い (本番) なら全部見える
 #[tokio::test]
