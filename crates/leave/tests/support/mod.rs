@@ -28,7 +28,10 @@ use leave::ichiban::{IchibanApi, IchibanError, IchibanResponse};
 use leave::inbox::{Inbox, InboxObject, TicketVerifier, VerifyError};
 use leave::reconcile::days_paths;
 use leave::store::{PdfStore, StoreError};
-use leave::{ingest_router, tenant_router, visible_minutes, IngestState, LeaveState, INGEST_PATH};
+use leave::{
+    ingest_router, tenant_router, visible_minutes, IngestState, LeaveState, INGEST_PATH,
+    SCAN_CHECK_PATH,
+};
 use tokio::sync::OnceCell;
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Config, NoTls};
@@ -683,9 +686,24 @@ pub async fn ingest(
     tenant_header: Option<Uuid>,
     body: Vec<u8>,
 ) -> Got {
+    post_internal(app, INGEST_PATH, secret, tenant_header, body).await
+}
+
+/// `POST /internal/scan-check` を 1 回打つ (`secret` が `None` ならヘッダーを付けない)
+pub async fn scan_check(app: &App, secret: Option<&str>, body: Vec<u8>) -> Got {
+    post_internal(app, SCAN_CHECK_PATH, secret, None, body).await
+}
+
+async fn post_internal(
+    app: &App,
+    path: &str,
+    secret: Option<&str>,
+    tenant_header: Option<Uuid>,
+    body: Vec<u8>,
+) -> Got {
     let mut b = Request::builder()
         .method("POST")
-        .uri(INGEST_PATH)
+        .uri(path)
         .header("content-type", "application/json");
     if let Some(s) = secret {
         b = b.header("X-Internal-Shared-Secret", s);
