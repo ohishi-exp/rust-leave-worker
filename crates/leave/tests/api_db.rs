@@ -3038,6 +3038,26 @@ mod inbox {
         );
     }
 
+    /// auth-worker が `{error: "unavailable"}` (資格情報の DB が一時的に引けない) を返したら retry。
+    /// チケット不正として消さない (object は inbox に残り、DB にも本保存にも入らない)
+    #[tokio::test]
+    async fn unavailable_verification_is_retried_and_keeps_the_object() {
+        let t = tenant().await;
+        let pdf = minimal_pdf(1);
+        let r = setup(
+            FakePdfs::default(),
+            FakeInbox::with(KEY, pdf, Some(TICKET)),
+            FakeVerifier::returning(Ok(json!({ "error": "unavailable" }))),
+        )
+        .await;
+        assert_eq!(r.handle(put_event()).await, Outcome::Retry);
+        assert_eq!(r.logs(), vec!["inbox: verify unavailable"]);
+        assert!(r.deleted().is_empty());
+        assert!(r.inbox.objects.lock().unwrap().contains_key(KEY));
+        assert!(r.pdfs.stored.lock().unwrap().is_empty());
+        assert!(pages_of(t).await.is_empty());
+    }
+
     /// verify の呼び出しと connect の呼び出しの順を残す verifier (どの呼び出しも同じ戻り)
     struct OrderedVerifier {
         events: Arc<StdMutex<Vec<&'static str>>>,
