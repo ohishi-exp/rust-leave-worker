@@ -1,11 +1,12 @@
-//! 管理 API の口 (15 本、worker が `/api` の下に nest するので実際の path は `/api/leave/…`)。
+//! 管理 API の口 (16 本、worker が `/api` の下に nest するので実際の path は `/api/leave/…`)。
 //!
 //! | method | path | 中身 |
 //! |---|---|---|
 //! | GET / PUT | `/leave/settings` | 自 tenant の設定 (無ければ既定値) / upsert |
 //! | GET | `/leave/departments` | 一番星の部門一覧をそのまま中継 |
 //! | GET | `/leave/employees` | 一番星の社員を自 tenant の `dept_codes` で絞る |
-//! | GET | `/leave/pages` | ページの一覧 (`status`・`employee_cd`・`limit`・`offset`) |
+//! | GET | `/leave/documents` | PDF 単位の一覧 (`state` = open / done / all・`limit`・`offset`) |
+//! | GET | `/leave/pages` | ページの一覧 (`status`・`employee_cd`・`r2_key`・`limit`・`offset`) |
 //! | GET / PUT | `/leave/pages/{id}` | ページ + 期間 / 紐づけの更新 |
 //! | GET | `/leave/pages/{id}/pdf` | そのページの PDF (自 tenant に見える行だけ) |
 //! | GET | `/leave/calendar` | 乗務員の月のカレンダー (`ledger`) |
@@ -42,7 +43,9 @@ use crate::auth::{actor, require_admin};
 use crate::cron::Notifier;
 use crate::ichiban::{filter_employees, IchibanApi, DEPARTMENTS_PATH, EMPLOYEES_PATH};
 use crate::ledger;
-use crate::pages::{validate_update, ListQuery, ListQueryRaw, PageUpdateInput};
+use crate::pages::{
+    validate_update, DocumentsQuery, DocumentsQueryRaw, ListQuery, ListQueryRaw, PageUpdateInput,
+};
 use crate::pg::{self, PutSettings};
 use crate::settings::{validate, Settings, SettingsInput};
 use crate::store::PdfStore;
@@ -94,6 +97,7 @@ pub fn tenant_router() -> Router<LeaveState> {
         .route("/leave/settings/test-notify", post(test_notify))
         .route("/leave/departments", get(departments))
         .route("/leave/employees", get(employees))
+        .route("/leave/documents", get(list_documents))
         .route("/leave/pages", get(list_pages))
         .route("/leave/pages/{id}", get(get_page).put(put_page))
         .route("/leave/pages/{id}/pdf", get(get_pdf))
@@ -276,6 +280,25 @@ async fn list_pages(
     match got {
         Ok(pages) => Json(json!({ "data": pages })).into_response(),
         Err(e) => db_error(&state, "list_pages", &e),
+    }
+}
+
+async fn list_documents(
+    State(state): State<LeaveState>,
+    Extension(t): Extension<TenantId>,
+    raw: Result<Query<DocumentsQueryRaw>, QueryRejection>,
+) -> Response {
+    let Ok(Query(raw)) = raw else {
+        return bad_request("invalid_query");
+    };
+    let q = match DocumentsQuery::parse(raw) {
+        Ok(q) => q,
+        Err(code) => return bad_request(code),
+    };
+    let got = pg::list_documents(&mut *state.pg.lock().await, t.0, q, visible_since(&state)).await;
+    match got {
+        Ok(docs) => Json(json!({ "data": docs })).into_response(),
+        Err(e) => db_error(&state, "list_documents", &e),
     }
 }
 
