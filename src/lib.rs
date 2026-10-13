@@ -32,7 +32,7 @@ use futures_util::lock::Mutex;
 use leave::cron::Notifier;
 use leave::{
     ingest_router, tenant_router, Clock, IngestState, LeaveState, LogSink, INGEST_PATH,
-    SCAN_CHECK_PATH, TEST_NOTIFY_PATH,
+    TEST_NOTIFY_PATH,
 };
 use tower_service::Service;
 use worker::{
@@ -70,7 +70,7 @@ fn clock() -> Clock {
 }
 
 /// 管理 API は `/api` の下にだけ出す。tenant の layer は nest の中の全 route (と、その下で当たらない path) に掛かる。
-/// メール取り込みの口 `/internal/ingest` と照合の口 `/internal/scan-check` は nest の外 (tenant・admin の layer の外で、共有 secret で守る)
+/// メール取り込みの口 `/internal/ingest` は nest の外 (tenant・admin の layer の外で、共有 secret で守る)
 fn router(state: LeaveState, ingest: IngestState) -> Router {
     let leave = tenant_router()
         .layer(middleware::from_fn(require_tenant_header))
@@ -136,7 +136,7 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
         .service(ICHIBAN_DB_BINDING)
         .ok()
         .map(|f| Arc::new(IchibanBinding::new(f)) as Arc<dyn leave::ichiban::IchibanApi>);
-    let secret = if matches!(req.uri().path(), INGEST_PATH | SCAN_CHECK_PATH) {
+    let secret = if req.uri().path() == INGEST_PATH {
         ingest_secret(&env).await
     } else {
         None

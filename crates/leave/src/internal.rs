@@ -9,10 +9,6 @@
 //! (R2 の await は transaction の外 = `tenant_tx` を 2 回に分けている)。
 //! ページ数以降 (本体) は [`ingest_pdf`] で、スキャンの inbox の取り込み ([`crate::inbox`]) と共用する。
 //!
-//! 同じ形の口 `POST /internal/scan-check` (nuxt-leave の /dav が、PUT の本体を受けたときに受信アドレスと資格情報の
-//! tenant を照合する): secret → body ([`check_scan_check`]) → `pg::resolve_mailbox` → tenant 一致なら 204、
-//! 未知・無効・別 tenant は区別せず 403 `mailbox_mismatch` (tenant や mailbox の有無を漏らさない)。
-//!
 //! 応答・ログは固定の語だけ。PDF の中身・差出人のアドレス・secret は出さない (tenant の識別子は 202・200 のログに出す)。
 
 use std::sync::Arc;
@@ -30,9 +26,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::ingest::{
-    check_input, check_scan_check, clip_mail_from, clip_subject, count_pages, object_key,
-    secret_matches, seeded_object_key, sender_allowed, IngestInput, Reject, MAX_BODY_BYTES,
-    MAX_SCAN_CHECK_BODY_BYTES,
+    check_input, clip_mail_from, clip_subject, count_pages, object_key, secret_matches,
+    seeded_object_key, sender_allowed, IngestInput, Reject, MAX_BODY_BYTES,
 };
 use crate::pg;
 use crate::routes::LogSink;
@@ -41,8 +36,6 @@ use crate::store::PdfStore;
 /// 口の path (worker はこれを `/api` の nest の外に置く)
 pub const INGEST_PATH: &str = "/internal/ingest";
 /// 共有 secret を載せるヘッダー (email-receiver と同じ名前)
-/// 受信アドレスと会社の照合の口 (worker は INGEST_PATH と同じく nest の外に置き、secret もこの path で取る)
-pub const SCAN_CHECK_PATH: &str = "/internal/scan-check";
 const SECRET_HEADER: &str = "X-Internal-Shared-Secret";
 
 #[derive(Clone)]
@@ -55,9 +48,7 @@ pub struct IngestState {
 }
 
 pub fn ingest_router() -> Router<IngestState> {
-    Router::new()
-        .route(INGEST_PATH, post(ingest))
-        .route(SCAN_CHECK_PATH, post(scan_check))
+    Router::new().route(INGEST_PATH, post(ingest))
 }
 
 fn unauthorized() -> Response {
@@ -141,40 +132,6 @@ async fn ingest(State(state): State<IngestState>, req: Request<Body>) -> Respons
         }
         Err(IngestFailure::Drop(reason)) => dropped(&state, reason, Some(tenant_id)),
         Err(IngestFailure::Failed) => internal_error(),
-    }
-}
-
-async fn scan_check(State(state): State<IngestState>, req: Request<Body>) -> Response {
-    let given = req
-        .headers()
-        .get(SECRET_HEADER)
-        .and_then(|v| v.to_str().ok());
-    let expected = state.secret.as_deref().unwrap_or("");
-    if !secret_matches(expected, given) {
-        (state.log)("scan-check: unauthorized");
-        return unauthorized();
-    }
-    let Ok(body) = axum::body::to_bytes(req.into_body(), MAX_SCAN_CHECK_BODY_BYTES).await else {
-        return bad_request("invalid_body");
-    };
-    let (mailbox, tenant_id) = match check_scan_check(&body) {
-        Ok(v) => v,
-        Err(code) => return bad_request(code),
-    };
-    match pg::resolve_mailbox(&mut *state.pg.lock().await, mailbox).await {
-        Ok(Some((found, _))) if found == tenant_id => StatusCode::NO_CONTENT.into_response(),
-        Ok(_) => {
-            (state.log)("scan-check: mailbox_mismatch");
-            (
-                StatusCode::FORBIDDEN,
-                Json(json!({ "error": "mailbox_mismatch" })),
-            )
-                .into_response()
-        }
-        Err(e) => {
-            (state.log)(&format!("scan-check resolve: {}", alc_worker_db::kind(&e)));
-            internal_error()
-        }
     }
 }
 
