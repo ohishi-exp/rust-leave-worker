@@ -2385,3 +2385,427 @@ mod ingest {
         assert!(a.pdfs.stored.lock().unwrap().is_empty());
     }
 }
+
+/// staging の表示制限 (vars `STAGING_VISIBLE_MINUTES`): 受信から N 分を過ぎたページは一覧・詳細・更新・PDF で 404。
+/// vars が無い (本番) なら全部見える
+#[tokio::test]
+async fn staging_hides_pages_older_than_visible_minutes() {
+    let t = tenant().await;
+    // NOW = 2026-10-10T00:00:00Z。10 分前ちょうどまでは見える
+    let fresh_key = format!("{t}/fresh.pdf");
+    let old_key = format!("{t}/old.pdf");
+    let fresh = page(t, &fresh_key, 1, "2026-10-09T23:55:00Z").await;
+    let edge = page(t, &format!("{t}/edge.pdf"), 1, "2026-10-09T23:50:00Z").await;
+    let old = page(t, &old_key, 1, "2026-10-09T23:49:59Z").await;
+    let pdfs = || FakePdfs {
+        objects: HashMap::from([
+            (fresh_key.clone(), b"%PDF-fresh".to_vec()),
+            (old_key.clone(), b"%PDF-old".to_vec()),
+        ]),
+        ..Default::default()
+    };
+    let ids = |v: &Value| -> Vec<String> {
+        v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    let staging = support::app_with_visible_minutes(pdfs(), "10").await;
+    let got = call(&staging, "GET", "/api/leave/pages", Some(t), ADMIN, None).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(ids(&got.json()), vec![fresh.to_string(), edge.to_string()]);
+    for (method, path, body) in [
+        ("GET", format!("/api/leave/pages/{old}"), None),
+        (
+            "PUT",
+            format!("/api/leave/pages/{old}"),
+            Some(json!({"status": "ignored"})),
+        ),
+        ("GET", format!("/api/leave/pages/{old}/pdf"), None),
+    ] {
+        let got = call(&staging, method, &path, Some(t), ADMIN, body).await;
+        assert_eq!(got.status, 404, "{method} {path}");
+        assert_eq!(got.json(), json!({"error": "not_found"}));
+    }
+    assert!(staging.pdfs.reads.lock().unwrap().is_empty());
+    let got = call(
+        &staging,
+        "GET",
+        &format!("/api/leave/pages/{fresh}/pdf"),
+        Some(t),
+        ADMIN,
+        None,
+    )
+    .await;
+    assert_eq!(got.body, b"%PDF-fresh");
+    let path = format!("/api/leave/pages/{edge}");
+    let got = call(&staging, "GET", &path, Some(t), ADMIN, None).await;
+    assert_eq!(got.status, 200);
+    let body = Some(json!({"status": "ignored"}));
+    let got = call(&staging, "PUT", &path, Some(t), ADMIN, body).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json()["status"], "ignored");
+
+    // 本番 (vars が無い) は全部見える
+    let prod = app(pdfs(), None).await;
+    let got = call(&prod, "GET", "/api/leave/pages", Some(t), ADMIN, None).await;
+    assert_eq!(ids(&got.json()).len(), 3);
+    let got = call(
+        &prod,
+        "GET",
+        &format!("/api/leave/pages/{old}/pdf"),
+        Some(t),
+        ADMIN,
+        None,
+    )
+    .await;
+    assert_eq!(got.body, b"%PDF-old");
+}
+
+/// スキャンの inbox の取り込み (Queue の consumer。worker の `#[event(queue)]` が呼ぶ `inbox::handle`)
+mod inbox {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    use futures_util::lock::Mutex;
+    use leave::inbox::{handle, InboxDeps, Outcome, VerifyError, TICKET_PURPOSE};
+    use leave::ingest::{minimal_pdf, sha256_hex, MAX_PAGES, MAX_PDF_BYTES};
+    use leave::LogSink;
+    use support::{app_client, FakeInbox, FakeVerifier};
+
+    const KEY: &str = "0b7c-申請.pdf";
+    const TICKET: &str = "test-ticket";
+
+    struct Run {
+        pg: Mutex<alc_worker_db::PgClient>,
+        pdfs: FakePdfs,
+        inbox: FakeInbox,
+        verifier: FakeVerifier,
+        logs: Arc<StdMutex<Vec<String>>>,
+        log: LogSink,
+    }
+
+    async fn setup(pdfs: FakePdfs, inbox: FakeInbox, verifier: FakeVerifier) -> Run {
+        let logs = Arc::new(StdMutex::new(Vec::new()));
+        let sink = logs.clone();
+        Run {
+            pg: Mutex::new(app_client().await),
+            pdfs,
+            inbox,
+            verifier,
+            logs,
+            log: Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_owned())),
+        }
+    }
+
+    impl Run {
+        async fn handle(&self, body: Value) -> Outcome {
+            let deps = InboxDeps {
+                pg: &self.pg,
+                pdfs: &self.pdfs,
+                inbox: &self.inbox,
+                verifier: &self.verifier,
+                log: &self.log,
+            };
+            handle(&deps, body).await
+        }
+
+        fn logs(&self) -> Vec<String> {
+            self.logs.lock().unwrap().clone()
+        }
+
+        fn deleted(&self) -> Vec<String> {
+            self.inbox.deleted.lock().unwrap().clone()
+        }
+    }
+
+    fn event(action: &str, size: Option<u64>) -> Value {
+        let mut object = json!({ "key": KEY, "eTag": "e" });
+        if let Some(s) = size {
+            object["size"] = json!(s);
+        }
+        json!({
+            "account": "acc",
+            "action": action,
+            "bucket": "leave-inbox",
+            "object": object,
+            "eventTime": "2026-10-09T08:30:00Z",
+        })
+    }
+
+    fn put_event() -> Value {
+        event("PutObject", Some(100))
+    }
+
+    fn ticket_for(t: Uuid, pdf: &[u8]) -> Result<Value, VerifyError> {
+        Ok(json!({ "tenantId": t, "username": "scan", "sha256": sha256_hex(pdf) }))
+    }
+
+    async fn pages_of(t: Uuid) -> Vec<Value> {
+        let a = app(FakePdfs::default(), None).await;
+        let got = call(&a, "GET", "/api/leave/pages", Some(t), ADMIN, None).await;
+        assert_eq!(got.status, 200);
+        got.json()["data"].as_array().unwrap().clone()
+    }
+
+    /// チケットの tenant に入る (mail_from / subject は NULL)。再配送しても同じ key・同じ行で、二重にならない
+    #[tokio::test]
+    async fn stores_for_the_ticket_tenant_once() {
+        let t = tenant().await;
+        let other = tenant().await;
+        let pdf = minimal_pdf(2);
+        let r = setup(
+            FakePdfs::default(),
+            FakeInbox::with(KEY, pdf.clone(), Some(TICKET)),
+            FakeVerifier::returning(ticket_for(t, &pdf)),
+        )
+        .await;
+        assert_eq!(r.handle(put_event()).await, Outcome::Ack);
+        let calls = r.verifier.calls.lock().unwrap().clone();
+        assert_eq!(calls, vec![(TICKET.to_owned(), TICKET_PURPOSE.to_owned())]);
+        assert_eq!(r.deleted(), vec![KEY]);
+        let stored: Vec<String> = r.pdfs.stored.lock().unwrap().keys().cloned().collect();
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].starts_with(&format!("{t}/2026/10/")));
+        assert!(!stored[0].contains("申請"));
+        let pages = pages_of(t).await;
+        assert_eq!(pages.len(), 2);
+        for p in &pages {
+            assert_eq!(p["mail_from"], Value::Null);
+            assert_eq!(p["subject"], Value::Null);
+            assert_eq!(p["r2_key"], stored[0].as_str());
+            assert_eq!(p["received_at"], "2026-10-09T08:30:00Z");
+        }
+        assert!(pages_of(other).await.is_empty());
+        assert_eq!(r.logs(), vec![format!("inbox stored: tenant={t} pages=2")]);
+
+        // 2 回目の配送 (前回の削除の後に届いた): object が無いので ack
+        assert_eq!(r.handle(put_event()).await, Outcome::Ack);
+        assert_eq!(r.logs().last().unwrap(), "inbox: object gone");
+
+        // 削除に失敗して再配送された: 同じ key に置き直し、行は増えない
+        r.inbox
+            .objects
+            .lock()
+            .unwrap()
+            .insert(KEY.to_owned(), (pdf.clone(), Some(TICKET.to_owned())));
+        assert_eq!(r.handle(put_event()).await, Outcome::Ack);
+        assert_eq!(r.pdfs.stored.lock().unwrap().len(), 1);
+        assert_eq!(pages_of(t).await.len(), 2);
+    }
+
+    /// 対象外の action・大きさ 0・読めない本文は何もせず ack (inbox の object には触らない)
+    #[tokio::test]
+    async fn ignores_other_events() {
+        let r = setup(
+            FakePdfs::default(),
+            FakeInbox::default(),
+            FakeVerifier::returning(Ok(Value::Null)),
+        )
+        .await;
+        for body in [
+            event("DeleteObject", Some(10)),
+            event("CopyObject", Some(10)),
+            event("PutObject", Some(0)),
+        ] {
+            assert_eq!(r.handle(body).await, Outcome::Ack);
+        }
+        assert_eq!(r.handle(json!({"action": "PutObject"})).await, Outcome::Ack);
+        assert_eq!(r.handle(json!("text")).await, Outcome::Ack);
+        assert_eq!(
+            r.logs(),
+            vec![
+                "inbox: skipped",
+                "inbox: skipped",
+                "inbox: skipped",
+                "inbox: invalid message",
+                "inbox: invalid message"
+            ]
+        );
+        assert!(r.deleted().is_empty());
+        assert!(r.verifier.calls.lock().unwrap().is_empty());
+    }
+
+    /// 取り込めない object は消して ack (再試行しない)。DB にも R2 の本保存にも入らない
+    #[tokio::test]
+    async fn discards_what_it_cannot_store() {
+        let t = tenant().await;
+        let pdf = minimal_pdf(1);
+        let not_pdf = b"GIF89a".to_vec();
+        let broken = b"%PDF-1.4\nbroken".to_vec();
+        let many = minimal_pdf(MAX_PAGES + 1);
+        type Case<'a> = (
+            Value,
+            Vec<u8>,
+            Option<&'a str>,
+            Result<Value, VerifyError>,
+            &'a str,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                event("PutObject", Some(MAX_PDF_BYTES as u64 + 1)),
+                pdf.clone(),
+                Some(TICKET),
+                ticket_for(t, &pdf),
+                "pdf_too_large",
+            ),
+            (
+                put_event(),
+                pdf.clone(),
+                None,
+                ticket_for(t, &pdf),
+                "ticket_missing",
+            ),
+            (
+                put_event(),
+                pdf.clone(),
+                Some(TICKET),
+                Ok(Value::Null),
+                "ticket_invalid",
+            ),
+            (
+                put_event(),
+                pdf.clone(),
+                Some(TICKET),
+                Ok(json!({"tenantId": "not-a-uuid", "sha256": sha256_hex(&pdf)})),
+                "ticket_invalid",
+            ),
+            (
+                put_event(),
+                pdf.clone(),
+                Some(TICKET),
+                ticket_for(t, b"another pdf"),
+                "sha256_mismatch",
+            ),
+            (
+                put_event(),
+                not_pdf.clone(),
+                Some(TICKET),
+                ticket_for(t, &not_pdf),
+                "not_pdf",
+            ),
+            (
+                put_event(),
+                broken.clone(),
+                Some(TICKET),
+                ticket_for(t, &broken),
+                "unreadable_pdf",
+            ),
+            (
+                put_event(),
+                many.clone(),
+                Some(TICKET),
+                ticket_for(t, &many),
+                "too_many_pages",
+            ),
+        ];
+        for (body, bytes, ticket, verified, reason) in cases {
+            let r = setup(
+                FakePdfs::default(),
+                FakeInbox::with(KEY, bytes, ticket),
+                FakeVerifier::returning(verified),
+            )
+            .await;
+            assert_eq!(r.handle(body).await, Outcome::Ack, "{reason}");
+            assert_eq!(r.logs(), vec![format!("inbox dropped: {reason}")]);
+            assert_eq!(r.deleted(), vec![KEY], "{reason}");
+            assert!(r.pdfs.stored.lock().unwrap().is_empty(), "{reason}");
+        }
+        assert!(pages_of(t).await.is_empty());
+    }
+
+    /// 一時的な失敗 (inbox の読み出し・RPC・R2 の put・inbox の削除) は retry
+    #[tokio::test]
+    async fn temporary_failures_are_retried() {
+        let t = tenant().await;
+        let pdf = minimal_pdf(1);
+        let inbox = || FakeInbox::with(KEY, pdf.clone(), Some(TICKET));
+
+        let r = setup(
+            FakePdfs::default(),
+            FakeInbox {
+                fail_get: true,
+                ..inbox()
+            },
+            FakeVerifier::returning(ticket_for(t, &pdf)),
+        )
+        .await;
+        assert_eq!(r.handle(put_event()).await, Outcome::Retry);
+        assert_eq!(r.logs(), vec!["inbox: get"]);
+
+        let r = setup(
+            FakePdfs::default(),
+            inbox(),
+            FakeVerifier::returning(Err(VerifyError)),
+        )
+        .await;
+        assert_eq!(r.handle(put_event()).await, Outcome::Retry);
+        assert_eq!(r.logs(), vec!["inbox: verify failed"]);
+        assert!(r.deleted().is_empty());
+
+        let fail_put = FakePdfs {
+            fail_put: true,
+            ..Default::default()
+        };
+        let verifier = FakeVerifier::returning(ticket_for(t, &pdf));
+        let r = setup(fail_put, inbox(), verifier).await;
+        assert_eq!(r.handle(put_event()).await, Outcome::Retry);
+        assert_eq!(r.logs(), vec!["ingest: r2 put failed"]);
+        assert!(r.deleted().is_empty());
+
+        // 取り込めたが inbox を消せなかった: retry (次の配送は同じ key・同じ行で冪等)
+        let r = setup(
+            FakePdfs::default(),
+            FakeInbox {
+                fail_delete: true,
+                ..inbox()
+            },
+            FakeVerifier::returning(ticket_for(t, &pdf)),
+        )
+        .await;
+        assert_eq!(r.handle(put_event()).await, Outcome::Retry);
+        let stored = format!("inbox stored: tenant={t} pages=1");
+        assert_eq!(r.logs(), vec![stored, "inbox: delete delete".to_owned()]);
+        assert_eq!(pages_of(t).await.len(), 1);
+
+        // 取り込めない object を消せなかった: retry
+        let r = setup(
+            FakePdfs::default(),
+            FakeInbox {
+                fail_delete: true,
+                ..FakeInbox::with(KEY, pdf.clone(), None)
+            },
+            FakeVerifier::returning(ticket_for(t, &pdf)),
+        )
+        .await;
+        assert_eq!(r.handle(put_event()).await, Outcome::Retry);
+        assert_eq!(
+            r.logs(),
+            vec!["inbox dropped: ticket_missing", "inbox: delete delete"]
+        );
+    }
+
+    /// INSERT が失敗しても、決定的な key の本保存の object は消さない (前の配送の行が指していることがある)
+    #[tokio::test]
+    async fn failed_insert_keeps_the_seeded_object() {
+        let t = tenant().await;
+        let pdf = minimal_pdf(1);
+        let r = setup(
+            FakePdfs {
+                drop_tenant_on_put: Some(t),
+                ..Default::default()
+            },
+            FakeInbox::with(KEY, pdf.clone(), Some(TICKET)),
+            FakeVerifier::returning(ticket_for(t, &pdf)),
+        )
+        .await;
+        assert_eq!(r.handle(put_event()).await, Outcome::Retry);
+        assert_eq!(r.logs(), vec!["ingest insert: 23503"]);
+        assert!(r.pdfs.deleted.lock().unwrap().is_empty());
+        assert_eq!(r.pdfs.stored.lock().unwrap().len(), 1);
+        assert!(r.deleted().is_empty());
+    }
+}

@@ -25,9 +25,10 @@ use futures_util::future::BoxFuture;
 use futures_util::lock::Mutex;
 use leave::cron::{Notifier, NotifyError, NotifyTarget};
 use leave::ichiban::{IchibanApi, IchibanError, IchibanResponse};
+use leave::inbox::{Inbox, InboxObject, TicketVerifier, VerifyError};
 use leave::reconcile::days_paths;
 use leave::store::{PdfStore, StoreError};
-use leave::{ingest_router, tenant_router, IngestState, LeaveState, INGEST_PATH};
+use leave::{ingest_router, tenant_router, visible_minutes, IngestState, LeaveState, INGEST_PATH};
 use tokio::sync::OnceCell;
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Config, NoTls};
@@ -316,6 +317,85 @@ impl PdfStore for FakePdfs {
     }
 }
 
+/// inbox の object (中身, チケット)
+pub type InboxEntry = (Vec<u8>, Option<String>);
+
+/// 偽のスキャンの inbox (key → (中身, チケット))。`fail_get` / `fail_delete` なら失敗する
+#[derive(Default)]
+pub struct FakeInbox {
+    pub objects: StdMutex<HashMap<String, InboxEntry>>,
+    pub deleted: StdMutex<Vec<String>>,
+    pub fail_get: bool,
+    pub fail_delete: bool,
+}
+
+impl FakeInbox {
+    pub fn with(key: &str, bytes: Vec<u8>, ticket: Option<&str>) -> Self {
+        let inbox = Self::default();
+        inbox
+            .objects
+            .lock()
+            .unwrap()
+            .insert(key.to_owned(), (bytes, ticket.map(str::to_owned)));
+        inbox
+    }
+}
+
+impl Inbox for FakeInbox {
+    fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<InboxObject>, StoreError>> {
+        Box::pin(async move {
+            if self.fail_get {
+                return Err(StoreError("get"));
+            }
+            let objects = self.objects.lock().unwrap();
+            Ok(objects.get(key).map(|(bytes, ticket)| InboxObject {
+                bytes: bytes.clone(),
+                ticket: ticket.clone(),
+            }))
+        })
+    }
+
+    fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            self.deleted.lock().unwrap().push(key.to_owned());
+            if self.fail_delete {
+                return Err(StoreError("delete"));
+            }
+            self.objects.lock().unwrap().remove(key);
+            Ok(())
+        })
+    }
+}
+
+/// 偽の auth-worker の `verifyTicket` (決まった戻りを返し、呼ばれた (チケット, 用途) を残す)
+pub struct FakeVerifier {
+    pub result: Result<serde_json::Value, VerifyError>,
+    pub calls: StdMutex<Vec<(String, String)>>,
+}
+
+impl FakeVerifier {
+    pub fn returning(result: Result<serde_json::Value, VerifyError>) -> Self {
+        Self {
+            result,
+            calls: StdMutex::new(Vec::new()),
+        }
+    }
+}
+
+impl TicketVerifier for FakeVerifier {
+    fn verify<'a>(
+        &'a self,
+        ticket: &'a str,
+        purpose: &'a str,
+    ) -> BoxFuture<'a, Result<serde_json::Value, VerifyError>> {
+        Box::pin(async move {
+            let call = (ticket.to_owned(), purpose.to_owned());
+            self.calls.lock().unwrap().push(call);
+            self.result.clone()
+        })
+    }
+}
+
 /// 偽の一番星 Worker (path → 応答)。登録の無い path は呼び出しの失敗
 #[derive(Default)]
 pub struct FakeIchiban {
@@ -427,19 +507,38 @@ pub struct App {
     pub logs: Arc<StdMutex<Vec<String>>>,
 }
 
-/// worker の src/lib.rs と同じ組み立て (`/api` の下に nest し、tenant の layer を掛ける)
+/// worker の src/lib.rs と同じ組み立て (`/api` の下に nest し、tenant の layer を掛ける)。
+/// 本番と同じく vars `STAGING_VISIBLE_MINUTES` が無い (= 表示制限なし)
 pub async fn app(pdfs: FakePdfs, ichiban: Option<FakeIchiban>) -> App {
     build(
         app_client().await,
         pdfs,
         ichiban,
         Arc::new(FakeNotifier::default()),
+        visible_minutes(None),
+    )
+}
+
+/// staging と同じ表示制限 (vars `STAGING_VISIBLE_MINUTES` = `minutes`) を掛けて組み立てる
+pub async fn app_with_visible_minutes(pdfs: FakePdfs, minutes: &str) -> App {
+    build(
+        app_client().await,
+        pdfs,
+        None,
+        Arc::new(FakeNotifier::default()),
+        visible_minutes(Some(minutes)),
     )
 }
 
 /// 送信の口 (偽の送信か、送れない環境) を差して組み立てる
 pub async fn app_with_notifier(notifier: Arc<dyn Notifier>) -> App {
-    build(app_client().await, FakePdfs::default(), None, notifier)
+    build(
+        app_client().await,
+        FakePdfs::default(),
+        None,
+        notifier,
+        None,
+    )
 }
 
 /// 接続が切れた DB (backend を落とした接続) で組み立てる (DB のエラーの経路を通すため)
@@ -449,6 +548,7 @@ pub async fn app_with_broken_db(ichiban: Option<FakeIchiban>) -> App {
         FakePdfs::default(),
         ichiban,
         Arc::new(FakeNotifier::default()),
+        None,
     )
 }
 
@@ -479,6 +579,7 @@ fn build(
     pdfs: FakePdfs,
     ichiban: Option<FakeIchiban>,
     notifier: Arc<dyn Notifier>,
+    visible_minutes: Option<i64>,
 ) -> App {
     let pdfs = Arc::new(pdfs);
     let ichiban = ichiban.map(Arc::new);
@@ -491,6 +592,7 @@ fn build(
         notifier,
         log: Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_owned())),
         now: Arc::new(|| NOW.parse().unwrap()),
+        visible_minutes,
     };
     let ingest_state = IngestState {
         pg: state.pg.clone(),

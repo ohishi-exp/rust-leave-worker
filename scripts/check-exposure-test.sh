@@ -45,7 +45,7 @@ mutate "staging 以外の env がトップレベルの true を継承" \
 mutate "トップレベルの vars に ALLOW_INSECURE_DB" \
   's = s.replace("[build]", "[vars]\nALLOW_INSECURE_DB = \"1\"\n\n[build]", 1)'
 mutate "staging の vars に ALLOW_INSECURE_DB" \
-  's += "\n[env.staging.vars]\nALLOW_INSECURE_DB = \"1\"\n"'
+  's = s.replace("[env.staging.vars]\n", "[env.staging.vars]\nALLOW_INSECURE_DB = \"1\"\n", 1)'
 mutate "トップレベルの workers_dev を true に" \
   's = re.sub(r"^workers_dev = false$", "workers_dev = true", s, count=1, flags=re.M)'
 mutate "トップレベルの preview_urls を消す" \
@@ -65,5 +65,17 @@ mutate "staging の r2_buckets が本番の bucket leave-pdfs を指す" \
   's = s.replace("bucket_name = \"leave-pdfs-staging\"", "bucket_name = \"leave-pdfs\"", 1)'
 mutate "staging に services (一番星 Worker = 本番の社員マスタ) を足す" \
   's = s.replace("[env.staging.observability]", "[[env.staging.services]]\nbinding = \"ICHIBAN_DB\"\nservice = \"ichibanboshi-ichiban\"\n\n[env.staging.observability]", 1)'
+mutate "staging に一番星の binding を -staging の service 名で足す" \
+  's = s.replace("[env.staging.observability]", "[[env.staging.services]]\nbinding = \"ICHIBAN_DB\"\nservice = \"ichibanboshi-ichiban-staging\"\n\n[env.staging.observability]", 1)'
+mutate "staging の services が本番の auth-worker を指す" \
+  's = s.replace("service = \"auth-worker-staging\"", "service = \"auth-worker\"", 1)'
+mutate "staging の r2_buckets が本番の bucket leave-inbox を指す" \
+  's = s.replace("bucket_name = \"leave-inbox-staging\"", "bucket_name = \"leave-inbox\"", 1)'
+mutate "staging の queue consumer が本番の queue leave-inbox を消費する" \
+  's = s.replace("queue = \"leave-inbox-staging\"\n", "queue = \"leave-inbox\"\n", 1)'
+mutate "staging の queue consumer の dead letter queue が本番のもの" \
+  's = s.replace("dead_letter_queue = \"leave-inbox-staging-dlq\"", "dead_letter_queue = \"leave-inbox-dlq\"", 1)'
+mutate "staging に本番の queue の consumer を前に挿す" \
+  's = s.replace("[env.staging.observability]", "[[env.staging.queues.consumers]]\nqueue = \"leave-inbox\"\n\n[env.staging.observability]", 1)'
 
 exit "$fail"

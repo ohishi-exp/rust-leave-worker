@@ -17,10 +17,13 @@
 #     (この worker は Durable Object も Container も持たない)
 #   - env 配下 (env.staging を含む) に hyperdrive が無い (ippoan/rust-alc-api#723)。Hyperdrive の binding は本番の DB へ
 #     届くので、トップレベル (本番) にだけ置く (staging に置かない)
-#   - env 配下の r2_buckets に本番の bucket (bucket_name = "leave-pdfs" 完全一致) が無い
-#     (staging が本番の bucket を指すと、本番の申請書を読み書きする)
-#   - env 配下 (env.staging を含む) に services が無い。一番星 Worker (ICHIBAN_DB) は本番の社員マスタを返すので、
-#     staging から引かせない (一番星 Worker に staging は無い)
+#   - env 配下の r2_buckets に本番の bucket (bucket_name = "leave-pdfs" / "leave-inbox" 完全一致) が無い
+#     (staging が本番の bucket を指すと、本番の申請書を読み書きする・本番の inbox を取り込む)
+#   - env 配下 (env.staging を含む) の services は、service 名が `-staging` で終わり、かつ binding が一番星用 (ICHIBAN_DB)
+#     でないものだけ。一番星 Worker は本番の社員マスタを返すので staging から引かせない (一番星 Worker に staging は無い)。
+#     ほかの service も本番の Worker (auth-worker 等) を staging から呼ばない
+#   - env 配下の queues.consumers の queue (と dead_letter_queue) が `-staging` (dlq は `-staging-dlq`) で終わる
+#     (本番の inbox の通知を staging が消費しない)
 # 違えば exit 1。CI で毎回走らせる。陰性対照は scripts/check-exposure-test.sh。
 #
 #   bash scripts/check-exposure.sh [wrangler.toml]
@@ -81,16 +84,27 @@ for name, e in envs.items():
     if e.get("hyperdrive"):
         err(f"env.{name} に hyperdrive がある (本番の DB へ届く binding。トップレベルにだけ置く)")
 
-# 本番の R2 の bucket を env 配下 (staging を含む) から指さない (本番の object を上書きする)
+# 本番の R2 の bucket を env 配下 (staging を含む) から指さない (本番の object を上書きする・本番の inbox を取り込む)
 for name, e in envs.items():
     for b in e.get("r2_buckets", []):
-        if b.get("bucket_name") in ("leave-pdfs",):
+        if b.get("bucket_name") in ("leave-pdfs", "leave-inbox"):
             err(f"env.{name} の r2_buckets が本番の bucket {b['bucket_name']} を指している (env 用の bucket を指すこと)")
 
-# Service Binding (一番星 Worker = 本番の社員マスタ) を env 配下 (staging を含む) に置かない
+# env 配下の Service Binding は `-staging` の service だけ (本番の auth-worker を staging から呼ばない)。
+# 一番星 Worker (ICHIBAN_DB) は本番の社員マスタを返すので、service 名に関わらず env 配下に置かない
 for name, e in envs.items():
-    if e.get("services"):
-        err(f"env.{name} に services がある (一番星 Worker は本番の社員マスタを返す。トップレベルにだけ置く)")
+    for s in e.get("services", []):
+        if s.get("binding") == "ICHIBAN_DB":
+            err(f"env.{name} の services に ICHIBAN_DB がある (一番星 Worker は本番の社員マスタを返す。トップレベルにだけ置く)")
+        elif not str(s.get("service", "")).endswith("-staging"):
+            err(f"env.{name} の services が -staging でない service を指している (本番の Worker へ届く)")
+
+# env 配下の Queue の consumer は `-staging` の queue だけ (本番の inbox の通知を staging が横取りしない)。dead letter queue も同じ
+for name, e in envs.items():
+    for c in e.get("queues", {}).get("consumers", []):
+        for key in ("queue", "dead_letter_queue"):
+            if key in c and not str(c[key]).endswith(("-staging", "-staging-dlq")):
+                err(f"env.{name} の queues.consumers の {key} が -staging でない (本番の queue を消費する)")
 
 if errors:
     sys.exit(1)

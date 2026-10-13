@@ -62,6 +62,26 @@ secret_name = "INTERNAL_SHARED_SECRET"
 binding = "AUTH_WORKER"
 service = "auth-worker"
 
+# スキャンの inbox (複合機 → nuxt-leave の WebDAV が置く。customMetadata.ticket に auth-worker のチケット)。
+# R2 のイベント通知 (object-create・suffix .pdf) が Queue leave-inbox に積み、下の consumer (src/lib.rs の queue) が取り込む。
+# staging は下で別の bucket・別の queue を指す (scripts/check-exposure.sh が検査)
+[[r2_buckets]]
+binding = "LEAVE_INBOX"
+bucket_name = "leave-inbox"
+
+[[queues.consumers]]
+queue = "leave-inbox"
+dead_letter_queue = "leave-inbox-dlq"
+max_batch_size = 5
+max_retries = 5
+
+# auth-worker の named entrypoint (RPC)。inbox のチケットを verifyTicket(ticket, "leave-scan") で検証する
+# (この Worker は鍵を持たない。会社 ID は検証結果だけから取る)
+[[services]]
+binding = "AUTH_MCRED"
+service = "auth-worker"
+entrypoint = "MachineCredentialEntrypoint"
+
 # 毎朝 7:00 JST に一番星と申請書を突き合わせる (src/lib.rs の scheduled)。本番だけ — staging / local は下で空にする
 # (triggers は env に継承されるため。staging には一番星の binding が無い)
 [triggers]
@@ -106,6 +126,28 @@ secret_name = "INTERNAL_SHARED_SECRET"
 # 定時実行は本番だけ (トップレベルの triggers を継承させない)
 [env.staging.triggers]
 crons = []
+
+# スキャンの inbox (staging の bucket と queue。binding も consumer も env に継承されないので再宣言する)
+[[env.staging.r2_buckets]]
+binding = "LEAVE_INBOX"
+bucket_name = "leave-inbox-staging"
+
+[[env.staging.queues.consumers]]
+queue = "leave-inbox-staging"
+dead_letter_queue = "leave-inbox-staging-dlq"
+max_batch_size = 5
+max_retries = 5
+
+# チケットの検証は auth-worker の staging へ (env 下の services は `-staging` の service だけ。scripts/check-exposure.sh)
+[[env.staging.services]]
+binding = "AUTH_MCRED"
+service = "auth-worker-staging"
+entrypoint = "MachineCredentialEntrypoint"
+
+# staging の表示制限: 受信から 10 分を過ぎたページは一覧・詳細・PDF で無いものとして扱う
+# (実物の削除は R2 の lifecycle と staging DB に任せる)。本番 (トップレベル) には置かない = 制限なし
+[env.staging.vars]
+STAGING_VISIBLE_MINUTES = "10"
 
 # ローカル (`wrangler dev --env local`) 専用。deploy しない。
 # binding を持たない (binding は env に継承されない) ので、src/db.rs は文字列 DATABASE_URL の段で繋ぐ

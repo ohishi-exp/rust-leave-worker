@@ -14,6 +14,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use chrono::{DateTime, Datelike, Utc};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 /// PDF の大きさの上限 (decode 後)
@@ -129,6 +130,36 @@ pub fn object_key(tenant_id: Uuid, received_at: DateTime<Utc>, id: Uuid) -> Stri
         received_at.year(),
         received_at.month()
     )
+}
+
+/// 中身の sha256 (hex 小文字 64 桁)
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// 何度呼んでも同じになる R2 の key (Queue の再配送で二重に取り込まないため)。`seed` (inbox の object key) は
+/// そのまま使わず、sha256 の先頭 32 桁だけを入れる (入力の文字を key に持ち込まない)
+pub fn seeded_object_key(tenant_id: Uuid, received_at: DateTime<Utc>, seed: &str) -> String {
+    format!(
+        "{tenant_id}/{:04}/{:02}/{}.pdf",
+        received_at.year(),
+        received_at.month(),
+        &sha256_hex(seed.as_bytes())[..32]
+    )
+}
+
+/// base64 を通らない PDF (スキャンの inbox) の検査: 大きさ (`pdf_too_large`) → `%PDF-` (`not_pdf`)
+pub fn check_pdf_bytes(pdf: &[u8]) -> Result<(), &'static str> {
+    if pdf.len() > MAX_PDF_BYTES {
+        return Err("pdf_too_large");
+    }
+    if !pdf.starts_with(b"%PDF-") {
+        return Err("not_pdf");
+    }
+    Ok(())
 }
 
 /// 文字数で切る (DB に長い文字列を入れない)
@@ -283,6 +314,37 @@ mod tests {
         let at: DateTime<Utc> = "2026-03-09T23:59:59Z".parse().unwrap();
         let key = object_key(t, at, id);
         assert_eq!(key, format!("{t}/2026/03/{id}.pdf"));
+    }
+
+    #[test]
+    fn seeded_key_is_stable_and_hides_the_seed() {
+        let t = Uuid::nil();
+        let at: DateTime<Utc> = "2026-10-01T00:00:00Z".parse().unwrap();
+        let a = seeded_object_key(t, at, "x-申請.pdf");
+        assert_eq!(a, seeded_object_key(t, at, "x-申請.pdf"));
+        assert_ne!(a, seeded_object_key(t, at, "y-申請.pdf"));
+        let name = a.strip_prefix(&format!("{t}/2026/10/")).unwrap();
+        assert_eq!(name.len(), 32 + ".pdf".len());
+        assert!(!a.contains("申請"));
+    }
+
+    #[test]
+    fn sha256_is_lowercase_hex() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn raw_pdf_is_checked_for_size_then_magic() {
+        assert_eq!(check_pdf_bytes(&minimal_pdf(1)), Ok(()));
+        assert_eq!(check_pdf_bytes(b"GIF89a"), Err("not_pdf"));
+        let mut big = b"%PDF-".to_vec();
+        big.resize(MAX_PDF_BYTES + 1, 0);
+        assert_eq!(check_pdf_bytes(&big), Err("pdf_too_large"));
+        big.truncate(MAX_PDF_BYTES);
+        assert_eq!(check_pdf_bytes(&big), Ok(()));
     }
 
     #[test]

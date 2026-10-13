@@ -64,6 +64,21 @@ pub struct LeaveState {
     pub notifier: Arc<dyn Notifier>,
     pub log: LogSink,
     pub now: Clock,
+    /// staging の表示制限 (分)。受信から この分数を過ぎたページは一覧・詳細・更新・PDF で「無いもの」(404) にする。
+    /// `None` = 制限なし (本番。vars `STAGING_VISIBLE_MINUTES` を置かない)。[`visible_minutes`] で読む
+    pub visible_minutes: Option<i64>,
+}
+
+/// vars `STAGING_VISIBLE_MINUTES` の値。無い・数でない・0 以下は `None` (制限なし)
+pub fn visible_minutes(raw: Option<&str>) -> Option<i64> {
+    raw?.trim().parse::<i64>().ok().filter(|n| *n > 0)
+}
+
+/// 見えるページの受信の下限 (`None` = 制限なし)
+fn visible_since(state: &LeaveState) -> Option<DateTime<Utc>> {
+    state
+        .visible_minutes
+        .map(|m| (state.now)() - chrono::Duration::minutes(m))
 }
 
 /// テスト送信の口の path (worker が、この口へのリクエストでだけ送信の口を組み立てるのに使う)
@@ -257,7 +272,7 @@ async fn list_pages(
         Ok(q) => q,
         Err(code) => return bad_request(code),
     };
-    let got = pg::list_pages(&mut *state.pg.lock().await, t.0, q).await;
+    let got = pg::list_pages(&mut *state.pg.lock().await, t.0, q, visible_since(&state)).await;
     match got {
         Ok(pages) => Json(json!({ "data": pages })).into_response(),
         Err(e) => db_error(&state, "list_pages", &e),
@@ -272,7 +287,7 @@ async fn get_page(
     let Some(id) = parse_id(&id) else {
         return not_found();
     };
-    let got = pg::get_page(&mut *state.pg.lock().await, t.0, id).await;
+    let got = pg::get_page(&mut *state.pg.lock().await, t.0, id, visible_since(&state)).await;
     match got {
         Ok(Some(d)) => Json(d).into_response(),
         Ok(None) => not_found(),
@@ -303,6 +318,7 @@ async fn put_page(
         id,
         update,
         actor(&headers),
+        visible_since(&state),
     )
     .await;
     match got {
@@ -321,7 +337,7 @@ async fn get_pdf(
     let Some(id) = parse_id(&id) else {
         return not_found();
     };
-    let got = pg::page_r2_key(&mut *state.pg.lock().await, t.0, id).await;
+    let got = pg::page_r2_key(&mut *state.pg.lock().await, t.0, id, visible_since(&state)).await;
     let key = match got {
         Ok(Some(k)) => k,
         Ok(None) => return not_found(),
@@ -344,5 +360,22 @@ async fn get_pdf(
             (state.log)(&format!("get_pdf: store {}", e.0));
             error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::visible_minutes;
+
+    #[test]
+    fn visible_minutes_is_none_unless_a_positive_number() {
+        // 本番 (トップレベル) には vars を置かない = 制限なし
+        assert_eq!(visible_minutes(None), None);
+        assert_eq!(visible_minutes(Some("10")), Some(10));
+        assert_eq!(visible_minutes(Some(" 10 ")), Some(10));
+        assert_eq!(visible_minutes(Some("0")), None);
+        assert_eq!(visible_minutes(Some("-5")), None);
+        assert_eq!(visible_minutes(Some("")), None);
+        assert_eq!(visible_minutes(Some("ten")), None);
     }
 }

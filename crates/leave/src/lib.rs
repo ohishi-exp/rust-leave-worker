@@ -3,7 +3,9 @@
 //!
 //! - [`auth`] — 管理者の判定 (1 か所) と操作した人の識別子
 //! - [`settings`] / [`pages`] — 入力の検証と応答の形 (純粋関数)
-//! - [`ingest`] / [`internal`] — メール取り込みの口 `/internal/ingest` (管理 API の外。共有 secret で守る) と入力の検証
+//! - [`ingest`] / [`internal`] — メール取り込みの口 `/internal/ingest` (管理 API の外。共有 secret で守る) と入力の検証、
+//!   取り込みの本体 [`internal::ingest_pdf`] (メールとスキャンで共用)
+//! - [`inbox`] — スキャンの inbox の取り込み (Queue の consumer。tenant は auth-worker が検証したチケットから)
 //! - [`ichiban`] — 一番星 Worker の口の抽象と応答の解釈
 //! - [`store`] — PDF の置き場の抽象
 //! - [`pg`] — SQL を流す 1 か所 (`tenant_tx` + `query_typed` 系だけ)
@@ -16,6 +18,7 @@ pub mod auth;
 pub mod cron;
 pub mod grants;
 pub mod ichiban;
+pub mod inbox;
 pub mod ingest;
 pub mod internal;
 pub mod kinds;
@@ -28,4 +31,6 @@ pub mod settings;
 pub mod store;
 
 pub use internal::{ingest_router, IngestState, INGEST_PATH};
-pub use routes::{tenant_router, Clock, LeaveState, LogSink, TEST_NOTIFY_PATH, TEST_NOTIFY_TEXT};
+pub use routes::{
+    tenant_router, visible_minutes, Clock, LeaveState, LogSink, TEST_NOTIFY_PATH, TEST_NOTIFY_TEXT,
+};
