@@ -11,8 +11,13 @@
 //! - **tenant はチケットの検証結果だけから取る** (inbox の key・メタデータからは読まない)。送信元の許可リストは見ない
 //!   (メール経路だけのもの。スキャンは資格情報で会社が確定している)
 //! - 取り込めない object (チケットが無い・不正・sha256 の不一致・PDF でない・読めない) は消して ack (再試行しない)
+//! - **DB の接続は検証の後**: batch の全メッセージの検証 (R2・RPC) を済ませ、通ったものがあるときだけ 1 本張る
+//!   ([`handle_batch`]。RPC の先が同じ DB に繋ぎにいっても、こちらが先に握っていないので詰まらない)
 //! - R2・DB・RPC の一時的な失敗は retry (Queue の max_retries の後は dead letter queue)。object が既に無ければ ack
 //! - ログは段の名前と固定の語だけ (チケット・PDF の中身・object key は出さない。tenant は取り込み後のログに出す)
+
+use std::fmt::Display;
+use std::future::Future;
 
 use alc_worker_db::PgClient;
 use chrono::{DateTime, Utc};
@@ -98,7 +103,6 @@ pub enum Outcome {
 }
 
 pub struct InboxDeps<'a> {
-    pub pg: &'a Mutex<PgClient>,
     /// 本保存の bucket (`LEAVE_R2`)
     pub pdfs: &'a dyn PdfStore,
     pub inbox: &'a dyn Inbox,
@@ -106,10 +110,24 @@ pub struct InboxDeps<'a> {
     pub log: &'a LogSink,
 }
 
+/// 検証を通った object (DB に取り込む前のもの)
+pub struct Verified {
+    key: String,
+    tenant_id: Uuid,
+    bytes: Vec<u8>,
+    received_at: DateTime<Utc>,
+}
+
+/// 検証段の結果。`Done` はもう決まったもの (ack か retry)、`Ready` は DB へ取り込むもの
+pub enum Verdict {
+    Done(Outcome),
+    Ready(Verified),
+}
+
 /// 取り込めない object を消して ack (消せなければ retry。次の配送でもう一度消す)
-async fn discard(d: &InboxDeps<'_>, key: &str, reason: &str) -> Outcome {
+async fn discard(d: &InboxDeps<'_>, key: &str, reason: &str) -> Verdict {
     (d.log)(&format!("inbox dropped: {reason}"));
-    settle(d, key).await
+    Verdict::Done(settle(d, key).await)
 }
 
 /// inbox の object を消して ack。消せなければ retry (取り込みは冪等なので、もう一度通してよい)
@@ -123,15 +141,17 @@ async fn settle(d: &InboxDeps<'_>, key: &str) -> Outcome {
     }
 }
 
-/// 1 メッセージを処理する
-pub async fn handle(d: &InboxDeps<'_>, body: serde_json::Value) -> Outcome {
+/// 1 メッセージの検証段 (**DB を使わない**): R2 の object の取得・チケットの検証・sha256 の照合・PDF の検査。
+/// チケットの検証 (RPC) は別の Worker 経由で同じ DB に繋ぎにいくことがある。同時に 1 本しか受けない DB では、
+/// こちらが先に接続を握っていると後の接続が閉じられるので、DB の接続を張る前に済ませる
+pub async fn verify(d: &InboxDeps<'_>, body: serde_json::Value) -> Verdict {
     let Ok(event) = serde_json::from_value::<InboxEvent>(body) else {
         (d.log)("inbox: invalid message");
-        return Outcome::Ack;
+        return Verdict::Done(Outcome::Ack);
     };
     if !STORE_ACTIONS.contains(&event.action.as_str()) || event.object.size == Some(0) {
         (d.log)("inbox: skipped");
-        return Outcome::Ack;
+        return Verdict::Done(Outcome::Ack);
     }
     let key = event.object.key.as_str();
     if event.object.size.is_some_and(|s| s > MAX_PDF_BYTES as u64) {
@@ -141,11 +161,11 @@ pub async fn handle(d: &InboxDeps<'_>, body: serde_json::Value) -> Outcome {
         Ok(Some(o)) => o,
         Ok(None) => {
             (d.log)("inbox: object gone");
-            return Outcome::Ack;
+            return Verdict::Done(Outcome::Ack);
         }
         Err(e) => {
             (d.log)(&format!("inbox: {}", e.0));
-            return Outcome::Retry;
+            return Verdict::Done(Outcome::Retry);
         }
     };
     let Some(ticket) = object.ticket.as_deref() else {
@@ -155,7 +175,7 @@ pub async fn handle(d: &InboxDeps<'_>, body: serde_json::Value) -> Outcome {
         Ok(v) => parse_ticket(v),
         Err(VerifyError) => {
             (d.log)("inbox: verify failed");
-            return Outcome::Retry;
+            return Verdict::Done(Outcome::Retry);
         }
     };
     let Some(ticket) = ticket else {
@@ -167,23 +187,79 @@ pub async fn handle(d: &InboxDeps<'_>, body: serde_json::Value) -> Outcome {
     if let Err(reason) = check_pdf_bytes(&object.bytes) {
         return discard(d, key, reason).await;
     }
-    let tenant_id = ticket.tenant_id;
+    Verdict::Ready(Verified {
+        key: key.to_owned(),
+        tenant_id: ticket.tenant_id,
+        bytes: object.bytes,
+        received_at: event.event_time,
+    })
+}
+
+/// 検証を通った 1 件の取り込み段 (DB を使う)
+async fn ingest(d: &InboxDeps<'_>, pg: &Mutex<PgClient>, v: Verified) -> Outcome {
+    let Verified {
+        key,
+        tenant_id,
+        bytes,
+        received_at,
+    } = v;
     let pdf = NewPdf {
         tenant_id,
-        pdf: object.bytes,
-        received_at: event.event_time,
+        pdf: bytes,
+        received_at,
         mail_from: None,
         subject: None,
-        key_seed: Some(key.to_owned()),
+        key_seed: Some(key.clone()),
     };
-    match ingest_pdf(d.pg, d.pdfs, d.log, pdf).await {
+    match ingest_pdf(pg, d.pdfs, d.log, pdf).await {
         Ok(pages) => {
             (d.log)(&format!("inbox stored: tenant={tenant_id} pages={pages}"));
-            settle(d, key).await
+            settle(d, &key).await
         }
-        Err(IngestFailure::Drop(reason)) => discard(d, key, reason).await,
+        Err(IngestFailure::Drop(reason)) => {
+            (d.log)(&format!("inbox dropped: {reason}"));
+            settle(d, &key).await
+        }
         Err(IngestFailure::Failed) => Outcome::Retry,
     }
+}
+
+/// 1 batch を 2 段で処理して、メッセージごとの扱い (入力と同じ順) を返す。
+/// 1. 全メッセージの検証段 ([`verify`])。**この間は DB に繋がない**
+/// 2. 検証を通ったものがあるときだけ `connect` を 1 回呼び、その接続を使い回して取り込む。
+///    繋がらなければ検証を通ったものを全部 retry (Queue の max_retries の後は dead letter queue)
+pub async fn handle_batch<F, Fut, E>(
+    d: &InboxDeps<'_>,
+    bodies: Vec<serde_json::Value>,
+    connect: F,
+) -> Vec<Outcome>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<PgClient, E>>,
+    E: Display,
+{
+    let mut outcomes = vec![Outcome::Retry; bodies.len()];
+    let mut ready = Vec::new();
+    for (i, body) in bodies.into_iter().enumerate() {
+        match verify(d, body).await {
+            Verdict::Done(o) => outcomes[i] = o,
+            Verdict::Ready(v) => ready.push((i, v)),
+        }
+    }
+    if ready.is_empty() {
+        return outcomes;
+    }
+    match connect().await {
+        Ok(pg) => {
+            let pg = Mutex::new(pg);
+            for (i, v) in ready {
+                outcomes[i] = ingest(d, &pg, v).await;
+            }
+        }
+        // `outcomes` の初期値が Retry なので、検証を通ったものはそのまま retry になる
+        Err(e) => (d.log)(&format!("inbox: {e}")),
+    }
+    outcomes
 }
 
 #[cfg(test)]
