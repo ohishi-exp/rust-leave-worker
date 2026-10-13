@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::cron::NotifyTarget;
 use crate::grants::{self, AutoGrant, Grant, GrantWrite, Opening, OpeningPut};
 use crate::pages::{Document, DocumentsQuery, ListQuery, Page, PageDetail, PageUpdate, Period};
-use crate::reconcile::{LinkedPeriod, Mismatch, PendingAlert};
+use crate::reconcile::{LinkedPeriod, Mismatch, OpenAlert, PendingAlert};
 use crate::settings::{Settings, ValidSettings};
 
 pub mod sql {
@@ -209,11 +209,11 @@ pub mod sql {
          AND b.provider = 'lineworks' AND b.enabled \
          WHERE s.tenant_id = $1";
 
-    /// ずれを入れる。解決済みの行が再びずれたら未解決・未通知に戻す
+    /// ずれを入れる。解決済みの行が再びずれたら未解決に戻す (`first_seen_at` は再発の時刻にする)
     pub const ALERTS_UPSERT: &str = "INSERT INTO alc_api.leave_alerts (tenant_id, employee_cd, day, kind, direction) \
          SELECT $1, u.e, u.d, u.k, u.r FROM unnest($2::text[], $3::date[], $4::text[], $5::text[]) AS u(e, d, k, r) \
          ON CONFLICT (tenant_id, employee_cd, day, kind, direction) DO UPDATE \
-         SET resolved_at = NULL, notified_at = NULL, first_seen_at = NOW() \
+         SET resolved_at = NULL, first_seen_at = NOW() \
          WHERE leave_alerts.resolved_at IS NOT NULL";
 
     /// 窓 (`$2`〜`$3`) の中の未解決の行のうち、今回のずれ (`$4`〜`$7`) に無いものを解決にする
@@ -222,13 +222,17 @@ pub mod sql {
          AND NOT EXISTS (SELECT 1 FROM unnest($4::text[], $5::date[], $6::text[], $7::text[]) AS u(e, d, k, r) \
          WHERE u.e = a.employee_cd AND u.d = a.day AND u.k = a.kind AND u.r = a.direction)";
 
-    pub const ALERTS_PENDING: &str =
-        "SELECT id, employee_cd, day, kind, direction FROM alc_api.leave_alerts \
-         WHERE tenant_id = $1 AND notified_at IS NULL AND resolved_at IS NULL \
+    /// 未解消の警告 = 未解決かつ窓 (`$2`〜`$3`) の中。毎朝の通知 ([`super::record_alerts`]) と一覧
+    /// ([`super::open_alerts`]) が同じこの 1 文を使う。窓の外へ出た未解決の行は `resolved_at` が NULL のまま表に
+    /// 残るが、通知にも一覧にも出ない (仕様)
+    pub const ALERTS_OPEN: &str =
+        "SELECT id, employee_cd, day, kind, direction, first_seen_at, notified_at FROM alc_api.leave_alerts \
+         WHERE tenant_id = $1 AND resolved_at IS NULL AND day BETWEEN $2 AND $3 \
          ORDER BY employee_cd, day, kind, direction";
 
+    /// 送れた警告に最後に送った時刻を付ける (毎朝送るので、送れるたびに上書きする)
     pub const ALERTS_NOTIFIED: &str = "UPDATE alc_api.leave_alerts SET notified_at = NOW() \
-         WHERE tenant_id = $1 AND id = ANY($2::uuid[]) AND notified_at IS NULL";
+         WHERE tenant_id = $1 AND id = ANY($2::uuid[])";
 }
 
 fn grant_from_row(row: &Row) -> Grant {
@@ -543,8 +547,51 @@ pub async fn notify_target(
     .await
 }
 
+/// 未解消の警告の行 ([`sql::ALERTS_OPEN`]。通知と一覧の共用)
+async fn open_alert_rows(
+    tx: &TenantTx<'_>,
+    tenant_id: Uuid,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Result<Vec<Row>, Error> {
+    tx.query_typed(
+        sql::ALERTS_OPEN,
+        &[
+            (&tenant_id, Type::UUID),
+            (&from, Type::DATE),
+            (&to, Type::DATE),
+        ],
+    )
+    .await
+}
+
+/// 未解消の警告の一覧 (`from`〜`to` は [`crate::cron::window`])
+pub async fn open_alerts(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    (from, to): (NaiveDate, NaiveDate),
+) -> Result<Vec<OpenAlert>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = open_alert_rows(tx, tenant_id, from, to).await?;
+            Ok(rows
+                .iter()
+                .map(|r| OpenAlert {
+                    employee_cd: r.get(1),
+                    day: r.get(2),
+                    kind: r.get(3),
+                    direction: r.get(4),
+                    first_seen_at: r.get(5),
+                    notified_at: r.get(6),
+                })
+                .collect())
+        })
+    })
+    .await
+}
+
 /// 突き合わせの結果を書く (1 つの transaction で): ずれを入れる (再発は開き直す) → 窓の中で今回ずれていない行を解決 →
-/// 未通知・未解決の行を返す。戻り値は (入れた / 開き直した件数, 解決した件数, 未通知)
+/// 未解消 (未解決かつ窓の中) の行を返す — 毎朝、通知済みかを問わず全部送る。戻り値は (入れた / 開き直した件数, 解決した件数, 未解消)
 pub async fn record_alerts(
     pg: &mut PgClient,
     tenant_id: Uuid,
@@ -584,9 +631,7 @@ pub async fn record_alerts(
                     ],
                 )
                 .await?;
-            let rows = tx
-                .query_typed(sql::ALERTS_PENDING, &[(&tenant_id, Type::UUID)])
-                .await?;
+            let rows = open_alert_rows(tx, tenant_id, from, to).await?;
             let pending = rows
                 .iter()
                 .map(|r| PendingAlert {
@@ -603,7 +648,7 @@ pub async fn record_alerts(
     .await
 }
 
-/// 送れた警告に通知済みの印を付ける
+/// 送れた警告に最後に送った時刻を付ける
 pub async fn mark_notified(
     pg: &mut PgClient,
     tenant_id: Uuid,

@@ -5,8 +5,8 @@
 //! 2. 紐づけ済みの期間を同じ窓で日ごとに展開する
 //! 3. (乗務員, 日, 区分) の差を取る (`今日 − grace_days` より後の日は待つ)
 //! 4. `leave_alerts` に書き、窓の中で今回ずれていない未解決の行を解決にする
-//! 5. 未通知の警告を乗務員ごとにまとめて LINE WORKS (グループか個人) へ送り、送れた分だけ通知済みにする
-//!    (宛先が無い・個人の宛先が無効なら送らずに残す)
+//! 5. 未解消 (未解決かつ窓の中) の警告を、通知済みかを問わず毎朝全部、乗務員ごとにまとめて LINE WORKS (グループか個人)
+//!    へ送り、送れた分に最後に送った時刻を付ける (宛先が無い・個人の宛先が無効なら送らない。翌朝また送る)
 //! 6. 有給の法定付与を全乗務員ぶん足す (在る付与日は飛ばす)
 //!
 //! 1 tenant の失敗で他の tenant を止めない。結果は 1 行のログ (tenant は順番の番号で出し、識別子・氏名は出さない。
@@ -28,6 +28,14 @@ use crate::reconcile::{
 
 /// 窓の長さ (今日 − 62 日 〜 今日 − 1 日)
 pub const WINDOW_DAYS: i64 = 62;
+
+/// 突き合わせの窓 (今日 − [`WINDOW_DAYS`] 日, 今日 − 1 日)。毎朝の通知と未解消の一覧 (`GET /api/leave/alerts`) が同じこれを使う
+pub fn window(today: NaiveDate) -> (NaiveDate, NaiveDate) {
+    (
+        today - Duration::days(WINDOW_DAYS),
+        today - Duration::days(1),
+    )
+}
 
 /// auth-worker の内部 proxy 経由の LINE WORKS 送信の口 (host は名目。path が `/alc-internal-proxy/` で始まる必要がある。
 /// nuxt-dtako-admin の dtako-scraper-relay の `lineworks-notify.ts` と同じ規約)
@@ -189,8 +197,7 @@ pub async fn run(
     if tenants.is_empty() {
         return summary;
     }
-    let from = today - Duration::days(WINDOW_DAYS);
-    let to = today - Duration::days(1);
+    let (from, to) = window(today);
     let (employees_body, day_bodies) = match fetch_ichiban(ichiban, from, to).await {
         Ok(b) => b,
         Err(stage) => {

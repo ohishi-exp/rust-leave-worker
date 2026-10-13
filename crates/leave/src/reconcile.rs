@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use alc_worker_db::TxOutput;
-use chrono::{Datelike, Duration, NaiveDate};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -289,7 +289,7 @@ pub struct Message {
     pub alerts: Vec<usize>,
 }
 
-/// 未通知の警告 1 件 (通知の文面の材料)
+/// 未解消の警告 1 件 (通知の文面の材料)
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingAlert {
     pub id: Uuid,
@@ -300,6 +300,20 @@ pub struct PendingAlert {
 }
 
 impl TxOutput for PendingAlert {}
+
+/// 未解消の警告 1 件 (`GET /api/leave/alerts` の 1 行。`kind` / `direction` は `leave_alerts` の列の値そのまま)
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct OpenAlert {
+    pub employee_cd: String,
+    pub day: NaiveDate,
+    pub kind: String,
+    pub direction: String,
+    pub first_seen_at: DateTime<Utc>,
+    /// 最後に通知を送った時刻 (まだ送れていなければ `null`)
+    pub notified_at: Option<DateTime<Utc>>,
+}
+
+impl TxOutput for OpenAlert {}
 
 /// 警告を乗務員ごとに並べた文面。長ければ [`MESSAGE_CHARS`] 字程度で分ける (各通の先頭に見出し)。
 /// `names` は乗務員コード → 氏名 (無ければコードだけ)

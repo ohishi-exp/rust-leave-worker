@@ -1,4 +1,4 @@
-//! 管理 API の口 (16 本、worker が `/api` の下に nest するので実際の path は `/api/leave/…`)。
+//! 管理 API の口 (17 本、worker が `/api` の下に nest するので実際の path は `/api/leave/…`)。
 //!
 //! | method | path | 中身 |
 //! |---|---|---|
@@ -14,6 +14,7 @@
 //! | POST | `/leave/grants/auto` | 法定付与を足す (`ledger`) |
 //! | PUT / DELETE | `/leave/grants/{id}` | 付与を直す / 消す (`ledger`) |
 //! | GET / PUT | `/leave/opening` | 全員分の有給の期首残 / 一括保存 (`ledger`) |
+//! | GET | `/leave/alerts` | 未解消の警告 (毎朝の通知と同じ条件・同じ窓。乗務員・日の順) |
 //! | POST | `/leave/settings/test-notify` | 保存済みの通知先へ固定の文面を 1 通送る (毎朝の cron と同じ宛先・同じ送信) |
 //!
 //! **全部の口を [`require_admin`] が包む** (管理者でなければ 403。handler にも DB にも届かない)。
@@ -40,7 +41,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::auth::{actor, require_admin};
-use crate::cron::Notifier;
+use crate::cron::{window, Notifier};
 use crate::ichiban::{filter_employees, IchibanApi, DEPARTMENTS_PATH, EMPLOYEES_PATH};
 use crate::ledger;
 use crate::pages::{
@@ -95,6 +96,7 @@ pub fn tenant_router() -> Router<LeaveState> {
     Router::new()
         .route("/leave/settings", get(get_settings).put(put_settings))
         .route("/leave/settings/test-notify", post(test_notify))
+        .route("/leave/alerts", get(list_alerts))
         .route("/leave/departments", get(departments))
         .route("/leave/employees", get(employees))
         .route("/leave/documents", get(list_documents))
@@ -295,6 +297,19 @@ async fn list_documents(
     match got {
         Ok(docs) => Json(json!({ "data": docs })).into_response(),
         Err(e) => db_error(&state, "list_documents", &e),
+    }
+}
+
+/// 未解消の警告 (毎朝の通知と同じ [`window`]・同じ SQL)
+async fn list_alerts(
+    State(state): State<LeaveState>,
+    Extension(t): Extension<TenantId>,
+) -> Response {
+    let range = window(ledger::jst_date((state.now)()));
+    let got = pg::open_alerts(&mut *state.pg.lock().await, t.0, range).await;
+    match got {
+        Ok(alerts) => Json(json!({ "alerts": alerts })).into_response(),
+        Err(e) => db_error(&state, "list_alerts", &e),
     }
 }
 
