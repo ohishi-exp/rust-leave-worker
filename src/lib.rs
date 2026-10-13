@@ -230,7 +230,7 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
 }
 
 /// スキャンの inbox の取り込み (wrangler.toml の `[[queues.consumers]]`)。メッセージごとに ack / retry を決める。
-/// DB か binding が無ければ全部 retry (Queue の max_retries の後は dead letter queue)
+/// binding が無ければ全部 retry、DB に繋がらなければ検証を通ったものを retry (Queue の max_retries の後は dead letter queue)
 #[event(queue)]
 async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) -> Result<()> {
     let (Ok(inbox), Ok(bucket), Ok(auth)) = (
@@ -242,28 +242,23 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
         batch.retry_all();
         return Ok(());
     };
-    let pg = match db::connect(&env).await {
-        Ok(c) => c,
-        Err(e) => {
-            console_error!("leave: inbox {e}");
-            batch.retry_all();
-            return Ok(());
-        }
-    };
-    let pg = Mutex::new(pg);
     let pdfs = R2Pdfs::new(bucket);
     let inbox = R2Inbox::new(inbox);
     let verifier = AuthTicketVerifier::new(auth);
     let log = log_sink();
     let deps = leave::inbox::InboxDeps {
-        pg: &pg,
         pdfs: &pdfs,
         inbox: &inbox,
         verifier: &verifier,
         log: &log,
     };
-    for message in batch.messages()? {
-        match leave::inbox::handle(&deps, message.body().clone()).await {
+    // 検証 (R2・verifyTicket) を全部済ませてから、通ったものがあるときだけ DB に繋ぐ。verifyTicket の先が同じ DB
+    // (DO は同時に 1 本) に繋ぎにいくので、先に握らない。繋がらなければ検証を通ったものを retry
+    let messages = batch.messages()?;
+    let bodies = messages.iter().map(|m| m.body().clone()).collect();
+    let outcomes = leave::inbox::handle_batch(&deps, bodies, || db::connect(&env)).await;
+    for (message, outcome) in messages.iter().zip(outcomes) {
+        match outcome {
             leave::inbox::Outcome::Ack => message.ack(),
             leave::inbox::Outcome::Retry => message.retry(),
         }

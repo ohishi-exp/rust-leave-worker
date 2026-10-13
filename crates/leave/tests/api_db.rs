@@ -2714,17 +2714,20 @@ mod inbox {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
-    use futures_util::lock::Mutex;
-    use leave::inbox::{handle, InboxDeps, Outcome, VerifyError, TICKET_PURPOSE};
+    use alc_worker_db::PgClient;
+    use futures_util::future::BoxFuture;
+    use leave::inbox::{
+        handle_batch, InboxDeps, Outcome, TicketVerifier, VerifyError, TICKET_PURPOSE,
+    };
     use leave::ingest::{minimal_pdf, sha256_hex, MAX_PAGES, MAX_PDF_BYTES};
     use leave::LogSink;
     use support::{app_client, FakeInbox, FakeVerifier};
 
     const KEY: &str = "0b7c-申請.pdf";
+    const KEY_2: &str = "9d41-休暇.pdf";
     const TICKET: &str = "test-ticket";
 
     struct Run {
-        pg: Mutex<alc_worker_db::PgClient>,
         pdfs: FakePdfs,
         inbox: FakeInbox,
         verifier: FakeVerifier,
@@ -2736,7 +2739,6 @@ mod inbox {
         let logs = Arc::new(StdMutex::new(Vec::new()));
         let sink = logs.clone();
         Run {
-            pg: Mutex::new(app_client().await),
             pdfs,
             inbox,
             verifier,
@@ -2747,14 +2749,18 @@ mod inbox {
 
     impl Run {
         async fn handle(&self, body: Value) -> Outcome {
+            self.batch(vec![body]).await.remove(0)
+        }
+
+        async fn batch(&self, bodies: Vec<Value>) -> Vec<Outcome> {
             let deps = InboxDeps {
-                pg: &self.pg,
                 pdfs: &self.pdfs,
                 inbox: &self.inbox,
                 verifier: &self.verifier,
                 log: &self.log,
             };
-            handle(&deps, body).await
+            let connect = || async { Ok::<_, String>(app_client().await) };
+            handle_batch(&deps, bodies, connect).await
         }
 
         fn logs(&self) -> Vec<String> {
@@ -3030,6 +3036,139 @@ mod inbox {
             r.logs(),
             vec!["inbox dropped: ticket_missing", "inbox: delete delete"]
         );
+    }
+
+    /// verify の呼び出しと connect の呼び出しの順を残す verifier (どの呼び出しも同じ戻り)
+    struct OrderedVerifier {
+        events: Arc<StdMutex<Vec<&'static str>>>,
+        result: Value,
+    }
+
+    impl TicketVerifier for OrderedVerifier {
+        fn verify<'a>(
+            &'a self,
+            _ticket: &'a str,
+            _purpose: &'a str,
+        ) -> BoxFuture<'a, Result<Value, VerifyError>> {
+            Box::pin(async move {
+                self.events.lock().unwrap().push("verify");
+                Ok(self.result.clone())
+            })
+        }
+    }
+
+    fn event_for(key: &str) -> Value {
+        let mut e = put_event();
+        e["object"]["key"] = json!(key);
+        e
+    }
+
+    /// batch の全メッセージの検証が終わるまで DB に繋がない (verify の間は接続が無い)。繋ぐのは 1 回で、使い回す
+    #[tokio::test]
+    async fn connects_once_after_every_ticket_is_verified() {
+        let t = tenant().await;
+        let pdf = minimal_pdf(1);
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let verifier = OrderedVerifier {
+            events: events.clone(),
+            result: ticket_for(t, &pdf).unwrap(),
+        };
+        let inbox = FakeInbox::with(KEY, pdf.clone(), Some(TICKET));
+        inbox
+            .objects
+            .lock()
+            .unwrap()
+            .insert(KEY_2.to_owned(), (pdf.clone(), Some(TICKET.to_owned())));
+        let pdfs = FakePdfs::default();
+        let log: LogSink = Arc::new(|_: &str| {});
+        let deps = InboxDeps {
+            pdfs: &pdfs,
+            inbox: &inbox,
+            verifier: &verifier,
+            log: &log,
+        };
+        let sink = events.clone();
+        let connect = || async move {
+            sink.lock().unwrap().push("connect");
+            Ok::<_, String>(app_client().await)
+        };
+        let bodies = vec![event_for(KEY), event_for(KEY_2)];
+        let got = handle_batch(&deps, bodies, connect).await;
+        assert_eq!(got, vec![Outcome::Ack, Outcome::Ack]);
+        assert_eq!(*events.lock().unwrap(), vec!["verify", "verify", "connect"]);
+        assert_eq!(pdfs.stored.lock().unwrap().len(), 2);
+        assert_eq!(pages_of(t).await.len(), 2);
+    }
+
+    /// 検証を通ったものが 1 件も無ければ DB に繋がない (対象外・不正・一時失敗だけの batch)
+    #[tokio::test]
+    async fn does_not_connect_without_a_verified_message() {
+        let t = tenant().await;
+        let pdf = minimal_pdf(1);
+        let r = setup(
+            FakePdfs::default(),
+            FakeInbox::with(KEY, pdf.clone(), Some(TICKET)),
+            FakeVerifier::returning(Ok(Value::Null)),
+        )
+        .await;
+        let deps = InboxDeps {
+            pdfs: &r.pdfs,
+            inbox: &r.inbox,
+            verifier: &r.verifier,
+            log: &r.log,
+        };
+        let connected = Arc::new(StdMutex::new(0));
+        let count = connected.clone();
+        let connect = || async move {
+            *count.lock().unwrap() += 1;
+            Err::<PgClient, String>("must not be called".to_owned())
+        };
+        // 対象外の action・チケットが不正・object が無い
+        let bodies = vec![
+            event("DeleteObject", Some(10)),
+            event_for(KEY),
+            event_for(KEY_2),
+        ];
+        let got = handle_batch(&deps, bodies, connect).await;
+        assert_eq!(got, vec![Outcome::Ack, Outcome::Ack, Outcome::Ack]);
+        assert_eq!(*connected.lock().unwrap(), 0);
+        assert_eq!(r.deleted(), vec![KEY]);
+        assert!(pages_of(t).await.is_empty());
+    }
+
+    /// 繋がらなければ、検証を通ったものだけ retry (取り込めないものは今までどおり消して ack)。DB の文面は固定の語で残す
+    #[tokio::test]
+    async fn connect_failure_retries_only_the_verified() {
+        let t = tenant().await;
+        let pdf = minimal_pdf(1);
+        let r = setup(
+            FakePdfs::default(),
+            FakeInbox::with(KEY, pdf.clone(), Some(TICKET)),
+            FakeVerifier::returning(ticket_for(t, &pdf)),
+        )
+        .await;
+        r.inbox
+            .objects
+            .lock()
+            .unwrap()
+            .insert(KEY_2.to_owned(), (pdf.clone(), None));
+        let deps = InboxDeps {
+            pdfs: &r.pdfs,
+            inbox: &r.inbox,
+            verifier: &r.verifier,
+            log: &r.log,
+        };
+        let connect = || async { Err::<PgClient, String>("connect failed".to_owned()) };
+        let bodies = vec![event_for(KEY), event_for(KEY_2)];
+        let got = handle_batch(&deps, bodies, connect).await;
+        assert_eq!(got, vec![Outcome::Retry, Outcome::Ack]);
+        assert_eq!(
+            r.logs(),
+            vec!["inbox dropped: ticket_missing", "inbox: connect failed"]
+        );
+        assert_eq!(r.deleted(), vec![KEY_2]);
+        assert!(r.pdfs.stored.lock().unwrap().is_empty());
+        assert!(pages_of(t).await.is_empty());
     }
 
     /// INSERT が失敗しても、決定的な key の本保存の object は消さない (前の配送の行が指していることがある)
