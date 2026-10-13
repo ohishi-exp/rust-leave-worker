@@ -1,22 +1,26 @@
 //! postgres への接続 (ippoan/alc-dtako-worker の `src/db.rs` の写し。Refs #1)。
 //! **DB に繋ぐのはこの 1 か所だけ**で、env の binding で経路を出し分ける
-//! (上から順に見て、最初にあったものを使う)。1 とローカルは間に transaction mode のプーラー (PgBouncer) が入る。
-//! 2 は Hyperdrive が間に入る (Refs ippoan/rust-alc-api#723)。3 は接続文字列の host:port へ繋ぐだけで、宛先の形
+//! (上から順に見て、最初にあったものを使う)。2 とローカルは間に transaction mode のプーラー (PgBouncer) が入る。
+//! 3 は Hyperdrive が間に入る (Refs ippoan/rust-alc-api#723)。4 は接続文字列の host:port へ繋ぐだけで、宛先の形
 //! (プーラーか直接か) は接続文字列しだい (RLS はトランザクション単位で、SQL は名前なしの文だけにするので、どれでも動く作り):
 //!
 //! | 順 | env | 読むもの | 経路 |
 //! |---|---|---|---|
-//! | 1 | staging | Workers VPC の binding `LEAVE_DB_VPC` (VPC Service 型、宛先の host:port は Service 側で固定。vein の staging と同じ Service) | TCP → 既存の Tunnel → staging の DB の PgBouncer (6432) |
-//! | 2 | 本番 | Hyperdrive の binding `LEAVE_HYPERDRIVE` (設定は実行用ロールのもの 1 つを複数の worker で共有する) | Worker → Hyperdrive → DB。接続・TLS・接続の使い回しは Hyperdrive が受け持つ。接続の部品は [`alc_worker_db::hyperdrive::connect`] |
-//! | 3 | ローカル | 文字列 `DATABASE_URL` (worker 自身の secret / `wrangler dev --var`) | 接続文字列の host:port へ STARTTLS。`sslmode=disable` + var `ALLOW_INSECURE_DB = "1"` のときだけ手元の PgBouncer へ平文 |
+//! | 1 | staging | Durable Object の binding `STAGING_DB` (別 Worker `alc-staging-db-staging` の class `StagingDb`。ippoan/alc-staging-db) | `connect(socket)` で受けたバイト列を DO の中の PGlite へ流す。user は本番と同じ実行用ロール `alc_api_rt` |
+//! | 2 | staging | Workers VPC の binding `LEAVE_DB_VPC` (VPC Service 型、宛先の host:port は Service 側で固定。vein の staging と同じ Service)。**切り戻し用** | TCP → 既存の Tunnel → staging の DB の PgBouncer (6432) |
+//! | 3 | 本番 | Hyperdrive の binding `LEAVE_HYPERDRIVE` (設定は実行用ロールのもの 1 つを複数の worker で共有する) | Worker → Hyperdrive → DB。接続・TLS・接続の使い回しは Hyperdrive が受け持つ。接続の部品は [`alc_worker_db::hyperdrive::connect`] |
+//! | 4 | ローカル | 文字列 `DATABASE_URL` (worker 自身の secret / `wrangler dev --var`) | 接続文字列の host:port へ STARTTLS。`sslmode=disable` + var `ALLOW_INSECURE_DB = "1"` のときだけ手元の PgBouncer へ平文 |
 //!
-//! **2 は「binding が無い (undefined)」ときだけ 3 へ落ちる。** binding が在るのに使えない (読めない /
+//! **1 は DO を VPC より前に見る** (`STAGING_DB` の binding を外すだけで 2 = docker の経路へ切り戻せる)。
+//! **1 の binding が在るのに繋がらないとき (stub / socket / handshake の失敗) は 2 以降へ落とさず**
+//! [`ConnectError::Other`] (fetch が 500 にする)。
+//! **3 は「binding が無い (undefined)」ときだけ 4 へ落ちる。** binding が在るのに使えない (読めない /
 //! Hyperdrive の binding ではない / 接続文字列が parse できない / socket・handshake の失敗) ときは
-//! [`ConnectError::Other`] (fetch が 500 にする) で、3 へは落とさない — Hyperdrive を使う環境が、
+//! [`ConnectError::Other`] (fetch が 500 にする) で、4 へは落とさない — Hyperdrive を使う環境が、
 //! worker secret へ黙って戻らないようにするため (判定は `alc_worker_db::hyperdrive::connect` が持つ)。
 //! どの段の binding も secret も無ければ [`ConnectError::NotConfigured`] (fetch が 503 にする)。
-//! binding は接続文字列より先に見るので、平文に落ちる binding (`LEAVE_DB_VPC`) を本番
-//! (トップレベル) に置かないことを scripts/check-exposure.sh が検査する。
+//! binding は接続文字列より先に見るので、平文に落ちる binding (`LEAVE_DB_VPC`) と DO の binding
+//! (`STAGING_DB`) を本番 (トップレベル) に置かないことを scripts/check-exposure.sh が検査する。
 //!
 //! `Socket` は `!Send` 相当 (JS の値) なので、この関数は handler (axum が Send を要求する側)
 //! の外 = fetch から呼ぶ。
@@ -29,6 +33,14 @@ use worker::{console_error, Env, SecureTransport, Socket};
 
 use crate::tcp::TcpPort;
 
+/// staging の DB (別 Worker `alc-staging-db-staging` の Durable Object `StagingDb`) の binding
+/// (`[[env.staging.durable_objects.bindings]]`、wrangler.toml の env.staging にだけ置く)
+const STAGING_DB_BINDING: &str = "STAGING_DB";
+/// DO の instance 名と、`connect()` に渡す名目のアドレス (宛先は DO 側で決まる)
+const STAGING_DB_NAME: &str = "staging-db";
+const STAGING_DB_PORT: u16 = 5432;
+/// DO の PGlite に繋ぐ実行用ロール (本番と同じ。DO 側も SET SESSION AUTHORIZATION する)
+const STAGING_DB_USER: &str = "alc_api_rt";
 /// staging の Workers VPC binding (VPC Service 型)。宛先 (staging の DB の PgBouncer) は Service 側で固定
 const LEAVE_DB_VPC_BINDING: &str = "LEAVE_DB_VPC";
 const LEAVE_DB_NAME: &str = "leave-db";
@@ -54,7 +66,7 @@ impl std::fmt::Display for ConnectError {
         match self {
             Self::NotConfigured => write!(
                 f,
-                "no {LEAVE_DB_VPC_BINDING} / {LEAVE_HYPERDRIVE_BINDING} binding and no {DATABASE_URL_SECRET} secret"
+                "no {STAGING_DB_BINDING} / {LEAVE_DB_VPC_BINDING} / {LEAVE_HYPERDRIVE_BINDING} binding and no {DATABASE_URL_SECRET} secret"
             ),
             Self::Other(e) => f.write_str(e),
         }
@@ -66,6 +78,10 @@ fn other(what: &str) -> impl Fn(worker::Error) -> ConnectError + '_ {
 }
 
 pub async fn connect(env: &Env) -> Result<PgClient, ConnectError> {
+    // DO の段を先頭に (binding を外せば下の VPC へ戻る)。binding が在るのに繋がらなければエラー
+    if let Ok(ns) = env.durable_object(STAGING_DB_BINDING) {
+        return connect_do(&ns).await;
+    }
     if let Ok(vpc) = env.get_binding::<TcpPort>(LEAVE_DB_VPC_BINDING) {
         return connect_vpc(&vpc).await;
     }
@@ -85,6 +101,23 @@ pub async fn connect(env: &Env) -> Result<PgClient, ConnectError> {
         return connect_url(&url.to_string(), allow_insecure, DATABASE_URL_SECRET).await;
     }
     Err(ConnectError::NotConfigured)
+}
+
+/// staging: DO の `connect(socket)` で受けたバイト列を PGlite へ流す (DO → PGlite は同じ isolate 内)。
+/// `get_by_name` と `connect` の宛先は名目の値 (どちらも DO の名前で決まり、ネットワークへは出ない)。
+async fn connect_do(ns: &worker::ObjectNamespace) -> Result<PgClient, ConnectError> {
+    let stub = ns
+        .get_by_name(STAGING_DB_NAME)
+        .map_err(other("staging-db stub"))?;
+    let socket = stub
+        .connect(&format!("{STAGING_DB_NAME}:{STAGING_DB_PORT}"))
+        .map_err(other("staging-db connect"))?;
+    let mut config = Config::new();
+    config
+        .user(STAGING_DB_USER)
+        .dbname("postgres")
+        .ssl_mode(SslMode::Disable);
+    handshake(config, socket, NoTls).await
 }
 
 /// staging: Workers VPC の binding へ TCP を開き、そのまま postgres のソケットとして使う。

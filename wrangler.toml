@@ -87,8 +87,9 @@ entrypoint = "MachineCredentialEntrypoint"
 [triggers]
 crons = ["0 22 * * *"]
 
-# staging: DB は ippoan/alc-vein-worker の staging と同じもの (Workers VPC の binding LEAVE_DB_VPC から
-# 既存の Tunnel 経由で PgBouncer へ繋ぐ。src/db.rs)。Hyperdrive は通さない。ICHIBAN_DB は無い (部門・社員の口は 503)。
+# staging: DB は別 Worker alc-staging-db-staging (ippoan/alc-staging-db) の Durable Object StagingDb の中の PGlite
+# (binding STAGING_DB を最優先で使う。src/db.rs)。LEAVE_DB_VPC (ippoan/alc-vein-worker の staging と同じ docker の DB) は
+# 切り戻し用に残す (STAGING_DB を外せばそちらへ戻る)。Hyperdrive は通さない。ICHIBAN_DB は無い (部門・社員の口は 503)。
 [env.staging]
 name = "rust-leave-worker-staging"
 workers_dev = false
@@ -97,6 +98,13 @@ preview_urls = false
 [env.staging.observability]
 enabled = true
 
+# staging の DB: 別 Worker alc-staging-db-staging の Durable Object (class はあちらの Worker のもの。migrations は要らない)。
+# script_name の完全一致 1 件だけを scripts/check-exposure.sh が許す。トップレベル (本番) には置かない
+[[env.staging.durable_objects.bindings]]
+name = "STAGING_DB"
+class_name = "StagingDb"
+script_name = "alc-staging-db-staging"
+
 [env.staging.version_metadata]
 binding = "CF_VERSION_METADATA"
 
@@ -104,7 +112,7 @@ binding = "CF_VERSION_METADATA"
 [env.staging.placement]
 region = "aws:ap-northeast-3"
 
-# staging の DB への口 (vein の staging と同じ VPC Service を共有)。本番 (トップレベル) には置かない
+# staging の DB への口 (vein の staging と同じ VPC Service を共有。STAGING_DB が無いときの切り戻し先)。本番 (トップレベル) には置かない
 # (scripts/check-exposure.sh が検査)
 [[env.staging.vpc_services]]
 binding = "LEAVE_DB_VPC"
