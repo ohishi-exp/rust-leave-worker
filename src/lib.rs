@@ -9,6 +9,9 @@
 //! (例外の `/internal/ingest` も Service Binding。wrangler.toml と scripts/check-exposure.sh が保証する)。
 //!
 //! 定時実行 (`scheduled`、本番だけ) は毎朝一番星と申請書を突き合わせ、ずれを LINE WORKS へ送る (crates/leave の `cron`)。
+//!
+//! Queue (`queue`) はスキャンの inbox (R2 bucket `leave-inbox` のイベント通知) を 1 メッセージずつ取り込む
+//! (中身は crates/leave の `inbox::handle`。tenant は auth-worker の RPC `verifyTicket` が返したものだけ)。
 
 // worker 本体は wasm32 専用。native の `cargo build` / `clippy` / `test` (workspace の root で打つもの) では空の crate にして、
 // crates/leave だけを検査させる
@@ -33,11 +36,13 @@ use leave::{
 };
 use tower_service::Service;
 use worker::{
-    console_error, console_log, event, Context, Date, Env, HttpRequest, Result, ScheduleContext,
-    ScheduledEvent, WorkerVersionMetadata,
+    console_error, console_log, event, Context, Date, Env, HttpRequest, MessageBatch, MessageExt,
+    Result, ScheduleContext, ScheduledEvent, WorkerVersionMetadata,
 };
 
-use crate::bindings::{AuthWorkerNotifier, IchibanBinding, NoNotifier, R2Pdfs};
+use crate::bindings::{
+    AuthTicketVerifier, AuthWorkerNotifier, IchibanBinding, NoNotifier, R2Inbox, R2Pdfs,
+};
 
 /// R2 の binding (本番と staging で別の bucket)
 const LEAVE_R2_BINDING: &str = "LEAVE_R2";
@@ -48,6 +53,12 @@ const ICHIBAN_DB_BINDING: &str = "ICHIBAN_DB";
 const INGEST_SECRET_BINDING: &str = "INTERNAL_SHARED_SECRET";
 /// auth-worker の Service Binding (本番だけ)。LINE WORKS への送信 (定時実行の通知) に使う
 const AUTH_WORKER_BINDING: &str = "AUTH_WORKER";
+/// スキャンの inbox の R2 (本番と staging で別の bucket)
+const LEAVE_INBOX_BINDING: &str = "LEAVE_INBOX";
+/// auth-worker の named entrypoint `MachineCredentialEntrypoint` (チケットの検証 `verifyTicket`)
+const AUTH_MCRED_BINDING: &str = "AUTH_MCRED";
+/// staging の表示制限 (分)。env.staging の vars にだけ置く (本番は無い = 制限なし)
+const VISIBLE_MINUTES_VAR: &str = "STAGING_VISIBLE_MINUTES";
 
 /// 今の時刻 (JS の Date)
 fn now() -> DateTime<Utc> {
@@ -151,6 +162,12 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
         notifier,
         log: log_sink(),
         now: clock(),
+        visible_minutes: leave::visible_minutes(
+            env.var(VISIBLE_MINUTES_VAR)
+                .ok()
+                .map(|v| v.to_string())
+                .as_deref(),
+        ),
     };
     let mut resp = match router(state, ingest).call(req).await {
         Ok(r) => r,
@@ -210,4 +227,46 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     let today = leave::ledger::jst_date(now());
     let summary = leave::cron::run(&mut pg, &ichiban, notifier.as_ref(), today).await;
     console_log!("leave: {}", summary.line());
+}
+
+/// スキャンの inbox の取り込み (wrangler.toml の `[[queues.consumers]]`)。メッセージごとに ack / retry を決める。
+/// DB か binding が無ければ全部 retry (Queue の max_retries の後は dead letter queue)
+#[event(queue)]
+async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) -> Result<()> {
+    let (Ok(inbox), Ok(bucket), Ok(auth)) = (
+        env.bucket(LEAVE_INBOX_BINDING),
+        env.bucket(LEAVE_R2_BINDING),
+        env.service(AUTH_MCRED_BINDING),
+    ) else {
+        console_error!("leave: inbox bindings missing");
+        batch.retry_all();
+        return Ok(());
+    };
+    let pg = match db::connect(&env).await {
+        Ok(c) => c,
+        Err(e) => {
+            console_error!("leave: inbox {e}");
+            batch.retry_all();
+            return Ok(());
+        }
+    };
+    let pg = Mutex::new(pg);
+    let pdfs = R2Pdfs::new(bucket);
+    let inbox = R2Inbox::new(inbox);
+    let verifier = AuthTicketVerifier::new(auth);
+    let log = log_sink();
+    let deps = leave::inbox::InboxDeps {
+        pg: &pg,
+        pdfs: &pdfs,
+        inbox: &inbox,
+        verifier: &verifier,
+        log: &log,
+    };
+    for message in batch.messages()? {
+        match leave::inbox::handle(&deps, message.body().clone()).await {
+            leave::inbox::Outcome::Ack => message.ack(),
+            leave::inbox::Outcome::Retry => message.retry(),
+        }
+    }
+    Ok(())
 }

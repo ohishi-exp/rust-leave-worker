@@ -46,16 +46,26 @@ pub mod sql {
         "id, r2_key, page_no, mail_from, subject, received_at, employee_cd, status, \
          linked_by, linked_at, note, created_at";
 
+    /// 一覧・詳細・PDF の key に共通の「見えるページ」の条件。`$n` が NULL なら全部 (本番)、在れば受信がそれ以降の
+    /// ページだけ (staging の表示制限。`STAGING_VISIBLE_MINUTES`)
+    fn visible(n: u8) -> String {
+        format!("(${n}::timestamptz IS NULL OR received_at >= ${n})")
+    }
+
     pub fn pages_list() -> String {
         format!(
             "SELECT {PAGE_COLUMNS} FROM alc_api.leave_pages \
              WHERE tenant_id = $1 AND ($2::text IS NULL OR status = $2) AND ($3::text IS NULL OR employee_cd = $3) \
-             ORDER BY received_at DESC, page_no, id LIMIT $4 OFFSET $5"
+             AND {} ORDER BY received_at DESC, page_no, id LIMIT $4 OFFSET $5",
+            visible(6)
         )
     }
 
     pub fn page_by_id() -> String {
-        format!("SELECT {PAGE_COLUMNS} FROM alc_api.leave_pages WHERE tenant_id = $1 AND id = $2")
+        format!(
+            "SELECT {PAGE_COLUMNS} FROM alc_api.leave_pages WHERE tenant_id = $1 AND id = $2 AND {}",
+            visible(3)
+        )
     }
 
     pub fn page_lock() -> String {
@@ -85,13 +95,19 @@ pub mod sql {
     pub const MAILBOX_RESOLVE: &str =
         "SELECT tenant_id, allowed_senders FROM alc_api.leave_resolve_mailbox($1)";
 
-    /// 1 通の PDF の全ページ (page_no 1..=$6) を 1 文で入れる
+    /// 1 通の PDF の全ページ (page_no 1..=$6) を 1 文で入れる。同じ key が既に在れば何もしない
+    /// (Queue の再配送。key は inbox の object key から決まる — `ingest::seeded_object_key`)
     pub const PAGES_INSERT: &str = "INSERT INTO alc_api.leave_pages \
          (tenant_id, r2_key, page_no, mail_from, subject, received_at, status) \
-         SELECT $1, $2, g, $3, $4, $5, 'unlinked' FROM generate_series(1, $6::int) AS g";
+         SELECT $1, $2, g, $3, $4, $5, 'unlinked' FROM generate_series(1, $6::int) AS g \
+         ON CONFLICT (r2_key, page_no) DO NOTHING";
 
-    pub const PAGE_R2_KEY: &str =
-        "SELECT r2_key FROM alc_api.leave_pages WHERE tenant_id = $1 AND id = $2";
+    pub fn page_r2_key() -> String {
+        format!(
+            "SELECT r2_key FROM alc_api.leave_pages WHERE tenant_id = $1 AND id = $2 AND {}",
+            visible(3)
+        )
+    }
 
     /// 日数は 0.1 日単位の整数で受け渡す (NUMERIC を Rust の型に通さない)
     const GRANT_COLUMNS: &str =
@@ -711,10 +727,12 @@ pub async fn put_settings(
     .await
 }
 
+/// `visible_since` は staging の表示制限 (`None` = 制限なし。一覧・詳細・更新・PDF の key で同じ値を渡す)
 pub async fn list_pages(
     pg: &mut PgClient,
     tenant_id: Uuid,
     q: ListQuery,
+    visible_since: Option<DateTime<Utc>>,
 ) -> Result<Vec<Page>, Error> {
     pg.tenant_tx(tenant_id, move |tx| {
         Box::pin(async move {
@@ -727,6 +745,7 @@ pub async fn list_pages(
                         (&q.employee_cd, Type::TEXT),
                         (&q.limit, Type::INT8),
                         (&q.offset, Type::INT8),
+                        (&visible_since, Type::TIMESTAMPTZ),
                     ],
                 )
                 .await?;
@@ -751,13 +770,18 @@ pub async fn get_page(
     pg: &mut PgClient,
     tenant_id: Uuid,
     id: Uuid,
+    visible_since: Option<DateTime<Utc>>,
 ) -> Result<Option<PageDetail>, Error> {
     pg.tenant_tx(tenant_id, move |tx| {
         Box::pin(async move {
             let Some(row) = tx
                 .query_typed_opt(
                     &sql::page_by_id(),
-                    &[(&tenant_id, Type::UUID), (&id, Type::UUID)],
+                    &[
+                        (&tenant_id, Type::UUID),
+                        (&id, Type::UUID),
+                        (&visible_since, Type::TIMESTAMPTZ),
+                    ],
                 )
                 .await?
             else {
@@ -782,6 +806,7 @@ pub async fn update_page(
     id: Uuid,
     u: PageUpdate,
     actor: Option<String>,
+    visible_since: Option<DateTime<Utc>>,
 ) -> Result<Option<PageDetail>, Error> {
     pg.tenant_tx(tenant_id, move |tx| {
         Box::pin(async move {
@@ -792,7 +817,16 @@ pub async fn update_page(
                 ),
                 (&id, Type::UUID),
             ];
-            if tx.query_typed_opt(&sql::page_lock(), &ids).await?.is_none() {
+            let lock = [
+                ids[0].clone(),
+                ids[1].clone(),
+                (&visible_since, Type::TIMESTAMPTZ),
+            ];
+            if tx
+                .query_typed_opt(&sql::page_lock(), &lock)
+                .await?
+                .is_none()
+            {
                 return Ok(None);
             }
             tx.execute_typed(sql::PERIODS_DELETE, &ids).await?;
@@ -838,13 +872,18 @@ pub async fn page_r2_key(
     pg: &mut PgClient,
     tenant_id: Uuid,
     id: Uuid,
+    visible_since: Option<DateTime<Utc>>,
 ) -> Result<Option<String>, Error> {
     pg.tenant_tx(tenant_id, move |tx| {
         Box::pin(async move {
             let row = tx
                 .query_typed_opt(
-                    sql::PAGE_R2_KEY,
-                    &[(&tenant_id, Type::UUID), (&id, Type::UUID)],
+                    &sql::page_r2_key(),
+                    &[
+                        (&tenant_id, Type::UUID),
+                        (&id, Type::UUID),
+                        (&visible_since, Type::TIMESTAMPTZ),
+                    ],
                 )
                 .await?;
             Ok(row.map(|r| r.get(0)))
@@ -874,10 +913,11 @@ pub async fn resolve_mailbox(
     .await
 }
 
-/// 取り込んだ PDF のページ (1..=`pages`) を未紐づけで入れる。1 文 = 全ページ (途中までは入らない)
+/// 取り込んだ PDF のページ (1..=`pages`) を未紐づけで入れる。1 文 = 全ページ (途中までは入らない)。
+/// `mail_from` / `subject` はメール経路だけ (スキャンの inbox 経路は NULL)
 pub struct NewPages {
     pub r2_key: String,
-    pub mail_from: String,
+    pub mail_from: Option<String>,
     pub subject: Option<String>,
     pub received_at: DateTime<Utc>,
     pub pages: i32,

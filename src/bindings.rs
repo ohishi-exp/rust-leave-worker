@@ -1,5 +1,6 @@
-//! crates/leave の trait の Workers での実装: R2 の binding (`LEAVE_R2`)・一番星 Worker の Service Binding (`ICHIBAN_DB`)・
-//! LINE WORKS への送信 (auth-worker の Service Binding `AUTH_WORKER`)。
+//! crates/leave の trait の Workers での実装: R2 の binding (`LEAVE_R2`・スキャンの inbox `LEAVE_INBOX`)・
+//! 一番星 Worker の Service Binding (`ICHIBAN_DB`)・LINE WORKS への送信 (auth-worker の Service Binding `AUTH_WORKER`)・
+//! チケットの検証 (auth-worker の RPC、Service Binding `AUTH_MCRED`)。
 //!
 //! 値と future は JS の値で `Send` でないので、`worker::send` の `SendWrapper`・`SendFuture` で包む (Workers は単一 thread)。
 //! エラーは段の名前だけに落とす (**key・ランタイムの生のエラー文はログに出さない**)。
@@ -9,8 +10,10 @@
 use futures_util::future::BoxFuture;
 use leave::cron::{send_body, Notifier, NotifyError, NotifyTarget, LINEWORKS_SEND_URL};
 use leave::ichiban::{IchibanApi, IchibanError, IchibanResponse};
+use leave::inbox::{Inbox, InboxObject, TicketVerifier, VerifyError};
 use leave::store::{PdfStore, StoreError};
-use wasm_bindgen::JsValue;
+use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::JsFuture;
 use worker::send::{SendFuture, SendWrapper};
 use worker::{Bucket, Fetcher, Headers, Method, Request, RequestInit};
 
@@ -134,6 +137,83 @@ impl Notifier for AuthWorkerNotifier {
             } else {
                 Err(NotifyError("status"))
             }
+        }))
+    }
+}
+
+/// スキャンの inbox (binding `LEAVE_INBOX`)。チケットは `customMetadata.ticket`
+pub struct R2Inbox(SendWrapper<Bucket>);
+
+impl R2Inbox {
+    pub fn new(bucket: Bucket) -> Self {
+        Self(SendWrapper::new(bucket))
+    }
+}
+
+impl Inbox for R2Inbox {
+    fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<InboxObject>, StoreError>> {
+        Box::pin(SendFuture::new(async move {
+            let object = self.0.get(key).execute().await;
+            let Some(object) = object.map_err(|_| StoreError("get"))? else {
+                return Ok(None);
+            };
+            let ticket = object
+                .custom_metadata()
+                .map_err(|_| StoreError("metadata"))?
+                .remove("ticket");
+            let body = object.body().ok_or(StoreError("get body"))?;
+            let bytes = body.bytes().await.map_err(|_| StoreError("read body"))?;
+            Ok(Some(InboxObject { bytes, ticket }))
+        }))
+    }
+
+    fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(SendFuture::new(async move {
+            self.0.delete(key).await.map_err(|_| StoreError("delete"))
+        }))
+    }
+}
+
+#[wasm_bindgen]
+extern "C" {
+    /// auth-worker の named entrypoint `MachineCredentialEntrypoint` (binding `AUTH_MCRED`)
+    #[wasm_bindgen(extends = js_sys::Object)]
+    type MachineCredentialRpc;
+
+    #[wasm_bindgen(method, catch, js_name = verifyTicket)]
+    fn verify_ticket(
+        this: &MachineCredentialRpc,
+        ticket: &str,
+        purpose: &str,
+    ) -> Result<js_sys::Promise, JsValue>;
+}
+
+/// チケットの検証 (auth-worker の RPC `verifyTicket`)。戻り値は JSON のまま crates/leave の `inbox::parse_ticket` に渡す。
+/// 呼び出しの失敗 (throw・変換できない値) は一時的な失敗 (retry)。エラーの中身は捨てる
+pub struct AuthTicketVerifier(SendWrapper<MachineCredentialRpc>);
+
+impl AuthTicketVerifier {
+    pub fn new(fetcher: Fetcher) -> Self {
+        Self(SendWrapper::new(fetcher.into_rpc::<MachineCredentialRpc>()))
+    }
+}
+
+impl TicketVerifier for AuthTicketVerifier {
+    fn verify<'a>(
+        &'a self,
+        ticket: &'a str,
+        purpose: &'a str,
+    ) -> BoxFuture<'a, Result<serde_json::Value, VerifyError>> {
+        Box::pin(SendFuture::new(async move {
+            let promise = self
+                .0
+                .verify_ticket(ticket, purpose)
+                .map_err(|_| VerifyError)?;
+            let value = JsFuture::from(promise).await.map_err(|_| VerifyError)?;
+            if value.is_null() || value.is_undefined() {
+                return Ok(serde_json::Value::Null);
+            }
+            serde_wasm_bindgen::from_value(value).map_err(|_| VerifyError)
         }))
     }
 }

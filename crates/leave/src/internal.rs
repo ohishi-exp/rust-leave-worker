@@ -7,6 +7,7 @@
 //! 流れ: secret → body → 検証 ([`check_input`]) → mailbox から tenant と許可リスト → 送信元の照合 →
 //! ページ数 ([`count_pages`]。PDF の parser には許可された送信元の PDF だけを渡す) → R2 に put → `tenant_tx` で全ページを INSERT。INSERT が失敗したら R2 の object を消してから 500
 //! (R2 の await は transaction の外 = `tenant_tx` を 2 回に分けている)。
+//! ページ数以降 (本体) は [`ingest_pdf`] で、スキャンの inbox の取り込み ([`crate::inbox`]) と共用する。
 //!
 //! 応答・ログは固定の語だけ。PDF の中身・差出人のアドレス・secret は出さない (tenant の識別子は 202・200 のログに出す)。
 
@@ -19,13 +20,14 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
+use chrono::{DateTime, Utc};
 use futures_util::lock::Mutex;
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::ingest::{
     check_input, clip_mail_from, clip_subject, count_pages, object_key, secret_matches,
-    sender_allowed, IngestInput, Reject, MAX_BODY_BYTES,
+    seeded_object_key, sender_allowed, IngestInput, Reject, MAX_BODY_BYTES,
 };
 use crate::pg;
 use crate::routes::LogSink;
@@ -115,32 +117,79 @@ async fn ingest(State(state): State<IngestState>, req: Request<Body>) -> Respons
         return dropped(&state, "sender_not_allowed", Some(tenant_id));
     }
 
-    let pages = match count_pages(&checked.pdf) {
-        Ok(n) => n,
-        Err(reason) => return dropped(&state, reason, Some(tenant_id)),
+    let pdf = NewPdf {
+        tenant_id,
+        pdf: checked.pdf,
+        received_at: input.received_at,
+        mail_from: Some(clip_mail_from(&input.header_from)),
+        subject: input.subject.as_deref().map(clip_subject),
+        key_seed: None,
     };
+    match ingest_pdf(&state.pg, state.pdfs.as_ref(), &state.log, pdf).await {
+        Ok(pages) => {
+            (state.log)(&format!("ingest stored: tenant={tenant_id} pages={pages}"));
+            Json(json!({ "pages": pages })).into_response()
+        }
+        Err(IngestFailure::Drop(reason)) => dropped(&state, reason, Some(tenant_id)),
+        Err(IngestFailure::Failed) => internal_error(),
+    }
+}
 
-    // R2 に置いてから DB に入れる (R2 の await は transaction に挟まない)。key はサーバ側で作る
-    let key = object_key(tenant_id, input.received_at, Uuid::new_v4());
-    if state.pdfs.put(&key, checked.pdf).await.is_err() {
-        (state.log)("ingest: r2 put failed");
-        return internal_error();
+/// 取り込む PDF (tenant は呼び手が確定済み: メール = mailbox と送信元、スキャン = auth-worker が検証したチケット)
+pub struct NewPdf {
+    pub tenant_id: Uuid,
+    /// `%PDF-` で始まり、大きさの上限以内 (呼び手が確かめる)
+    pub pdf: Vec<u8>,
+    pub received_at: DateTime<Utc>,
+    /// メール経路だけ (スキャンは `None` = NULL)
+    pub mail_from: Option<String>,
+    pub subject: Option<String>,
+    /// 在れば R2 の key をこれから決定的に作る (Queue の再配送で同じ key・同じ行になる)。`None` なら乱数の UUID
+    pub key_seed: Option<String>,
+}
+
+/// 取り込みの本体が返す失敗
+#[derive(Debug, PartialEq)]
+pub enum IngestFailure {
+    /// 意図して捨てる (ページ数が読めない・多すぎる)。語は固定
+    Drop(&'static str),
+    /// R2 か DB の失敗 (一時的なもの。メールは 500、Queue は retry)。段の名前はログに出してある
+    Failed,
+}
+
+/// 取り込みの本体 (メールの口と Queue の consumer で共用): ページ数 ([`count_pages`]) → R2 に put → 全ページを INSERT。
+/// INSERT が失敗したら R2 の object を消す。ただし `key_seed` が在る (決定的な key) ときは消さない — 前の配送で
+/// 入った行がその object を指していることがあり、再試行は同じ key に put し直すため。
+/// R2 の await は transaction の外 (`tenant_tx` は INSERT の 1 回だけ)
+pub async fn ingest_pdf(
+    pg: &Mutex<PgClient>,
+    pdfs: &dyn PdfStore,
+    log: &LogSink,
+    p: NewPdf,
+) -> Result<usize, IngestFailure> {
+    let pages = count_pages(&p.pdf).map_err(IngestFailure::Drop)?;
+    let key = match &p.key_seed {
+        Some(seed) => seeded_object_key(p.tenant_id, p.received_at, seed),
+        None => object_key(p.tenant_id, p.received_at, Uuid::new_v4()),
+    };
+    if pdfs.put(&key, p.pdf).await.is_err() {
+        log("ingest: r2 put failed");
+        return Err(IngestFailure::Failed);
     }
     let new_pages = pg::NewPages {
         r2_key: key.clone(),
-        mail_from: clip_mail_from(&input.header_from),
-        subject: input.subject.as_deref().map(clip_subject),
-        received_at: input.received_at,
+        mail_from: p.mail_from,
+        subject: p.subject,
+        received_at: p.received_at,
         pages: i32::try_from(pages).unwrap_or(i32::MAX),
     };
-    let inserted = pg::insert_pages(&mut *state.pg.lock().await, tenant_id, new_pages).await;
+    let inserted = pg::insert_pages(&mut *pg.lock().await, p.tenant_id, new_pages).await;
     if let Err(e) = inserted {
-        (state.log)(&format!("ingest insert: {}", alc_worker_db::kind(&e)));
-        if state.pdfs.delete(&key).await.is_err() {
-            (state.log)("ingest: r2 delete failed");
+        log(&format!("ingest insert: {}", alc_worker_db::kind(&e)));
+        if p.key_seed.is_none() && pdfs.delete(&key).await.is_err() {
+            log("ingest: r2 delete failed");
         }
-        return internal_error();
+        return Err(IngestFailure::Failed);
     }
-    (state.log)(&format!("ingest stored: tenant={tenant_id} pages={pages}"));
-    Json(json!({ "pages": pages })).into_response()
+    Ok(pages)
 }
