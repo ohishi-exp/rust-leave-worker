@@ -194,10 +194,6 @@ async fn put_settings(
         Ok(PutSettings::UnknownChannel) => bad_request("unknown_lineworks_channel"),
         Ok(PutSettings::UnknownRecipient) => bad_request("unknown_notify_recipient"),
         Ok(PutSettings::UnknownBot) => bad_request("unknown_notify_bot"),
-        // mailbox の UNIQUE (別の tenant が使っている)
-        Err(e) if alc_worker_db::kind(&e) == "23505" => {
-            error(StatusCode::CONFLICT, "mailbox_taken")
-        }
         Err(e) => db_error(&state, "put_settings", &e),
     }
 }

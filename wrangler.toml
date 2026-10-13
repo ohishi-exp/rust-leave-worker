@@ -38,7 +38,7 @@ enabled = true
 binding = "LEAVE_HYPERDRIVE"
 id = "6bdf446634034f989d4e094d5510b162"
 
-# 本番の R2 (休暇申請書の PDF の置き場。書くのはメール受信の口、この Worker の管理 API は読むだけ)。
+# 本番の R2 (休暇申請書の PDF の置き場。書くのはスキャンの inbox の取り込み (Queue)、管理 API は読むだけ)。
 # binding は env に継承されないので、staging は下で別の bucket を指す
 [[r2_buckets]]
 binding = "LEAVE_R2"
@@ -50,7 +50,7 @@ bucket_name = "leave-pdfs"
 binding = "ICHIBAN_DB"
 service = "ichibanboshi-ichiban"
 
-# メール取り込みの口 (/internal/ingest) の共有 secret。ippoan/email-receiver の wrangler.toml と同じ Secrets Store の
+# auth-worker との共有 secret (通知 = LINE WORKS 送信の内部 proxy に付ける)。auth-worker と同じ Secrets Store の
 # secret (値は repo に無い。worker では `.get()` で実値にする)。binding は env に継承されないので staging にも書く
 [[secrets_store_secrets]]
 binding = "INTERNAL_SHARED_SECRET"

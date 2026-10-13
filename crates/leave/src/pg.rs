@@ -16,7 +16,7 @@ use crate::settings::{Settings, ValidSettings};
 
 pub mod sql {
     pub const SETTINGS_SELECT: &str =
-        "SELECT mailbox, allowed_senders, dept_codes, lineworks_channel_id, notify_recipient_id, \
+        "SELECT dept_codes, lineworks_channel_id, notify_recipient_id, \
          notify_bot_config_id, grace_days, enabled, updated_at \
          FROM alc_api.leave_settings WHERE tenant_id = $1";
 
@@ -33,13 +33,12 @@ pub mod sql {
          WHERE id = $1 AND tenant_id = $2 AND provider = 'lineworks' AND enabled";
 
     pub const SETTINGS_UPSERT: &str = "INSERT INTO alc_api.leave_settings \
-         (tenant_id, mailbox, allowed_senders, dept_codes, lineworks_channel_id, notify_recipient_id, notify_bot_config_id, grace_days, enabled, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW()) \
-         ON CONFLICT (tenant_id) DO UPDATE SET mailbox = EXCLUDED.mailbox, allowed_senders = EXCLUDED.allowed_senders, \
-         dept_codes = EXCLUDED.dept_codes, lineworks_channel_id = EXCLUDED.lineworks_channel_id, \
+         (tenant_id, dept_codes, lineworks_channel_id, notify_recipient_id, notify_bot_config_id, grace_days, enabled, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) \
+         ON CONFLICT (tenant_id) DO UPDATE SET dept_codes = EXCLUDED.dept_codes, lineworks_channel_id = EXCLUDED.lineworks_channel_id, \
          notify_recipient_id = EXCLUDED.notify_recipient_id, notify_bot_config_id = EXCLUDED.notify_bot_config_id, \
          grace_days = EXCLUDED.grace_days, enabled = EXCLUDED.enabled, updated_at = NOW() \
-         RETURNING mailbox, allowed_senders, dept_codes, lineworks_channel_id, notify_recipient_id, \
+         RETURNING dept_codes, lineworks_channel_id, notify_recipient_id, \
          notify_bot_config_id, grace_days, enabled, updated_at";
 
     const PAGE_COLUMNS: &str =
@@ -108,10 +107,6 @@ pub mod sql {
 
     pub const PERIOD_INSERT: &str = "INSERT INTO alc_api.leave_periods \
          (tenant_id, page_id, kind, start_date, end_date, half) VALUES ($1, $2, $3, $4, $5, $6)";
-
-    /// mailbox から tenant と許可リストを引く。SECURITY DEFINER で tenant をまたぐ (無効な設定・未知の mailbox は 0 行)
-    pub const MAILBOX_RESOLVE: &str =
-        "SELECT tenant_id, allowed_senders FROM alc_api.leave_resolve_mailbox($1)";
 
     /// 1 通の PDF の全ページ (page_no 1..=$6) を 1 文で入れる。同じ key が既に在れば何もしない
     /// (Queue の再配送。key は inbox の object key から決まる — `ingest::seeded_object_key`)
@@ -628,15 +623,13 @@ pub async fn mark_notified(
 
 fn settings_from_row(row: &Row) -> Settings {
     Settings {
-        mailbox: row.get(0),
-        allowed_senders: row.get(1),
-        dept_codes: row.get(2),
-        lineworks_channel_id: row.get(3),
-        notify_recipient_id: row.get(4),
-        notify_bot_config_id: row.get(5),
-        grace_days: row.get(6),
-        enabled: row.get(7),
-        updated_at: Some(row.get::<_, DateTime<Utc>>(8)),
+        dept_codes: row.get(0),
+        lineworks_channel_id: row.get(1),
+        notify_recipient_id: row.get(2),
+        notify_bot_config_id: row.get(3),
+        grace_days: row.get(4),
+        enabled: row.get(5),
+        updated_at: Some(row.get::<_, DateTime<Utc>>(6)),
     }
 }
 
@@ -728,8 +721,6 @@ pub async fn put_settings(
                     sql::SETTINGS_UPSERT,
                     &[
                         (&tenant_id, Type::UUID),
-                        (&s.mailbox, Type::TEXT),
-                        (&s.allowed_senders, Type::TEXT_ARRAY),
                         (&s.dept_codes, Type::TEXT_ARRAY),
                         (&s.lineworks_channel_id, Type::UUID),
                         (&s.notify_recipient_id, Type::UUID),
@@ -952,29 +943,8 @@ pub async fn page_r2_key(
     .await
 }
 
-/// mailbox が指す tenant と、許可された送信元 (小文字化は呼び手)。未知・無効なら `None`。
-///
-/// tenant が決まる前の照会。alc-vein-worker・alc-dtako-worker に前例が無く、`PgClient` にはテナントを設定しない
-/// transaction の口が無いので、`tenant_tx(Uuid::nil(), ..)` の中でこの関数だけを呼ぶ。関数は SECURITY DEFINER
-/// (`SET search_path = alc_api`) で、tenant をまたいで `leave_settings` を引くため、設定した tenant には依存しない
-/// (nil UUID はどの tenant にも当たらない値)。
-pub async fn resolve_mailbox(
-    pg: &mut PgClient,
-    mailbox: String,
-) -> Result<Option<(Uuid, Vec<String>)>, Error> {
-    pg.tenant_tx(Uuid::nil(), move |tx| {
-        Box::pin(async move {
-            let row = tx
-                .query_typed_opt(sql::MAILBOX_RESOLVE, &[(&mailbox, Type::TEXT)])
-                .await?;
-            Ok(row.map(|r| (r.get::<_, Uuid>(0), r.get::<_, Vec<String>>(1))))
-        })
-    })
-    .await
-}
-
 /// 取り込んだ PDF のページ (1..=`pages`) を未紐づけで入れる。1 文 = 全ページ (途中までは入らない)。
-/// `mail_from` / `subject` はメール経路だけ (スキャンの inbox 経路は NULL)
+/// `mail_from` / `subject` は列として残す (取り込み経路 = スキャンの inbox は NULL)
 pub struct NewPages {
     pub r2_key: String,
     pub mail_from: Option<String>,

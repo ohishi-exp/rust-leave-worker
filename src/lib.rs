@@ -6,7 +6,7 @@
 //! **この Worker は JWT を検証せず、auth-worker が付け直した tenant / role ヘッダーを信頼する**
 //! (`alc_core_wasm::require_tenant_header` と crates/leave の `auth::require_admin`)。本番・staging とも
 //! workers.dev を開けず (`workers_dev` / `preview_urls` = false、`routes` を持たない)、入口は Service Binding だけ
-//! (例外の `/internal/ingest` も Service Binding。wrangler.toml と scripts/check-exposure.sh が保証する)。
+//! (wrangler.toml と scripts/check-exposure.sh が保証する)。
 //!
 //! 定時実行 (`scheduled`、本番だけ) は毎朝一番星と申請書を突き合わせ、ずれを LINE WORKS へ送る (crates/leave の `cron`)。
 //!
@@ -30,10 +30,7 @@ use axum::{middleware, Router};
 use chrono::{DateTime, Utc};
 use futures_util::lock::Mutex;
 use leave::cron::Notifier;
-use leave::{
-    ingest_router, tenant_router, Clock, IngestState, LeaveState, LogSink, INGEST_PATH,
-    TEST_NOTIFY_PATH,
-};
+use leave::{tenant_router, Clock, LeaveState, LogSink, TEST_NOTIFY_PATH};
 use tower_service::Service;
 use worker::{
     console_error, console_log, event, Context, Date, Env, HttpRequest, MessageBatch, MessageExt,
@@ -48,9 +45,9 @@ use crate::bindings::{
 const LEAVE_R2_BINDING: &str = "LEAVE_R2";
 /// 一番星 Worker の Service Binding (本番だけ。staging には置かない — 部門・社員・カレンダー・付与の口は 503)
 const ICHIBAN_DB_BINDING: &str = "ICHIBAN_DB";
-/// メール取り込みの口と LINE WORKS 送信 (auth-worker の内部 proxy) の共有 secret
+/// auth-worker との共有 secret (LINE WORKS 送信 = auth-worker の内部 proxy の通知に使う)
 /// (Secrets Store の binding。`.get()` で実値にする)
-const INGEST_SECRET_BINDING: &str = "INTERNAL_SHARED_SECRET";
+const NOTIFY_SECRET_BINDING: &str = "INTERNAL_SHARED_SECRET";
 /// auth-worker の Service Binding (本番だけ)。LINE WORKS への送信 (定時実行の通知) に使う
 const AUTH_WORKER_BINDING: &str = "AUTH_WORKER";
 /// スキャンの inbox の R2 (本番と staging で別の bucket)
@@ -69,27 +66,12 @@ fn clock() -> Clock {
     Arc::new(now)
 }
 
-/// 管理 API は `/api` の下にだけ出す。tenant の layer は nest の中の全 route (と、その下で当たらない path) に掛かる。
-/// メール取り込みの口 `/internal/ingest` は nest の外 (tenant・admin の layer の外で、共有 secret で守る)
-fn router(state: LeaveState, ingest: IngestState) -> Router {
+/// 管理 API は `/api` の下にだけ出す。tenant の layer は nest の中の全 route (と、その下で当たらない path) に掛かる
+fn router(state: LeaveState) -> Router {
     let leave = tenant_router()
         .layer(middleware::from_fn(require_tenant_header))
         .with_state(state);
-    Router::new()
-        .nest("/api", leave)
-        .merge(ingest_router().with_state(ingest))
-}
-
-/// 共有 secret の実値。取り込みの口へのリクエストでだけ引く。取れなければ `None` (口は全部 401)
-async fn ingest_secret(env: &Env) -> Option<Arc<str>> {
-    let store = env.secret_store(INGEST_SECRET_BINDING).ok()?;
-    match store.get().await {
-        Ok(Some(v)) => Some(Arc::from(v)),
-        _ => {
-            console_error!("leave: no {INGEST_SECRET_BINDING} value");
-            None
-        }
-    }
+    Router::new().nest("/api", leave)
 }
 
 fn log_sink() -> LogSink {
@@ -136,11 +118,6 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
         .service(ICHIBAN_DB_BINDING)
         .ok()
         .map(|f| Arc::new(IchibanBinding::new(f)) as Arc<dyn leave::ichiban::IchibanApi>);
-    let secret = if req.uri().path() == INGEST_PATH {
-        ingest_secret(&env).await
-    } else {
-        None
-    };
     // 送信の口 (secret の取得を伴う) はテスト送信の口へのリクエストでだけ組む。ほかの口は使わない
     let notifier: Arc<dyn Notifier> = if req.uri().path() == TEST_NOTIFY_PATH {
         Arc::from(notifier(&env).await)
@@ -149,12 +126,6 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
     };
     let pg = Arc::new(Mutex::new(pg));
     let pdfs = Arc::new(R2Pdfs::new(bucket));
-    let ingest = IngestState {
-        pg: pg.clone(),
-        pdfs: pdfs.clone(),
-        secret,
-        log: log_sink(),
-    };
     let state = LeaveState {
         pg,
         pdfs,
@@ -169,7 +140,7 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
                 .as_deref(),
         ),
     };
-    let mut resp = match router(state, ingest).call(req).await {
+    let mut resp = match router(state).call(req).await {
         Ok(r) => r,
         Err(e) => match e {},
     };
@@ -195,14 +166,14 @@ async fn notifier(env: &Env) -> Box<dyn Notifier> {
         console_error!("leave: cron no {AUTH_WORKER_BINDING} binding");
         return Box::new(NoNotifier);
     };
-    let secret = match env.secret_store(INGEST_SECRET_BINDING) {
+    let secret = match env.secret_store(NOTIFY_SECRET_BINDING) {
         Ok(store) => store.get().await.ok().flatten(),
         Err(_) => None,
     };
     match secret {
         Some(s) => Box::new(AuthWorkerNotifier::new(fetcher, s)),
         None => {
-            console_error!("leave: cron no {INGEST_SECRET_BINDING} secret");
+            console_error!("leave: cron no {NOTIFY_SECRET_BINDING} secret");
             Box::new(NoNotifier)
         }
     }
