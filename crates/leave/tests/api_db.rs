@@ -3014,3 +3014,127 @@ mod inbox {
         assert!(r.deleted().is_empty());
     }
 }
+
+/// 管理画面からの取り込みの口 `POST /api/leave/uploads` (本文 = PDF そのもの)
+mod uploads {
+    use super::*;
+    use leave::ingest::{minimal_pdf, MAX_PAGES, MAX_PDF_BYTES};
+    use support::call_bytes;
+
+    const PATH: &str = "/api/leave/uploads";
+
+    async fn pages_of(t: Uuid) -> Vec<Value> {
+        let a = app(FakePdfs::default(), None).await;
+        let got = call(&a, "GET", "/api/leave/pages", Some(t), ADMIN, None).await;
+        assert_eq!(got.status, 200);
+        got.json()["data"].as_array().unwrap().clone()
+    }
+
+    fn big(len: usize) -> Vec<u8> {
+        let mut v = vec![0u8; len];
+        v[..5].copy_from_slice(b"%PDF-");
+        v
+    }
+
+    /// 自 tenant に全ページが入り (mail_from / subject は NULL)、置き場に 1 件
+    #[tokio::test]
+    async fn stores_the_pdf_for_the_header_tenant() {
+        let t = tenant().await;
+        let other = tenant().await;
+        let a = app(FakePdfs::default(), None).await;
+        let got = call_bytes(&a, "POST", PATH, Some(t), ADMIN, minimal_pdf(3)).await;
+        assert_eq!(got.status, 201);
+        assert_eq!(got.json(), json!({"pages": 3}));
+        let stored: Vec<String> = a.pdfs.stored.lock().unwrap().keys().cloned().collect();
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].starts_with(&format!("{t}/")));
+        let pages = pages_of(t).await;
+        assert_eq!(pages.len(), 3);
+        for p in &pages {
+            assert_eq!(p["mail_from"], Value::Null);
+            assert_eq!(p["subject"], Value::Null);
+            assert_eq!(p["r2_key"], stored[0].as_str());
+        }
+        assert!(pages_of(other).await.is_empty());
+    }
+
+    /// 同じファイルを 2 回上げたら 2 件 (別 key・別の行)
+    #[tokio::test]
+    async fn the_same_body_twice_is_stored_twice() {
+        let t = tenant().await;
+        let a = app(FakePdfs::default(), None).await;
+        for _ in 0..2 {
+            let got = call_bytes(&a, "POST", PATH, Some(t), ADMIN, minimal_pdf(1)).await;
+            assert_eq!(got.status, 201);
+        }
+        assert_eq!(a.pdfs.stored.lock().unwrap().len(), 2);
+        assert_eq!(pages_of(t).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_body_that_is_not_a_pdf() {
+        let t = tenant().await;
+        let a = app(FakePdfs::default(), None).await;
+        let got = call_bytes(&a, "POST", PATH, Some(t), ADMIN, b"GIF89a".to_vec()).await;
+        assert_eq!(got.status, 400);
+        assert_eq!(got.json(), json!({"error": "not_pdf"}));
+        assert!(a.pdfs.stored.lock().unwrap().is_empty());
+        assert!(pages_of(t).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_too_many_pages() {
+        let t = tenant().await;
+        let a = app(FakePdfs::default(), None).await;
+        let got = call_bytes(&a, "POST", PATH, Some(t), ADMIN, minimal_pdf(MAX_PAGES + 1)).await;
+        assert_eq!(got.status, 422);
+        assert_eq!(got.json(), json!({"error": "too_many_pages"}));
+        assert!(a.pdfs.stored.lock().unwrap().is_empty());
+        assert!(pages_of(t).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn is_admin_only() {
+        let t = tenant().await;
+        let a = app(FakePdfs::default(), None).await;
+        for role in [None, Some("viewer"), Some("Admin"), Some("")] {
+            let got = call_bytes(&a, "POST", PATH, Some(t), role, minimal_pdf(1)).await;
+            assert_eq!(got.status, 403, "role={role:?}");
+            assert_eq!(got.json(), json!({"error": "forbidden"}));
+        }
+        assert!(a.pdfs.stored.lock().unwrap().is_empty());
+        assert!(pages_of(t).await.is_empty());
+    }
+
+    /// 上限を 1 バイト超えたものは handler の 400、axum の上限 (+1024) を超えたものは 413
+    #[tokio::test]
+    async fn size_limits() {
+        let t = tenant().await;
+        let a = app(FakePdfs::default(), None).await;
+        let got = call_bytes(&a, "POST", PATH, Some(t), ADMIN, big(MAX_PDF_BYTES + 1)).await;
+        assert_eq!(got.status, 400);
+        assert_eq!(got.json(), json!({"error": "pdf_too_large"}));
+        let got = call_bytes(&a, "POST", PATH, Some(t), ADMIN, big(MAX_PDF_BYTES + 2048)).await;
+        assert_eq!(got.status, 413);
+        assert!(a.pdfs.stored.lock().unwrap().is_empty());
+        assert!(pages_of(t).await.is_empty());
+    }
+
+    /// INSERT の失敗は 503 `ingest_failed`。ログは固定の語だけ
+    #[tokio::test]
+    async fn a_failed_insert_is_503_with_a_fixed_log() {
+        let t = tenant().await;
+        let a = app(
+            FakePdfs {
+                drop_tenant_on_put: Some(t),
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        let got = call_bytes(&a, "POST", PATH, Some(t), ADMIN, minimal_pdf(1)).await;
+        assert_eq!(got.status, 503);
+        assert_eq!(got.json(), json!({"error": "ingest_failed"}));
+        assert_eq!(*a.logs.lock().unwrap(), vec!["ingest insert: 23503"]);
+    }
+}

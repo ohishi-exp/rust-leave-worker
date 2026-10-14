@@ -77,7 +77,7 @@ jobs:
           awk '/Running unittests src\/lib\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/leave-test.txt" \
             | grep -Eq '^test result: ok\. 71 passed; 0 failed; 0 ignored'
           awk '/Running tests\/api_db\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/leave-test.txt" \
-            | grep -Eq '^test result: ok\. 66 passed; 0 failed; 0 ignored'
+            | grep -Eq '^test result: ok\. 73 passed; 0 failed; 0 ignored'
           awk '/Running tests\/cron_db\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/leave-test.txt" \
             | grep -Eq '^test result: ok\. 11 passed; 0 failed; 0 ignored'
           # -p を付けないと直下の package (worker) だけが対象になり、報告が空になる

@@ -1,4 +1,5 @@
-//! 取り込みの本体 [`ingest_pdf`] (スキャンの inbox の取り込み [`crate::inbox`] が呼ぶ)。
+//! 取り込みの本体 [`ingest_pdf`]。呼び手は 2 つ: スキャンの inbox の取り込み ([`crate::inbox`]) と、
+//! 管理画面からの取り込みの口 (`POST /leave/uploads`、[`crate::routes`])。
 //!
 //! 流れ: ページ数 ([`count_pages`]) → R2 に put → `tenant_tx` で全ページを INSERT
 //! (R2 の await は transaction の外 = `tenant_tx` は INSERT の 1 回だけ)。
@@ -15,7 +16,8 @@ use crate::pg;
 use crate::routes::LogSink;
 use crate::store::PdfStore;
 
-/// 取り込む PDF (tenant は呼び手が確定済み: auth-worker が検証したチケット)
+/// 取り込む PDF。呼び手は inbox と Web の取り込み口の 2 つ。tenant は呼び手が確定済み
+/// (inbox = auth-worker が検証したチケット / Web = auth-worker が付けたヘッダ)
 pub struct NewPdf {
     pub tenant_id: Uuid,
     /// `%PDF-` で始まり、大きさの上限以内 (呼び手が確かめる)
@@ -37,7 +39,7 @@ pub enum IngestFailure {
     Failed,
 }
 
-/// 取り込みの本体 (Queue の consumer が呼ぶ): ページ数 ([`count_pages`]) → R2 に put → 全ページを INSERT。
+/// 取り込みの本体 (Queue の consumer と Web の取り込み口が呼ぶ): ページ数 ([`count_pages`]) → R2 に put → 全ページを INSERT。
 /// INSERT が失敗しても R2 の object は消さない (key は決定的。前の配送で入った行がその object を指していることがあり、
 /// 再試行は同じ key に put し直すため)。R2 の await は transaction の外 (`tenant_tx` は INSERT の 1 回だけ)
 pub async fn ingest_pdf(
