@@ -1,4 +1,4 @@
-//! 管理 API の口 (18 本、worker が `/api` の下に nest するので実際の path は `/api/leave/…`)。
+//! 管理 API の口 (method ごとに数えて 22 本、worker が `/api` の下に nest するので実際の path は `/api/leave/…`)。
 //!
 //! | method | path | 中身 |
 //! |---|---|---|
@@ -7,8 +7,10 @@
 //! | GET | `/leave/employees` | 一番星の社員を自 tenant の `dept_codes` で絞る |
 //! | GET | `/leave/documents` | PDF 単位の一覧 (`state` = open / done / all・`limit`・`offset`) |
 //! | GET | `/leave/pages` | ページの一覧 (`status`・`employee_cd`・`r2_key`・`limit`・`offset`) |
-//! | GET / PUT | `/leave/pages/{id}` | ページ + 期間 / 紐づけの更新 |
+//! | GET / PUT | `/leave/pages/{id}` | ページ + 期間 / 紐づけの更新 (`ichiban_row_ids` があれば一番星で確かめて保存) |
 //! | GET | `/leave/pages/{id}/pdf` | そのページの PDF (自 tenant に見える行だけ) |
+//! | GET | `/leave/pages/{id}/candidates` | 基準日か受信日の前後 7 日の一番星の休暇の行を期間にまとめる (`ledger`) |
+//! | PUT | `/leave/pages/{id}/base-date` | PDF の基準日 (同じ PDF の全ページ。`null` で受信日に戻す) |
 //! | GET | `/leave/calendar` | 乗務員の月のカレンダー (`ledger`) |
 //! | GET / POST | `/leave/grants` | 有給の付与台帳と残 / 手で付与を足す (`ledger`) |
 //! | POST | `/leave/grants/auto` | 法定付与を足す (`ledger`) |
@@ -49,7 +51,8 @@ use crate::ingest::{check_pdf_bytes, MAX_PDF_BYTES};
 use crate::internal::{ingest_pdf, IngestFailure, NewPdf};
 use crate::ledger;
 use crate::pages::{
-    validate_update, DocumentsQuery, DocumentsQueryRaw, ListQuery, ListQueryRaw, PageUpdateInput,
+    validate_update, BaseDateInput, DocumentsQuery, DocumentsQueryRaw, ListQuery, ListQueryRaw,
+    PageUpdateInput,
 };
 use crate::pg::{self, PutSettings};
 use crate::settings::{validate, Settings, SettingsInput};
@@ -83,7 +86,7 @@ pub fn visible_minutes(raw: Option<&str>) -> Option<i64> {
 }
 
 /// 見えるページの受信の下限 (`None` = 制限なし)
-fn visible_since(state: &LeaveState) -> Option<DateTime<Utc>> {
+pub(crate) fn visible_since(state: &LeaveState) -> Option<DateTime<Utc>> {
     state
         .visible_minutes
         .map(|m| (state.now)() - chrono::Duration::minutes(m))
@@ -112,6 +115,8 @@ pub fn tenant_router() -> Router<LeaveState> {
         .route("/leave/pages", get(list_pages))
         .route("/leave/pages/{id}", get(get_page).put(put_page))
         .route("/leave/pages/{id}/pdf", get(get_pdf))
+        .route("/leave/pages/{id}/candidates", get(ledger::candidates))
+        .route("/leave/pages/{id}/base-date", put(put_base_date))
         .route("/leave/calendar", get(ledger::calendar))
         .route(
             "/leave/grants",
@@ -380,11 +385,17 @@ async fn put_page(
         Ok(u) => u,
         Err(code) => return bad_request(code),
     };
+    // 一番星の行を確かめられなければ何も書かない
+    let link_rows = match ledger::verified_link_rows(&state, t.0, id, &update).await {
+        Ok(rows) => rows,
+        Err(resp) => return resp,
+    };
     let got = pg::update_page(
         &mut *state.pg.lock().await,
         t.0,
         id,
         update,
+        link_rows,
         actor(&headers),
         visible_since(&state),
     )
@@ -393,6 +404,34 @@ async fn put_page(
         Ok(Some(d)) => Json(d).into_response(),
         Ok(None) => not_found(),
         Err(e) => db_error(&state, "put_page", &e),
+    }
+}
+
+/// PDF の基準日を、そのページと同じ PDF の全ページに書く
+async fn put_base_date(
+    State(state): State<LeaveState>,
+    Extension(t): Extension<TenantId>,
+    Path(id): Path<String>,
+    body: Result<Json<BaseDateInput>, JsonRejection>,
+) -> Response {
+    let Some(id) = parse_id(&id) else {
+        return not_found();
+    };
+    let Ok(Json(input)) = body else {
+        return bad_request("invalid_body");
+    };
+    let got = pg::set_base_date(
+        &mut *state.pg.lock().await,
+        t.0,
+        id,
+        input.base_date,
+        visible_since(&state),
+    )
+    .await;
+    match got {
+        Ok(Some(n)) => Json(json!({ "base_date": input.base_date, "updated": n })).into_response(),
+        Ok(None) => not_found(),
+        Err(e) => db_error(&state, "put_base_date", &e),
     }
 }
 

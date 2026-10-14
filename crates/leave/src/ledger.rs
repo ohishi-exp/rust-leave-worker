@@ -8,6 +8,9 @@
 //! | PUT / DELETE | `/leave/grants/{id}` | 付与を直す (source は manual になる) / 消す |
 //! | POST | `/leave/grants/auto?employee_cd=` | 法定付与を計算し、無い付与日だけ足す (manual は上書きしない) |
 //! | GET / PUT | `/leave/opening` | 全員分の期首残 / 一括保存 (両方 null の行は削除) |
+//! | GET | `/leave/pages/{id}/candidates?employee_cd=` | ページの窓 (基準日か受信日の前後 7 日) の一番星の休暇の行を期間にまとめる |
+//!
+//! 紐づけの更新 (`PUT /leave/pages/{id}`) が受け取る一番星の行の確かめ ([`verified_link_rows`]) もここに置く。
 //!
 //! **期首残** (`leave_opening`、1 人 1 行): 期首日 X 時点の残 (繰越・今年度) が在り、残の基準日が X 以降なら、
 //! 付与日 <= X の付与台帳の行を外して (`superseded`) 合成の付与 2 件に置き換え、消化は X の翌日以降だけを数える
@@ -43,14 +46,16 @@ use crate::grants::{
     GrantUpdateInput, NewGrantInput, Opening, OpeningGrants, OpeningPutInput,
 };
 use crate::ichiban::{IchibanApi, EMPLOYEES_PATH};
+use crate::pages::{Page, PageUpdate};
 use crate::pg;
 use crate::reconcile::{
-    calendar_days, days_paths, expand_periods, parse_days, parse_employees, rousai_days, rows_of,
-    yukyu_usages, Employee, IchibanDays,
+    calendar_days, candidate_periods, days_paths, expand_periods, parse_employees, pick_link_rows,
+    push_days, read_day_rows, rousai_days, rows_of, yukyu_usages, Employee, IchibanDays,
+    IchibanRow, LinkRow,
 };
 use crate::routes::{
     bad_request, db_error, error, ichiban_get, ichiban_not_configured, not_found, parse_id,
-    LeaveState,
+    visible_since, LeaveState,
 };
 
 /// 消化をさかのぼる月数 (92 日 × 16 回)
@@ -161,7 +166,25 @@ async fn opening_of(
     Ok(got.map(|o| opening_grants(o, emp.hire_date, emp.retire_date)))
 }
 
-/// 一番星の休暇を `from`〜`to` で取り、`codes` の乗務員だけを正規化する (92 日ごとに呼ぶ)
+/// 一番星の休暇の行を `from`〜`to` で取り、`codes` の乗務員の行だけを返す (92 日ごとに呼ぶ。正規化はしない)
+pub(crate) async fn fetch_rows<'a>(
+    state: &LeaveState,
+    api: &Arc<dyn IchibanApi>,
+    codes: &'a BTreeSet<String>,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Result<Vec<IchibanRow<'a>>, &'static str> {
+    let mut out = Vec::new();
+    for path in days_paths(from, to) {
+        let body = ichiban_get(state, api, &path).await?;
+        out.extend(read_day_rows(&body, codes).inspect_err(|code| {
+            (state.log)(&format!("ichiban {}: {code}", crate::reconcile::DAYS_PATH));
+        })?);
+    }
+    Ok(out)
+}
+
+/// 一番星の休暇を `from`〜`to` で取り、`codes` の乗務員だけを正規化する ([`fetch_rows`])
 pub(crate) async fn fetch_days<'a>(
     state: &LeaveState,
     api: &Arc<dyn IchibanApi>,
@@ -170,13 +193,85 @@ pub(crate) async fn fetch_days<'a>(
     to: NaiveDate,
 ) -> Result<IchibanDays<'a>, &'static str> {
     let mut out = IchibanDays::default();
-    for path in days_paths(from, to) {
-        let body = ichiban_get(state, api, &path).await?;
-        parse_days(&body, codes, &mut out).inspect_err(|code| {
-            (state.log)(&format!("ichiban {}: {code}", crate::reconcile::DAYS_PATH));
-        })?;
-    }
+    push_days(&fetch_rows(state, api, codes, from, to).await?, &mut out);
     Ok(out)
+}
+
+/// 候補を探す窓の幅 (中心の日の前後の日数)
+pub const CANDIDATE_DAYS: i64 = 7;
+
+/// 候補を探す窓 (PDF の基準日、無ければ受信日 (JST) の前後 [`CANDIDATE_DAYS`] 日。両端を含む)
+pub fn candidate_window(page: &Page) -> (NaiveDate, NaiveDate) {
+    let center = page.base_date.unwrap_or_else(|| jst_date(page.received_at));
+    let span = chrono::Duration::days(CANDIDATE_DAYS);
+    (center - span, center + span)
+}
+
+/// ページの窓 ([`candidate_window`]) で、乗務員 `code` の一番星の行を取る (`codes` は `code` 1 つだけの集合)。
+/// ページが自 tenant に見えない・乗務員が自 tenant の部門から外れたら 404、一番星が無ければ 503、一番星の失敗は 502
+async fn page_window_rows<'a>(
+    state: &LeaveState,
+    tenant_id: Uuid,
+    page_id: Uuid,
+    code: &str,
+    codes: &'a BTreeSet<String>,
+) -> Result<Vec<IchibanRow<'a>>, Response> {
+    let got = pg::get_page(
+        &mut *state.pg.lock().await,
+        tenant_id,
+        page_id,
+        visible_since(state),
+    )
+    .await
+    .map_err(|e| db_error(state, "page window", &e))?;
+    let page = got.ok_or_else(not_found)?.page;
+    let api = ichiban_of(state)?;
+    find_employee(state, &api, tenant_id, code).await?;
+    let (from, to) = candidate_window(&page);
+    fetch_rows(state, &api, codes, from, to)
+        .await
+        .map_err(bad_gateway)
+}
+
+/// `GET /leave/pages/{id}/candidates?employee_cd=`: ページの窓の一番星の休暇の行を、続く日ごとの期間にまとめて返す
+pub async fn candidates(
+    State(state): State<LeaveState>,
+    Extension(t): Extension<TenantId>,
+    Path(id): Path<String>,
+    raw: Result<Query<EmployeeQuery>, QueryRejection>,
+) -> Response {
+    respond(candidates_inner(state, t.0, id, raw).await)
+}
+
+async fn candidates_inner(
+    state: LeaveState,
+    tenant_id: Uuid,
+    id: String,
+    raw: Result<Query<EmployeeQuery>, QueryRejection>,
+) -> Result<Response, Response> {
+    let id = parse_id(&id).ok_or_else(not_found)?;
+    let code = employee_cd_of(raw)?.employee_cd.unwrap_or_default();
+    let codes = BTreeSet::from([code.clone()]);
+    let rows = page_window_rows(&state, tenant_id, id, &code, &codes).await?;
+    Ok(Json(json!({ "periods": candidate_periods(&rows, &code) })).into_response())
+}
+
+/// 紐づけの更新で受け取った一番星の行 (`ichiban_row_ids`) を確かめ、保存する中身を返す。
+/// `status = linked` で行が在るときだけ、ページの窓で一番星を引き直す (全部が在り、本文の乗務員の行でなければ 400
+/// `unknown_row`)。それ以外は空で、一番星も部門も見ない
+pub(crate) async fn verified_link_rows(
+    state: &LeaveState,
+    tenant_id: Uuid,
+    page_id: Uuid,
+    u: &PageUpdate,
+) -> Result<Vec<LinkRow>, Response> {
+    if u.status != "linked" || u.ichiban_row_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let code = u.employee_cd.clone().unwrap_or_default();
+    let codes = BTreeSet::from([code.clone()]);
+    let rows = page_window_rows(state, tenant_id, page_id, &code, &codes).await?;
+    pick_link_rows(&rows, &code, &u.ichiban_row_ids).ok_or_else(|| bad_request("unknown_row"))
 }
 
 /// 付与 1 件と、基準日の内訳 (日数)

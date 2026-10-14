@@ -78,6 +78,7 @@ mod forbidden {
         )
         .await;
         assert_eq!(detail.json()["status"], "unlinked");
+        assert_eq!(detail.json()["base_date"], Value::Null);
         let s = call(
             &app(FakePdfs::default(), None).await,
             "GET",
@@ -174,6 +175,27 @@ mod forbidden {
     #[tokio::test]
     async fn get_pdf() {
         assert_forbidden("GET", "/api/leave/pages/{id}/pdf", None).await;
+    }
+
+    #[tokio::test]
+    async fn candidates() {
+        assert_forbidden(
+            "GET",
+            "/api/leave/pages/{id}/candidates?employee_cd=1021",
+            None,
+        )
+        .await;
+    }
+
+    /// 管理者でなければ 403 で、基準日も変わらない
+    #[tokio::test]
+    async fn put_base_date() {
+        assert_forbidden(
+            "PUT",
+            "/api/leave/pages/{id}/base-date",
+            Some(json!({"base_date": "2026-10-20"})),
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1329,13 +1351,23 @@ async fn db_errors_are_500() {
         ("GET", format!("/api/leave/pages/{p}"), None),
         ("PUT", format!("/api/leave/pages/{p}"), Some(link)),
         ("GET", format!("/api/leave/pages/{p}/pdf"), None),
+        (
+            "PUT",
+            format!("/api/leave/pages/{p}/base-date"),
+            Some(json!({"base_date": null})),
+        ),
+        (
+            "GET",
+            format!("/api/leave/pages/{p}/candidates?employee_cd=1"),
+            None,
+        ),
     ] {
         let got = call(&a, method, &uri, Some(t), ADMIN, body).await;
         assert_eq!(got.status, 500, "{method} {uri}");
         assert_eq!(got.json(), json!({"error": "internal_error"}));
     }
     let logs = a.logs.lock().unwrap();
-    assert_eq!(logs.len(), 10);
+    assert_eq!(logs.len(), 12);
     for line in logs.iter() {
         assert!(
             !line.contains(&t.to_string()) && !line.contains(&p.to_string()),
@@ -3137,4 +3169,504 @@ mod uploads {
         assert_eq!(got.json(), json!({"error": "ingest_failed"}));
         assert_eq!(*a.logs.lock().unwrap(), vec!["ingest insert: 23503"]);
     }
+}
+
+// ---- 一番星の候補・紐づけの保存・PDF の基準日 ----
+
+/// 受信 (JST でも同じ日) と、その前後 7 日の窓
+const RECEIVED: &str = "2026-10-01T00:00:00Z";
+const WIN_FROM: &str = "2026-09-24";
+const WIN_TO: &str = "2026-10-08";
+
+fn link_day_rows() -> Vec<Value> {
+    use support::day_row;
+    vec![
+        day_row(
+            "1021",
+            "2026-09-30",
+            "有休",
+            Some("20260930-1"),
+            Some("2026-09-30 08:00:00.000"),
+        ),
+        day_row(
+            "1021",
+            "2026-10-01",
+            " 有休（積置） ",
+            Some("20261001-1"),
+            None,
+        ),
+        day_row("1021", "2026-10-02", "休み", Some("20261002-1"), None),
+        day_row("1021", "2026-10-03", "午前休", Some("20261003-1"), None),
+        day_row("1021", "2026-10-04", "謎", Some("20261004-1"), None),
+        day_row("1021", "2026-10-05", "有休", None, None),
+        day_row("1021", "2026-10-06", "労災", Some("20261006-1"), None),
+        day_row("2001", "2026-10-01", "有休", Some("20261001-2"), None),
+        day_row("1030", "2026-10-01", "有休", Some("20261001-3"), None),
+    ]
+}
+
+/// 社員と、`from`〜`to` の休暇の口 (worker が呼ぶのと同じ path)
+fn link_ichiban(from: &str, to: &str, rows: &[Value]) -> FakeIchiban {
+    let mut f = ichiban_with(&[(EMPLOYEES_PATH, 200, ledger_employees())]);
+    support::add_days(&mut f, from, to, rows);
+    f
+}
+
+async fn link_app(t: Uuid, f: FakeIchiban) -> App {
+    let a = app(FakePdfs::default(), Some(f)).await;
+    assert_eq!(
+        put_settings(&a, t, json!({"dept_codes": ["10"]}))
+            .await
+            .status,
+        200
+    );
+    a
+}
+
+fn ichiban_calls(a: &App) -> Vec<String> {
+    a.ichiban.as_ref().unwrap().calls.lock().unwrap().clone()
+}
+
+#[tokio::test]
+async fn candidates_group_rows_around_the_base_date() {
+    let t = tenant().await;
+    let p = page(t, &format!("{t}/a.pdf"), 1, RECEIVED).await;
+    let a = link_app(t, link_ichiban(WIN_FROM, WIN_TO, &link_day_rows())).await;
+    let uri = format!("/api/leave/pages/{p}/candidates?employee_cd=1021");
+    let got = call(&a, "GET", &uri, Some(t), ADMIN, None).await;
+    assert_eq!(got.status, 200);
+    // 続く日の同じ区分は 1 期間・半日は単日・対象外・表に無い語・row_id 無し・別の乗務員は入れない
+    assert_eq!(
+        got.json(),
+        json!({"periods": [
+            {"kind": "yukyu", "start_date": "2026-09-30", "end_date": "2026-10-01", "half": null, "rows": [
+                {"row_id": "20260930-1", "day": "2026-09-30", "item_name": "有休"},
+                {"row_id": "20261001-1", "day": "2026-10-01", "item_name": " 有休（積置） "}
+            ]},
+            {"kind": "yukyu", "start_date": "2026-10-03", "end_date": "2026-10-03", "half": "am", "rows": [
+                {"row_id": "20261003-1", "day": "2026-10-03", "item_name": "午前休"}
+            ]},
+            {"kind": "rousai", "start_date": "2026-10-06", "end_date": "2026-10-06", "half": null, "rows": [
+                {"row_id": "20261006-1", "day": "2026-10-06", "item_name": "労災"}
+            ]}
+        ]})
+    );
+    // 基準日が無ければ受信日の前後 7 日を 1 回で取る
+    let window = leave::reconcile::days_paths(WIN_FROM.parse().unwrap(), WIN_TO.parse().unwrap());
+    assert_eq!(window.len(), 1);
+    assert_eq!(
+        ichiban_calls(&a),
+        vec![EMPLOYEES_PATH.to_owned(), window[0].clone()]
+    );
+
+    // 基準日を置くと、その前後 7 日 (受信日の窓は呼ばない)
+    let got = call(
+        &a,
+        "PUT",
+        &format!("/api/leave/pages/{p}/base-date"),
+        Some(t),
+        ADMIN,
+        Some(json!({"base_date": "2026-10-20"})),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    let b = app(
+        FakePdfs::default(),
+        Some(link_ichiban(
+            "2026-10-13",
+            "2026-10-27",
+            &[support::day_row(
+                "1021",
+                "2026-10-20",
+                "欠勤",
+                Some("20261020-1"),
+                None,
+            )],
+        )),
+    )
+    .await;
+    let got = call(&b, "GET", &uri, Some(t), ADMIN, None).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(
+        got.json(),
+        json!({"periods": [
+            {"kind": "kekkin", "start_date": "2026-10-20", "end_date": "2026-10-20", "half": null, "rows": [
+                {"row_id": "20261020-1", "day": "2026-10-20", "item_name": "欠勤"}
+            ]}
+        ]})
+    );
+}
+
+#[tokio::test]
+async fn candidates_reject_and_need_ichiban() {
+    let (t, other) = (tenant().await, tenant().await);
+    let p = page(t, &format!("{t}/a.pdf"), 1, RECEIVED).await;
+    let po = page(other, &format!("{other}/a.pdf"), 1, RECEIVED).await;
+    let a = link_app(t, link_ichiban(WIN_FROM, WIN_TO, &link_day_rows())).await;
+    let uri = |id: &str, q: &str| format!("/api/leave/pages/{id}/candidates{q}");
+    for (u, status, code) in [
+        // 他部門の乗務員・見えないページ・UUID でない id
+        (uri(&p.to_string(), "?employee_cd=2001"), 404, "not_found"),
+        (uri(&po.to_string(), "?employee_cd=1021"), 404, "not_found"),
+        (
+            uri(&Uuid::new_v4().to_string(), "?employee_cd=1021"),
+            404,
+            "not_found",
+        ),
+        (uri("x", "?employee_cd=1021"), 404, "not_found"),
+        (uri(&p.to_string(), ""), 400, "invalid_employee_cd"),
+    ] {
+        let got = call(&a, "GET", &u, Some(t), ADMIN, None).await;
+        assert_eq!(
+            (got.status, got.json()),
+            (status, json!({"error": code})),
+            "{u}"
+        );
+    }
+    let ok = uri(&p.to_string(), "?employee_cd=1021");
+    // 一番星の binding が無い環境 (staging) では 503
+    let none = app(FakePdfs::default(), None).await;
+    let got = call(&none, "GET", &ok, Some(t), ADMIN, None).await;
+    assert_eq!(
+        (got.status, got.json()),
+        (503, json!({"error": "ichiban_not_configured"}))
+    );
+    // 一番星の失敗は 502 (休暇の口が無い・非 2xx・形が違う)
+    let path =
+        leave::reconcile::days_paths(WIN_FROM.parse().unwrap(), WIN_TO.parse().unwrap()).remove(0);
+    let with_days = |status: u16, body: Value| {
+        ichiban_with(&[
+            (EMPLOYEES_PATH, 200, ledger_employees()),
+            (path.as_str(), status, body),
+        ])
+    };
+    for (fake, code) in [
+        (
+            ichiban_with(&[(EMPLOYEES_PATH, 200, ledger_employees())]),
+            "ichiban_unavailable",
+        ),
+        (with_days(500, json!({})), "ichiban_upstream"),
+        (with_days(200, json!([])), "ichiban_bad_response"),
+    ] {
+        let b = app(FakePdfs::default(), Some(fake)).await;
+        let got = call(&b, "GET", &ok, Some(t), ADMIN, None).await;
+        assert_eq!((got.status, got.json()), (502, json!({"error": code})));
+        for line in b.logs.lock().unwrap().iter() {
+            assert!(
+                !line.contains(&t.to_string()) && !line.contains(&p.to_string()),
+                "{line}"
+            );
+        }
+    }
+}
+
+async fn put_base(a: &App, t: Uuid, id: &str, body: Value) -> support::Got {
+    call(
+        a,
+        "PUT",
+        &format!("/api/leave/pages/{id}/base-date"),
+        Some(t),
+        ADMIN,
+        Some(body),
+    )
+    .await
+}
+
+async fn base_of(a: &App, t: Uuid, id: Uuid) -> Value {
+    call(
+        a,
+        "GET",
+        &format!("/api/leave/pages/{id}"),
+        Some(t),
+        ADMIN,
+        None,
+    )
+    .await
+    .json()["base_date"]
+        .clone()
+}
+
+#[tokio::test]
+async fn base_date_is_set_for_the_whole_pdf() {
+    let (t, other) = (tenant().await, tenant().await);
+    let key = format!("{t}/a.pdf");
+    let p1 = page(t, &key, 1, RECEIVED).await;
+    let p2 = page(t, &key, 2, RECEIVED).await;
+    let p3 = page(t, &format!("{t}/b.pdf"), 1, RECEIVED).await;
+    let po = page(other, &format!("{other}/a.pdf"), 1, RECEIVED).await;
+    let a = app(FakePdfs::default(), None).await;
+    let got = put_base(&a, t, &p2.to_string(), json!({"base_date": "2026-10-20"})).await;
+    assert_eq!(
+        (got.status, got.json()),
+        (200, json!({"base_date": "2026-10-20", "updated": 2}))
+    );
+    assert_eq!(base_of(&a, t, p1).await, "2026-10-20");
+    assert_eq!(base_of(&a, t, p2).await, "2026-10-20");
+    // 別の PDF は変わらない
+    assert_eq!(base_of(&a, t, p3).await, Value::Null);
+    let list = call(
+        &a,
+        "GET",
+        &format!("/api/leave/pages?r2_key={key}"),
+        Some(t),
+        ADMIN,
+        None,
+    )
+    .await
+    .json();
+    assert_eq!(list["data"].as_array().unwrap().len(), 2);
+    assert!(list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|p| p["base_date"] == "2026-10-20"));
+    // null で受信日に戻す
+    let got = put_base(&a, t, &p1.to_string(), json!({"base_date": null})).await;
+    assert_eq!(
+        (got.status, got.json()),
+        (200, json!({"base_date": null, "updated": 2}))
+    );
+    assert_eq!(base_of(&a, t, p2).await, Value::Null);
+    // 他 tenant のページ・UUID でない id・壊れた本文
+    for (id, body, status, code) in [
+        (
+            po.to_string(),
+            json!({"base_date": "2026-10-20"}),
+            404,
+            "not_found",
+        ),
+        (
+            "x".to_owned(),
+            json!({"base_date": "2026-10-20"}),
+            404,
+            "not_found",
+        ),
+        (
+            p1.to_string(),
+            json!({"base_date": "10/20"}),
+            400,
+            "invalid_body",
+        ),
+        (
+            p1.to_string(),
+            json!({"base_date": null, "x": 1}),
+            400,
+            "invalid_body",
+        ),
+    ] {
+        let got = put_base(&a, t, &id, body).await;
+        assert_eq!(
+            (got.status, got.json()),
+            (status, json!({"error": code})),
+            "{id}"
+        );
+    }
+    assert_eq!(base_of(&a, other, po).await, Value::Null);
+    assert_eq!(base_of(&a, t, p1).await, Value::Null);
+
+    // staging の表示制限の外のページは 404 (中のページは書ける)
+    let fresh = page(t, &format!("{t}/c.pdf"), 1, "2026-10-09T23:55:00Z").await;
+    let s = support::app_with_visible_minutes(FakePdfs::default(), "10").await;
+    for (id, status) in [(p1, 404), (fresh, 200)] {
+        let got = put_base(&s, t, &id.to_string(), json!({"base_date": "2026-10-20"})).await;
+        assert_eq!(got.status, status);
+    }
+    assert_eq!(base_of(&a, t, p1).await, Value::Null);
+    assert_eq!(base_of(&a, t, fresh).await, "2026-10-20");
+}
+
+fn link_body(employee_cd: &str, kind: &str, ids: Value) -> Value {
+    json!({"employee_cd": employee_cd, "status": "linked",
+           "periods": [{"kind": kind, "start_date": "2026-09-30", "end_date": "2026-10-01"}],
+           "ichiban_row_ids": ids})
+}
+
+fn saved(
+    id: &str,
+    day: &str,
+    item: &str,
+    lu: Option<&str>,
+) -> (String, String, String, String, Option<String>) {
+    (
+        id.to_owned(),
+        "1021".to_owned(),
+        day.to_owned(),
+        item.to_owned(),
+        lu.map(str::to_owned),
+    )
+}
+
+#[tokio::test]
+async fn link_page_saves_ichiban_rows() {
+    let t = tenant().await;
+    let p = page(t, &format!("{t}/a.pdf"), 1, RECEIVED).await;
+    let a = link_app(t, link_ichiban(WIN_FROM, WIN_TO, &link_day_rows())).await;
+    let uri = format!("/api/leave/pages/{p}");
+
+    // 一番星の生の値 (品名・最終更新) で入る (同じ row_id は 1 つ)
+    let ids = json!(["20261001-1", "20260930-1", "20261001-1"]);
+    let got = call(
+        &a,
+        "PUT",
+        &uri,
+        Some(t),
+        ADMIN,
+        Some(link_body("1021", "yukyu", ids)),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json()["status"], "linked");
+    assert_eq!(
+        support::link_rows_of(p).await,
+        vec![
+            saved(
+                "20260930-1",
+                "2026-09-30",
+                "有休",
+                Some("2026-09-30 08:00:00.000")
+            ),
+            saved("20261001-1", "2026-10-01", " 有休（積置） ", None)
+        ]
+    );
+    // 2 回目は置き換え
+    let ids = json!(["20261003-1"]);
+    let got = call(
+        &a,
+        "PUT",
+        &uri,
+        Some(t),
+        ADMIN,
+        Some(link_body("1021", "yukyu", ids)),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(
+        support::link_rows_of(p).await,
+        vec![saved("20261003-1", "2026-10-03", "午前休", None)]
+    );
+    // 行の指定が無い紐づけは手入力の期間だけ (一番星も部門も見ない。行は消える)
+    let before = ichiban_calls(&a).len();
+    let got = call(
+        &a,
+        "PUT",
+        &uri,
+        Some(t),
+        ADMIN,
+        Some(link_body("1021", "yukyu", json!([]))),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert!(support::link_rows_of(p).await.is_empty());
+    assert_eq!(ichiban_calls(&a).len(), before);
+    // linked 以外になれば行は消える (指定があっても一番星は呼ばない)
+    let ids = json!(["20261006-1"]);
+    let got = call(
+        &a,
+        "PUT",
+        &uri,
+        Some(t),
+        ADMIN,
+        Some(link_body("1021", "rousai", ids)),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(support::link_rows_of(p).await.len(), 1);
+    let before = ichiban_calls(&a).len();
+    let body = json!({"status": "ignored", "ichiban_row_ids": ["20261006-1"]});
+    let got = call(&a, "PUT", &uri, Some(t), ADMIN, Some(body)).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json()["status"], "ignored");
+    assert!(support::link_rows_of(p).await.is_empty());
+    assert_eq!(ichiban_calls(&a).len(), before);
+}
+
+#[tokio::test]
+async fn link_page_rejects_unknown_rows_without_writing() {
+    let t = tenant().await;
+    let p = page(t, &format!("{t}/a.pdf"), 1, RECEIVED).await;
+    let a = link_app(t, link_ichiban(WIN_FROM, WIN_TO, &link_day_rows())).await;
+    let uri = format!("/api/leave/pages/{p}");
+    let ids = json!(["20260930-1"]);
+    let got = call(
+        &a,
+        "PUT",
+        &uri,
+        Some(t),
+        ADMIN,
+        Some(link_body("1021", "yukyu", ids)),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    let page_before = call(&a, "GET", &uri, Some(t), ADMIN, None).await.json();
+    let rows_before = support::link_rows_of(p).await;
+    assert_eq!(rows_before.len(), 1);
+
+    let mut cases: Vec<(Value, u16, &str)> = vec![
+        // 無い row_id・別の乗務員 (他部門 / 同じ部門) の row_id
+        (
+            link_body("1021", "kekkin", json!(["nope"])),
+            400,
+            "unknown_row",
+        ),
+        (
+            link_body("1021", "kekkin", json!(["20260930-1", "20261001-2"])),
+            400,
+            "unknown_row",
+        ),
+        (
+            link_body("1021", "kekkin", json!(["20261001-3"])),
+            400,
+            "unknown_row",
+        ),
+        // 本文の乗務員が自 tenant の部門の外
+        (
+            link_body("2001", "kekkin", json!(["20261001-2"])),
+            404,
+            "not_found",
+        ),
+    ];
+    cases.push((
+        link_body("1021", "kekkin", json!(["1".repeat(33)])),
+        400,
+        "invalid_row_id",
+    ));
+    for (body, status, code) in cases {
+        let got = call(&a, "PUT", &uri, Some(t), ADMIN, Some(body.clone())).await;
+        assert_eq!(
+            (got.status, got.json()),
+            (status, json!({"error": code})),
+            "{body}"
+        );
+    }
+    // 見えないページは 404
+    let got = call(
+        &a,
+        "PUT",
+        &format!("/api/leave/pages/{}", Uuid::new_v4()),
+        Some(t),
+        ADMIN,
+        Some(link_body("1021", "kekkin", json!(["20260930-1"]))),
+    )
+    .await;
+    assert_eq!(got.status, 404);
+    // 一番星の失敗は 502・無い環境は 503
+    for (fake, status, code) in [
+        (
+            Some(ichiban_with(&[(EMPLOYEES_PATH, 200, ledger_employees())])),
+            502,
+            "ichiban_unavailable",
+        ),
+        (None, 503, "ichiban_not_configured"),
+    ] {
+        let b = app(FakePdfs::default(), fake).await;
+        let body = link_body("1021", "kekkin", json!(["20260930-1"]));
+        let got = call(&b, "PUT", &uri, Some(t), ADMIN, Some(body)).await;
+        assert_eq!((got.status, got.json()), (status, json!({"error": code})));
+    }
+    // どれもページも行も変えない (fail-closed)
+    assert_eq!(
+        call(&a, "GET", &uri, Some(t), ADMIN, None).await.json(),
+        page_before
+    );
+    assert_eq!(support::link_rows_of(p).await, rows_before);
 }

@@ -21,6 +21,9 @@ pub const MAX_R2_KEY_LEN: usize = 512;
 /// `GET /api/leave/documents` の `state` の値 (open = 未紐づけのページが 1 つでも在る PDF / done = 無い PDF)
 pub const DOCUMENT_STATES: [&str; 3] = ["open", "done", "all"];
 pub const MAX_NOTE_CHARS: usize = 2000;
+/// 1 ページに結べる一番星の行の数と、行 ID 1 つの長さ (バイト) の上限
+pub const MAX_ICHIBAN_ROWS: usize = 200;
+pub const MAX_ROW_ID_LEN: usize = 32;
 
 /// ページ 1 行 (応答の形)
 #[derive(Serialize, Debug, Clone, PartialEq)]
@@ -37,6 +40,8 @@ pub struct Page {
     pub linked_at: Option<DateTime<Utc>>,
     pub note: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// PDF の基準日 (同じ `r2_key` のページで同じ値。`None` は受信日を使う)
+    pub base_date: Option<NaiveDate>,
 }
 
 impl TxOutput for Page {}
@@ -193,6 +198,9 @@ pub struct PageUpdateInput {
     pub note: Option<String>,
     #[serde(default)]
     pub periods: Vec<PeriodInput>,
+    /// 紐づける一番星の行 (`row_id`)。`status = linked` のときだけ使う
+    #[serde(default)]
+    pub ichiban_row_ids: Vec<String>,
 }
 
 /// 検証済みの更新 (DB へ書く値)
@@ -202,6 +210,15 @@ pub struct PageUpdate {
     pub status: String,
     pub note: Option<String>,
     pub periods: Vec<Period>,
+    /// 重複を除いて並べたもの
+    pub ichiban_row_ids: Vec<String>,
+}
+
+/// `PUT /api/leave/pages/{id}/base-date` の本文 (`null` で受信日に戻す)
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct BaseDateInput {
+    pub base_date: Option<NaiveDate>,
 }
 
 /// 期間 1 行の検証: 区分・半日の値・逆順・半日は単日だけ
@@ -251,6 +268,19 @@ pub fn validate_update(input: PageUpdateInput) -> Result<PageUpdate, &'static st
     if input.periods.len() > MAX_PERIODS {
         return Err("too_many_periods");
     }
+    if input.ichiban_row_ids.len() > MAX_ICHIBAN_ROWS {
+        return Err("too_many_rows");
+    }
+    if input
+        .ichiban_row_ids
+        .iter()
+        .any(|r| r.is_empty() || r.len() > MAX_ROW_ID_LEN)
+    {
+        return Err("invalid_row_id");
+    }
+    let mut ichiban_row_ids = input.ichiban_row_ids;
+    ichiban_row_ids.sort();
+    ichiban_row_ids.dedup();
     let periods = input
         .periods
         .into_iter()
@@ -269,6 +299,7 @@ pub fn validate_update(input: PageUpdateInput) -> Result<PageUpdate, &'static st
         status: input.status,
         note,
         periods,
+        ichiban_row_ids,
     })
 }
 
@@ -295,6 +326,7 @@ mod tests {
             status: status.into(),
             note: None,
             periods,
+            ichiban_row_ids: Vec::new(),
         }
     }
 
@@ -389,6 +421,40 @@ mod tests {
             )),
             Err("period_end_before_start")
         );
+    }
+
+    #[test]
+    fn row_ids_are_limited_and_deduplicated() {
+        let with = |ids: Vec<String>| {
+            let mut u = update(
+                "linked",
+                Some("1021"),
+                vec![period("yukyu", "2026-10-01", "2026-10-01", None)],
+            );
+            u.ichiban_row_ids = ids;
+            validate_update(u)
+        };
+        let ok = with(vec!["b".into(), "a".into(), "b".into()]).unwrap();
+        assert_eq!(ok.ichiban_row_ids, vec!["a", "b"]);
+        assert_eq!(
+            with(vec!["a".into(); MAX_ICHIBAN_ROWS + 1]),
+            Err("too_many_rows")
+        );
+        assert_eq!(with(vec![String::new()]), Err("invalid_row_id"));
+        assert_eq!(
+            with(vec!["1".repeat(MAX_ROW_ID_LEN + 1)]),
+            Err("invalid_row_id")
+        );
+        assert!(with(vec!["1".repeat(MAX_ROW_ID_LEN)]).is_ok());
+    }
+
+    #[test]
+    fn base_date_body() {
+        let b: BaseDateInput = serde_json::from_str(r#"{"base_date":"2026-10-01"}"#).unwrap();
+        assert_eq!(b.base_date, Some(d("2026-10-01")));
+        let b: BaseDateInput = serde_json::from_str(r#"{"base_date":null}"#).unwrap();
+        assert_eq!(b.base_date, None);
+        assert!(serde_json::from_str::<BaseDateInput>(r#"{"base_date":null,"x":1}"#).is_err());
     }
 
     #[test]

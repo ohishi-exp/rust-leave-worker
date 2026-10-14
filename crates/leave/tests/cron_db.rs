@@ -703,3 +703,198 @@ async fn broken_db_is_reported() {
     );
     assert!(s.tenants.is_empty());
 }
+
+// ---- 紐づけた一番星の行の毎朝の比べ ----
+
+/// 紐づけ済みのページ (`yukyu` の 1 日) と、そのとき保存した一番星の行 1 つ (superuser で直接入れる)
+async fn linked_with_row(
+    t: Uuid,
+    emp: &str,
+    day: &str,
+    (row_id, item, last_updated): (&str, &str, Option<&str>),
+) -> Uuid {
+    let p = page_with(t, emp, "linked", &[("yukyu", day, day, None)]).await;
+    let d: NaiveDate = day.parse().unwrap();
+    let su = admin().await;
+    su.execute(
+        "UPDATE alc_api.leave_pages SET linked_by = 'admin@example.com', linked_at = now(), note = 'メモ' WHERE id = $1",
+        &[&p],
+    )
+    .await
+    .unwrap();
+    su.execute(
+        "INSERT INTO alc_api.leave_link_rows (tenant_id, page_id, row_id, employee_cd, day, item_name, last_updated) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        &[&t, &p, &row_id, &emp, &d, &item, &last_updated],
+    )
+    .await
+    .unwrap();
+    p
+}
+
+/// ページの (状態, 乗務員, 備考, linked_by が在るか, linked_at が在るか, 期間の数, 保存した行の数)
+async fn page_state(p: Uuid) -> (String, Option<String>, Option<String>, bool, bool, i64, i64) {
+    let r = admin()
+        .await
+        .query_one(
+            "SELECT status, employee_cd, note, linked_by IS NOT NULL, linked_at IS NOT NULL, \
+             (SELECT count(*) FROM alc_api.leave_periods WHERE page_id = $1), \
+             (SELECT count(*) FROM alc_api.leave_link_rows WHERE page_id = $1) \
+             FROM alc_api.leave_pages WHERE id = $1",
+            &[&p],
+        )
+        .await
+        .unwrap();
+    (
+        r.get(0),
+        r.get(1),
+        r.get(2),
+        r.get(3),
+        r.get(4),
+        r.get(5),
+        r.get(6),
+    )
+}
+
+fn still_linked(emp: &str) -> (String, Option<String>, Option<String>, bool, bool, i64, i64) {
+    (
+        "linked".into(),
+        Some(emp.into()),
+        Some("メモ".into()),
+        true,
+        true,
+        1,
+        1,
+    )
+}
+
+fn unlinked(emp: &str) -> (String, Option<String>, Option<String>, bool, bool, i64, i64) {
+    (
+        "unlinked".into(),
+        Some(emp.into()),
+        Some("メモ".into()),
+        false,
+        false,
+        0,
+        0,
+    )
+}
+
+#[tokio::test]
+async fn changed_ichiban_rows_unlink_pages() {
+    let _g = serial().await;
+    let (t, ch) = enabled_tenant("10", true).await;
+    use support::day_row;
+    let f = ichiban(
+        vec![
+            employee("1021", "山田太郎", "10", None),
+            employee("2001", "他部門", "20", None),
+        ],
+        &[
+            day_row("1021", "2026-09-01", "有休", Some("a"), Some("t1")),
+            day_row("1021", "2026-09-02", "有休", Some("b"), Some("t2")),
+            day_row("1021", "2026-09-03", "午前休", Some("c"), None),
+            day_row("1021", "2026-09-04", "有休", Some("d"), Some("t9")),
+        ],
+    );
+    // 最終更新が同じ → 残す
+    let pa = linked_with_row(t, "1021", "2026-09-01", ("a", "有休", Some("t1"))).await;
+    // 最終更新が変わった → 外す
+    let pb = linked_with_row(t, "1021", "2026-09-02", ("b", "有休", Some("t1"))).await;
+    // 最終更新が NULL で品名が変わった → 外す
+    let pc = linked_with_row(t, "1021", "2026-09-03", ("c", "有休", None)).await;
+    // 最終更新が NULL で中身が同じ → 残す (一番星の側に最終更新が付いても)
+    let pd = linked_with_row(t, "1021", "2026-09-04", ("d", "有休", None)).await;
+    // 行が消えた → 外す
+    let pe = linked_with_row(t, "1021", "2026-09-05", ("e", "有休", None)).await;
+    // 窓の外の行は比べない
+    let pf = linked_with_row(t, "1021", "2026-08-01", ("f", "有休", None)).await;
+    // 部門から外れた乗務員の行は比べない
+    let pg = linked_with_row(t, "2001", "2026-09-06", ("g", "有休", None)).await;
+
+    let n = FakeNotifier::default();
+    let s = run_once(&f, &n).await;
+    let r = &s.tenants[0];
+    assert_eq!((r.unlinked, r.failed.as_deref()), (3, None));
+    assert!(s.line().contains("#1 unlinked=3 mismatches=2"));
+    for p in [pa, pd, pf] {
+        assert_eq!(page_state(p).await, still_linked("1021"), "{p}");
+    }
+    assert_eq!(page_state(pg).await, still_linked("2001"));
+    for p in [pb, pc, pe] {
+        assert_eq!(page_state(p).await, unlinked("1021"), "{p}");
+    }
+    // 外したページは突き合わせに入らない (一番星だけに在る 2 日がずれになる)
+    assert_eq!(
+        alerts(t).await,
+        vec![
+            a("1021", "2026-09-02", "yukyu", "ichiban_only", true, false),
+            a("1021", "2026-09-03", "yukyu", "ichiban_only", true, false)
+        ]
+    );
+    let sent = n.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].0, NotifyTarget::Channel(ch.unwrap()));
+    assert!(sent[0].1.starts_with(
+        "【勤怠申請】一番星と申請書のずれ 2 件\n一番星が変わったため紐づけを解除: 3 件\n1021 山田太郎: 09/02"
+    ));
+    // 行・品名の値は文面にもログにも出さない
+    assert!(!sent[0].1.contains("t1") && !s.line().contains("t1"));
+}
+
+#[tokio::test]
+async fn unlinking_alone_sends_one_message() {
+    let _g = serial().await;
+    let (t, _) = enabled_tenant("10", true).await;
+    // 有休が「休み」に直された (区分の対象外になったので、ずれも出ない)
+    let f = ichiban(
+        vec![employee("1021", "山田太郎", "10", None)],
+        &[support::day_row(
+            "1021",
+            "2026-09-02",
+            "休み",
+            Some("b"),
+            Some("t1"),
+        )],
+    );
+    let p = linked_with_row(t, "1021", "2026-09-02", ("b", "有休", Some("t1"))).await;
+    let n = FakeNotifier::default();
+    let s = run_once(&f, &n).await;
+    let r = &s.tenants[0];
+    assert_eq!(
+        (r.unlinked, r.mismatches, r.sent_messages, r.notified),
+        (1, 0, 1, 0)
+    );
+    assert_eq!(page_state(p).await, unlinked("1021"));
+    assert!(alerts(t).await.is_empty());
+    assert_eq!(
+        n.sent.lock().unwrap()[0].1,
+        "【勤怠申請】一番星が変わったため紐づけを解除: 1 件"
+    );
+}
+
+#[tokio::test]
+async fn failed_ichiban_runs_do_not_unlink() {
+    let _g = serial().await;
+    let (t, _) = enabled_tenant("10", true).await;
+    let p = linked_with_row(t, "1021", "2026-09-02", ("b", "有休", Some("t1"))).await;
+    let n = FakeNotifier::default();
+    // 一番星の取得の失敗 (tenant に入る前に止まる)
+    let s = run_once(&ichiban_with(&[]), &n).await;
+    assert_eq!(s.failed.as_deref(), Some("ichiban_unavailable"));
+    assert_eq!(page_state(p).await, still_linked("1021"));
+    // tenant の社員の読みの失敗
+    let bad = ichiban(
+        vec![json!({"employee_code": "9901", "dept_code": "10", "hire_date": "x"})],
+        &[],
+    );
+    let s = run_once(&bad, &n).await;
+    assert_eq!(s.tenants[0].failed.as_deref(), Some("ichiban_bad_response"));
+    assert_eq!(page_state(p).await, still_linked("1021"));
+    assert!(n.sent.lock().unwrap().is_empty());
+    // 取れた回は外す (同じ行が一番星から消えている)
+    let ok = ichiban(vec![employee("1021", "山田太郎", "10", None)], &[]);
+    let s = run_once(&ok, &n).await;
+    assert_eq!(s.tenants[0].unlinked, 1);
+    assert_eq!(page_state(p).await, unlinked("1021"));
+}

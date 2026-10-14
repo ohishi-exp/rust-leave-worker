@@ -2,6 +2,9 @@
 //!
 //! 有効な tenant ([`pg::enabled_tenants`]) ごとに:
 //! 1. 一番星の社員を tenant の `dept_codes` で絞る。休暇は「今日 − 62 日 〜 今日 − 1 日」を 1 回だけ取り、乗務員で絞って正規化する
+//!    紐づけたときに保存した一番星の行 (`leave_link_rows`、日が窓の中のもの) を今の行と比べ、消えた・変わった行を持つ
+//!    ページの紐づけを外す (`reconcile::stale_pages`。乗務員が部門から外れた行は比べない。一番星の取得に失敗した回は
+//!    ここまで来ないので外さない)。外した件数は通知の 1 通目に載せる
 //! 2. 紐づけ済みの期間を同じ窓で日ごとに展開する
 //! 3. (乗務員, 日, 区分) の差を取る (`今日 − grace_days` より後の日は待つ)
 //! 4. `leave_alerts` に書き、窓の中で今回ずれていない未解決の行を解決にする
@@ -23,7 +26,8 @@ use crate::grants::statutory;
 use crate::ichiban::{IchibanApi, EMPLOYEES_PATH};
 use crate::pg;
 use crate::reconcile::{
-    days_paths, diff, expand_periods, messages, parse_days, parse_employees, IchibanDays,
+    days_paths, diff, expand_periods, messages, parse_employees, push_days, read_day_rows,
+    stale_pages, IchibanDays,
 };
 
 /// 窓の長さ (今日 − 62 日 〜 今日 − 1 日)
@@ -99,6 +103,8 @@ pub struct TenantResult {
     pub sent_messages: usize,
     pub notified: u64,
     pub grants: u64,
+    /// 一番星の行が消えた・変わったので紐づけを外したページの数
+    pub unlinked: u64,
     /// 失敗した段 (途中で止まった)
     pub failed: Option<String>,
 }
@@ -122,8 +128,9 @@ impl Summary {
             .map(|(i, t)| match &t.failed {
                 Some(stage) => format!("#{} failed={stage}", i + 1),
                 None => format!(
-                    "#{} mismatches={} upserted={} resolved={} pending={} sent={} notified={} grants={}",
+                    "#{} unlinked={} mismatches={} upserted={} resolved={} pending={} sent={} notified={} grants={}",
                     i + 1,
+                    t.unlinked,
                     t.mismatches,
                     t.upserted,
                     t.resolved,
@@ -239,12 +246,24 @@ async fn run_tenant(
 ) -> Result<(), String> {
     let employees = parse_employees(employees_body, &t.dept_codes).map_err(str::to_owned)?;
     let codes: BTreeSet<String> = employees.iter().map(|e| e.employee_code.clone()).collect();
-    let mut days = IchibanDays::default();
+    // 本文は 1 回だけ読み、正規化した日 (突き合わせ) と生の行 (紐づけの比べ) の両方に使う
+    let mut rows = Vec::new();
     for body in day_bodies {
-        parse_days(body, &codes, &mut days).map_err(str::to_owned)?;
+        rows.extend(read_day_rows(body, &codes).map_err(str::to_owned)?);
     }
+    let mut days = IchibanDays::default();
+    push_days(&rows, &mut days);
     for (w, n) in &days.unknown {
         *unknown.entry(w.clone()).or_default() += n;
+    }
+    // 一番星の行が消えた・変わったページの紐づけを外す (1 ページ 1 transaction)。外したページは下の突き合わせに入らない
+    let saved = pg::link_rows(pg, t.tenant_id, from, to)
+        .await
+        .map_err(|e| db_stage("link_rows", &e))?;
+    for page in stale_pages(&saved, &rows, &codes) {
+        result.unlinked += pg::unlink_page(pg, t.tenant_id, page)
+            .await
+            .map_err(|e| db_stage("unlink_page", &e))?;
     }
     let periods = pg::linked_periods(pg, t.tenant_id, None, from, to)
         .await
@@ -272,7 +291,7 @@ async fn run_tenant(
             .filter_map(|e| Some((e.employee_code.clone(), e.employee_name.clone()?)))
             .collect();
         let mut sent = Vec::new();
-        for m in messages(&pending, &names) {
+        for m in messages(&pending, &names, result.unlinked) {
             if notifier.send(target, &m.text).await.is_ok() {
                 result.sent_messages += 1;
                 sent.extend(m.alerts.iter().map(|&i| pending[i].id));
@@ -315,6 +334,7 @@ mod tests {
                     sent_messages: 1,
                     notified: 2,
                     grants: 3,
+                    unlinked: 1,
                     ..Default::default()
                 },
                 TenantResult {
@@ -325,7 +345,7 @@ mod tests {
             unknown: BTreeMap::from([("謎".to_owned(), 2)]),
             failed: None,
         };
-        assert_eq!(s.line(), "cron: tenants=2 [#1 mismatches=2 upserted=2 resolved=0 pending=2 sent=1 notified=2 grants=3; #2 failed=record_alerts:08006] unknown_items=2 [\"謎\"x2]");
+        assert_eq!(s.line(), "cron: tenants=2 [#1 unlinked=1 mismatches=2 upserted=2 resolved=0 pending=2 sent=1 notified=2 grants=3; #2 failed=record_alerts:08006] unknown_items=2 [\"謎\"x2]");
         let f = Summary {
             failed: Some("ichiban_unavailable".into()),
             ..Default::default()
