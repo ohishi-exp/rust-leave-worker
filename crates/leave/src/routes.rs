@@ -17,7 +17,7 @@
 //! | PUT / DELETE | `/leave/grants/{id}` | 付与を直す / 消す (`ledger`) |
 //! | GET / PUT | `/leave/opening` | 全員分の有給の期首残 / 一括保存 (`ledger`) |
 //! | GET | `/leave/ledger` | 全員分の有給の年度 (4 月始まり) の一覧 (`as_of` の省略は今日。`ledger`) |
-//! | GET | `/leave/alerts` | 未解消の警告 (毎朝の通知と同じ条件・同じ窓。乗務員・日の順) |
+//! | GET | `/leave/alerts` | 未解消の警告 (毎朝の通知と同じ条件・同じ窓。乗務員・日の順) と窓 (`from` / `to`、YYYY-MM-DD) |
 //! | POST | `/leave/uploads` | 管理画面からの PDF の取り込み (本文 = PDF そのもの。毎回別の行。201 `{"pages": n}`) |
 //! | POST | `/leave/settings/test-notify` | 保存済みの通知先へ固定の文面を 1 通送る (毎朝の cron と同じ宛先・同じ送信) |
 //!
@@ -47,6 +47,7 @@ use uuid::Uuid;
 
 use crate::auth::{actor, require_admin};
 use crate::cron::{window, Notifier};
+use crate::holidays::HolidaysApi;
 use crate::ichiban::{filter_employees, IchibanApi, DEPARTMENTS_PATH, EMPLOYEES_PATH};
 use crate::ingest::{check_pdf_bytes, MAX_PDF_BYTES};
 use crate::internal::{ingest_pdf, IngestFailure, NewPdf};
@@ -71,6 +72,8 @@ pub struct LeaveState {
     pub pdfs: Arc<dyn PdfStore>,
     /// 一番星 Worker の binding。無い環境 (staging) では `None` で、部門・社員の口は 503
     pub ichiban: Option<Arc<dyn IchibanApi>>,
+    /// 日本の祝日の口 (カレンダーで労災の紐づけを延ばすとき、日曜と同じく飛ばす日)
+    pub holidays: Arc<dyn HolidaysApi>,
     /// LINE WORKS への送信 (cron と同じもの)。テスト送信の口だけが使う。
     /// 送れない環境 (staging など) では [`Notifier::available`] が `false` で、その口は 503
     pub notifier: Arc<dyn Notifier>,
@@ -349,7 +352,9 @@ async fn list_alerts(
     let range = window(ledger::jst_date((state.now)()));
     let got = pg::open_alerts(&mut *state.pg.lock().await, t.0, range).await;
     match got {
-        Ok(alerts) => Json(json!({ "alerts": alerts })).into_response(),
+        Ok(alerts) => {
+            Json(json!({ "alerts": alerts, "from": range.0, "to": range.1 })).into_response()
+        }
         Err(e) => db_error(&state, "list_alerts", &e),
     }
 }

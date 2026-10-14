@@ -25,6 +25,10 @@ path = "crates/leave/src/pages.rs"
 [[files]]
 path = "crates/leave/src/ichiban.rs"
 
+# 日本の祝日の応答の解釈と年ごとの取得 (労災の紐づけの延長)
+[[files]]
+path = "crates/leave/src/holidays.rs"
+
 # SQL を流す 1 か所 (tests/api_db.rs が実 DB で通す)
 [[files]]
 path = "crates/leave/src/pg.rs"

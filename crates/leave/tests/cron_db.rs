@@ -11,14 +11,14 @@ use leave::ichiban::EMPLOYEES_PATH;
 use serde_json::{json, Value};
 use support::{
     add_days, admin, app_client, ichiban_with, lineworks_channel, notify_recipient, tenant,
-    FakeIchiban, FakeNotifier,
+    FakeHolidays, FakeIchiban, FakeNotifier,
 };
 use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
 const TODAY: &str = "2026-10-10";
-/// 窓 (今日 − 62 日 〜 今日 − 1 日)
-const FROM: &str = "2026-08-09";
+/// 窓 (ALERTS_FROM 〜 今日 − 1 日)
+const FROM: &str = "2026-08-01";
 const TO: &str = "2026-10-09";
 
 static SERIAL: Mutex<()> = Mutex::const_new(());
@@ -101,7 +101,14 @@ fn ichiban(employees: Vec<Value>, days: &[Value]) -> FakeIchiban {
 }
 
 async fn run_once(f: &FakeIchiban, n: &FakeNotifier) -> Summary {
-    let s = run(&mut app_client().await, f, n, today()).await;
+    let s = run(
+        &mut app_client().await,
+        f,
+        &FakeHolidays::japan_2026(),
+        n,
+        today(),
+    )
+    .await;
     eprintln!("[leave-db] {}", s.line());
     s
 }
@@ -580,7 +587,7 @@ async fn unresolved_rows_outside_the_window_are_not_sent() {
     let _g = serial().await;
     let (t, _) = enabled_tenant("10", true).await;
     // 窓 (FROM〜TO) の外へ出た未解決の行: 解決にもならず表に残るが、送らない (窓の 1 日前と今日)
-    for d in ["2026-08-08", TODAY] {
+    for d in ["2026-07-31", TODAY] {
         let d: NaiveDate = d.parse().unwrap();
         admin()
             .await
@@ -603,7 +610,7 @@ async fn unresolved_rows_outside_the_window_are_not_sent() {
     assert_eq!(
         alerts(t).await,
         vec![
-            a("1021", "2026-08-08", "yukyu", "ichiban_only", false, false),
+            a("1021", "2026-07-31", "yukyu", "ichiban_only", false, false),
             a("1021", TODAY, "yukyu", "ichiban_only", false, false)
         ]
     );
@@ -682,6 +689,169 @@ async fn failures_do_not_stop_other_tenants() {
         .all(|t| t.failed.as_deref() == Some("ichiban_bad_response")));
 }
 
+// ---- 労災の紐づけの延長と窓の始め ----
+
+async fn run_with_holidays(f: &FakeIchiban, h: &FakeHolidays) -> Summary {
+    let s = run(
+        &mut app_client().await,
+        f,
+        h,
+        &FakeNotifier::default(),
+        today(),
+    )
+    .await;
+    eprintln!("[leave-db] {}", s.line());
+    s
+}
+
+/// 労災のページのあと一番星の労災が続く日 (土曜は行が在る日、日曜は飛ばす) は漏れにならない。
+/// 行の無い平日で止まり、その後の労災は漏れになる
+#[tokio::test]
+async fn rousai_continuing_after_the_page_is_not_a_leak() {
+    let _g = serial().await;
+    let (t, _) = enabled_tenant("10", false).await;
+    page_with(
+        t,
+        "1021",
+        "linked",
+        &[("rousai", "2026-09-28", "2026-09-30", None)],
+    )
+    .await;
+    let days: Vec<Value> = [
+        "2026-09-28",
+        "2026-09-29",
+        "2026-09-30",
+        "2026-10-01",
+        "2026-10-02",
+        "2026-10-03",
+        "2026-10-05",
+        "2026-10-07",
+    ]
+    .iter()
+    .map(|d| day("1021", d, "労災"))
+    .collect();
+    let f = ichiban(vec![employee("1021", "山田太郎", "10", None)], &days);
+    let h = FakeHolidays::japan_2026();
+    let s = run_with_holidays(&f, &h).await;
+    assert_eq!(s.tenants[0].mismatches, 1);
+    assert!(!s.line().contains("holidays_unavailable"));
+    // 10/4 (日) は飛ばし、10/6 (火) で止まる。10/7 は申請書なし
+    assert_eq!(
+        alerts(t).await,
+        vec![a(
+            "1021",
+            "2026-10-07",
+            "rousai",
+            "ichiban_only",
+            false,
+            false
+        )]
+    );
+    // 祝日は窓のうち延長を数える年だけ取る
+    assert_eq!(*h.calls.lock().unwrap(), vec![2026]);
+}
+
+/// 祝日が取れなければ日曜だけ飛ばす (祝日で止まり、その後は漏れになる)。ログに固定語
+#[tokio::test]
+async fn holidays_unavailable_skips_only_sundays() {
+    let _g = serial().await;
+    let (t, _) = enabled_tenant("10", false).await;
+    page_with(
+        t,
+        "1021",
+        "linked",
+        &[("rousai", "2026-09-14", "2026-09-18", None)],
+    )
+    .await;
+    let days: Vec<Value> = [
+        "2026-09-14",
+        "2026-09-15",
+        "2026-09-16",
+        "2026-09-17",
+        "2026-09-18",
+        "2026-09-19",
+        "2026-09-24",
+    ]
+    .iter()
+    .map(|d| day("1021", d, "労災"))
+    .collect();
+    let f = ichiban(vec![employee("1021", "山田太郎", "10", None)], &days);
+    // 取れれば 9/21〜23 (祝) を飛ばして 9/24 まで続く
+    let s = run_with_holidays(&f, &FakeHolidays::japan_2026()).await;
+    assert_eq!(s.tenants[0].mismatches, 0);
+    // 取れなければ 9/21 (月) で止まり、9/24 は申請書なし
+    let s = run_with_holidays(&f, &FakeHolidays::default()).await;
+    assert_eq!(
+        (s.tenants[0].mismatches, s.tenants[0].holidays_unavailable),
+        (1, true)
+    );
+    assert!(
+        s.line()
+            .ends_with("grants=0 holidays_unavailable] unknown_items=0 []"),
+        "{}",
+        s.line()
+    );
+    assert_eq!(
+        alerts(t).await,
+        vec![a(
+            "1021",
+            "2026-09-24",
+            "rousai",
+            "ichiban_only",
+            false,
+            false
+        )]
+    );
+}
+
+/// 窓の始め (ALERTS_FROM = 2026-08-01) より前の日は数えない (一番星もそこから読む)。
+/// 窓より前に終わった労災は窓の始めから延ばす
+#[tokio::test]
+async fn days_before_alerts_from_are_not_counted() {
+    let _g = serial().await;
+    let (t, _) = enabled_tenant("10", false).await;
+    page_with(
+        t,
+        "1021",
+        "linked",
+        &[("yukyu", "2026-07-30", "2026-08-03", None)],
+    )
+    .await;
+    page_with(
+        t,
+        "1022",
+        "linked",
+        &[("rousai", "2026-07-01", "2026-07-20", None)],
+    )
+    .await;
+    let days = [
+        day("1021", "2026-08-03", "有休"),
+        day("1022", "2026-08-01", "労災"),
+        day("1022", "2026-08-03", "労災"),
+    ];
+    let f = ichiban(
+        vec![
+            employee("1021", "山田太郎", "10", None),
+            employee("1022", "佐藤花子", "10", None),
+        ],
+        &days,
+    );
+    run_once(&f, &FakeNotifier::default()).await;
+    // 1021 の 7/30・7/31 は数えず、窓の中の 8/1 (土)・8/2 (日) だけが申請書だけ。1022 の 8/1・8/3 は延長で覆う
+    assert_eq!(
+        alerts(t).await,
+        vec![
+            a("1021", "2026-08-01", "yukyu", "pdf_only", false, false),
+            a("1021", "2026-08-02", "yukyu", "pdf_only", false, false),
+        ]
+    );
+    let calls = f.calls.lock().unwrap();
+    assert_eq!(
+        calls[1..],
+        ["/api/leave/days?from=2026-08-01&to=2026-10-09".to_owned()]
+    );
+}
+
 #[tokio::test]
 async fn broken_db_is_reported() {
     let _g = serial().await;
@@ -690,6 +860,7 @@ async fn broken_db_is_reported() {
     let s = run(
         &mut pg,
         &FakeIchiban::default(),
+        &FakeHolidays::default(),
         &FakeNotifier::default(),
         today(),
     )
@@ -808,7 +979,7 @@ async fn changed_ichiban_rows_unlink_pages() {
     // 行が消えた → 外す
     let pe = linked_with_row(t, "1021", "2026-09-05", ("e", "有休", None)).await;
     // 窓の外の行は比べない
-    let pf = linked_with_row(t, "1021", "2026-08-01", ("f", "有休", None)).await;
+    let pf = linked_with_row(t, "1021", "2026-07-31", ("f", "有休", None)).await;
     // 部門から外れた乗務員の行は比べない
     let pg = linked_with_row(t, "2001", "2026-09-06", ("g", "有休", None)).await;
 

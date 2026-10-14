@@ -38,7 +38,7 @@ use worker::{
 };
 
 use crate::bindings::{
-    AuthTicketVerifier, AuthWorkerNotifier, IchibanBinding, NoNotifier, R2Inbox, R2Pdfs,
+    AuthTicketVerifier, AuthWorkerNotifier, HolidaysJp, IchibanBinding, NoNotifier, R2Inbox, R2Pdfs,
 };
 
 /// R2 の binding (本番と staging で別の bucket)
@@ -130,6 +130,7 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
         pg,
         pdfs,
         ichiban,
+        holidays: Arc::new(HolidaysJp),
         notifier,
         log: log_sink(),
         now: clock(),
@@ -196,7 +197,7 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     };
     let notifier = notifier(&env).await;
     let today = leave::ledger::jst_date(now());
-    let summary = leave::cron::run(&mut pg, &ichiban, notifier.as_ref(), today).await;
+    let summary = leave::cron::run(&mut pg, &ichiban, &HolidaysJp, notifier.as_ref(), today).await;
     console_log!("leave: {}", summary.line());
 }
 
