@@ -1,4 +1,4 @@
-//! 管理 API の口 (method ごとに数えて 22 本、worker が `/api` の下に nest するので実際の path は `/api/leave/…`)。
+//! 管理 API の口 (method ごとに数えて 23 本、worker が `/api` の下に nest するので実際の path は `/api/leave/…`)。
 //!
 //! | method | path | 中身 |
 //! |---|---|---|
@@ -16,6 +16,7 @@
 //! | POST | `/leave/grants/auto` | 法定付与を足す (`ledger`) |
 //! | PUT / DELETE | `/leave/grants/{id}` | 付与を直す / 消す (`ledger`) |
 //! | GET / PUT | `/leave/opening` | 全員分の有給の期首残 / 一括保存 (`ledger`) |
+//! | GET | `/leave/ledger` | 全員分の有給の年度 (4 月始まり) の一覧 (`as_of` の省略は今日。`ledger`) |
 //! | GET | `/leave/alerts` | 未解消の警告 (毎朝の通知と同じ条件・同じ窓。乗務員・日の順) |
 //! | POST | `/leave/uploads` | 管理画面からの PDF の取り込み (本文 = PDF そのもの。毎回別の行。201 `{"pages": n}`) |
 //! | POST | `/leave/settings/test-notify` | 保存済みの通知先へ固定の文面を 1 通送る (毎朝の cron と同じ宛先・同じ送信) |
@@ -127,6 +128,7 @@ pub fn tenant_router() -> Router<LeaveState> {
             "/leave/opening",
             get(ledger::list_openings).put(ledger::put_openings),
         )
+        .route("/leave/ledger", get(ledger::ledger))
         .route(
             "/leave/grants/{id}",
             put(ledger::update_grant).delete(ledger::delete_grant),

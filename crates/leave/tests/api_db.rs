@@ -241,6 +241,11 @@ mod forbidden {
     }
 
     #[tokio::test]
+    async fn ledger() {
+        assert_forbidden("GET", "/api/leave/ledger?as_of=2026-04-01", None).await;
+    }
+
+    #[tokio::test]
     async fn put_openings() {
         let body = json!({"as_of": "2026-09-30", "rows": [{"employee_cd": "1021", "carryover": 1, "current": 2}]});
         assert_forbidden("PUT", "/api/leave/opening", Some(body)).await;
@@ -2029,6 +2034,7 @@ async fn ledger_db_errors_are_500() {
     let id = Uuid::new_v4();
     for (method, uri, body) in [
         ("GET", "/api/leave/grants?employee_cd=1021".to_owned(), None),
+        ("GET", "/api/leave/ledger".to_owned(), None),
         (
             "GET",
             "/api/leave/calendar?employee_cd=1021&month=2026-10".to_owned(),
@@ -2481,6 +2487,301 @@ async fn grants_and_calendar_use_opening() {
         .unwrap()
         .iter()
         .all(|g| g["superseded"] == false));
+}
+
+// ---- 全員分の有給の年度の一覧 (GET /api/leave/ledger) ----
+
+/// 全員分の一覧が取る一番星の休暇の窓 (基準日ごとに、全員の消化の最初の日と年度の初日の早い方〜基準日)
+const LEDGER_WINDOWS: [(&str, &str); 3] = [
+    // 今日 (2026-10-10): 1030 (入社日なし) の 48 か月前の翌日から
+    ("2022-10-11", "2026-10-10"),
+    ("2022-04-01", "2026-03-31"),
+    ("2022-10-01", "2026-09-30"),
+];
+
+fn year_ledger_ichiban() -> FakeIchiban {
+    let mut rows = ledger_rows();
+    rows.push(day("1030", "2026-05-10", "有休"));
+    rows.push(day("1030", "2025-05-10", "午後休"));
+    let mut f = ichiban_with(&[(EMPLOYEES_PATH, 200, ledger_employees())]);
+    for (from, to) in LEDGER_WINDOWS {
+        support::add_days(&mut f, from, to, &rows);
+    }
+    // 付与台帳の口 (1021 の 1 人分) の窓 (期首残の前と後)
+    support::add_days(&mut f, "2024-04-01", "2026-10-10", &rows);
+    support::add_days(&mut f, "2026-10-01", "2026-10-10", &rows);
+    f
+}
+
+type LedgerLine = (String, Value, f64, f64, f64, f64, f64);
+
+/// 一覧の行を (乗務員, 最新の付与, 年度の付与, 年度の取得, 残, 失効, 未割当) に
+fn ledger_view(v: &Value) -> Vec<LedgerLine> {
+    v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let n = |k: &str| r[k].as_f64().unwrap();
+            (
+                r["employee_cd"].as_str().unwrap().to_owned(),
+                r["latest_grant"].clone(),
+                n("granted_in_fy"),
+                n("used_in_fy"),
+                n("remaining"),
+                n("expired"),
+                n("unallocated"),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn ledger_lists_everyone_by_fiscal_year() {
+    let t = tenant().await;
+    let a = app(FakePdfs::default(), Some(year_ledger_ichiban())).await;
+    assert_eq!(
+        put_settings(&a, t, json!({"dept_codes": ["10"]}))
+            .await
+            .status,
+        200
+    );
+    // 1021: 法定付与 2024-10-01 (10)・2025-10-01 (11)・2026-10-01 (12)。1030: 手で 2025-06-01 (3)・2026-04-01 (5)
+    call(
+        &a,
+        "POST",
+        "/api/leave/grants/auto?employee_cd=1021",
+        Some(t),
+        ADMIN,
+        None,
+    )
+    .await;
+    for (date, days) in [("2025-06-01", 3), ("2026-04-01", 5)] {
+        let body = json!({"employee_cd": "1030", "grant_date": date, "days": days});
+        let got = call(&a, "POST", "/api/leave/grants", Some(t), ADMIN, Some(body)).await;
+        assert_eq!(got.status, 201);
+    }
+    // 他 tenant の付与は混ざらない
+    let other = tenant().await;
+    put_settings(&a, other, json!({"dept_codes": ["10"]})).await;
+    let body = json!({"employee_cd": "1021", "grant_date": "2026-04-01", "days": 7});
+    let got = call(
+        &a,
+        "POST",
+        "/api/leave/grants",
+        Some(other),
+        ADMIN,
+        Some(body),
+    )
+    .await;
+    assert_eq!(got.status, 201);
+
+    let get = |uri: &'static str| {
+        let a = &a;
+        async move {
+            let got = call(a, "GET", uri, Some(t), ADMIN, None).await;
+            assert_eq!(got.status, 200, "{uri}");
+            got.json()
+        }
+    };
+    let calls = || a.ichiban.as_ref().unwrap().calls.lock().unwrap().len();
+
+    // 基準日の省略は今日 (2026-10-10) → 2026 年度。一番星は社員 1 回 + 休暇の窓 1 つ (92 日ずつ 16 回) だけ
+    let before = calls();
+    let v = get("/api/leave/ledger").await;
+    assert_eq!(calls() - before, 1 + 16);
+    assert_eq!(
+        (v["as_of"].clone(), v["fiscal_year"].clone()),
+        (
+            json!("2026-10-10"),
+            json!({"start": "2026-04-01", "end": "2027-03-31", "label": 2026})
+        )
+    );
+    // 1021 は付与台帳の口 (1 人分) と同じ残 (20.5・失効 8.5)。部門の外の 2001 は出ない
+    assert_eq!(
+        ledger_view(&v),
+        vec![
+            (
+                "1021".into(),
+                json!({"grant_date": "2026-10-01", "days": 12.0}),
+                12.0,
+                2.5,
+                20.5,
+                8.5,
+                0.0
+            ),
+            (
+                "1030".into(),
+                json!({"grant_date": "2026-04-01", "days": 5.0}),
+                5.0,
+                1.0,
+                7.0,
+                0.0,
+                0.5
+            ),
+        ]
+    );
+    assert_eq!(
+        (
+            v["data"][0]["employee_name"].as_str(),
+            v["data"][0]["hire_date"].as_str(),
+            v["data"][1]["hire_date"].clone()
+        ),
+        (Some("山田太郎"), Some("2024-04-01"), Value::Null)
+    );
+    let one = get("/api/leave/grants?employee_cd=1021").await;
+    assert_eq!(
+        (
+            one["balance"]["remaining"].as_f64(),
+            one["balance"]["expired"].as_f64()
+        ),
+        (Some(20.5), Some(8.5))
+    );
+
+    // 去年度の末日 → 2025 年度。2026-10-01 の付与はまだ無く、2025-01-10 の取得は 2024 年度。
+    // 1030 の 2025-05-10 の半日は付与 (2025-06-01) より前なので未割当
+    let v = get("/api/leave/ledger?as_of=2026-03-31").await;
+    assert_eq!(
+        v["fiscal_year"],
+        json!({"start": "2025-04-01", "end": "2026-03-31", "label": 2025})
+    );
+    assert_eq!(
+        ledger_view(&v),
+        vec![
+            (
+                "1021".into(),
+                json!({"grant_date": "2025-10-01", "days": 11.0}),
+                11.0,
+                0.5,
+                19.5,
+                0.0,
+                0.0
+            ),
+            (
+                "1030".into(),
+                json!({"grant_date": "2025-06-01", "days": 3.0}),
+                3.0,
+                0.5,
+                3.0,
+                0.0,
+                0.5
+            ),
+        ]
+    );
+
+    // 期首残 (2026-09-30: 繰越 2・今年度 9) を入れると、期首日以前の付与は置き換わる
+    let got = put_opening(
+        &a,
+        t,
+        json!({"as_of": "2026-09-30", "rows": [{"employee_cd": "1021", "carryover": 2, "current": 9}]}),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    // 今日: 付与台帳の口と同じ 18.5・失効 2 (年度の付与・取得は付与台帳と一番星のまま)
+    let v = get("/api/leave/ledger?as_of=2026-10-10").await;
+    assert_eq!(
+        ledger_view(&v)[0],
+        (
+            "1021".into(),
+            json!({"grant_date": "2026-10-01", "days": 12.0}),
+            12.0,
+            2.5,
+            18.5,
+            2.0,
+            0.0
+        )
+    );
+    let one = get("/api/leave/grants?employee_cd=1021").await;
+    assert_eq!(
+        (
+            one["balance"]["remaining"].as_f64(),
+            one["balance"]["expired"].as_f64()
+        ),
+        (Some(18.5), Some(2.0))
+    );
+    // 期首日: 基準日以前の付与は全部置き換わったので最新の付与は無く、残は期首残そのもの
+    let v = get("/api/leave/ledger?as_of=2026-09-30").await;
+    assert_eq!(
+        ledger_view(&v)[0],
+        ("1021".into(), Value::Null, 0.0, 0.0, 11.0, 0.0, 0.0)
+    );
+}
+
+#[tokio::test]
+async fn ledger_rejects_bad_as_of_and_needs_ichiban() {
+    let t = tenant().await;
+    let a = app(FakePdfs::default(), Some(year_ledger_ichiban())).await;
+    // 部門を選んでいない tenant は空で、一番星も呼ばない
+    let got = call(
+        &a,
+        "GET",
+        "/api/leave/ledger?as_of=2026-03-31",
+        Some(t),
+        ADMIN,
+        None,
+    )
+    .await;
+    assert_eq!(
+        (got.status, got.json()),
+        (
+            200,
+            json!({"as_of": "2026-03-31", "data": [],
+                   "fiscal_year": {"start": "2025-04-01", "end": "2026-03-31", "label": 2025}})
+        )
+    );
+    // 日付でない・今日の 1 年後 (2027-10-10) より後は 400
+    for (q, code) in [
+        ("as_of=2026-13-01", "invalid_as_of"),
+        ("as_of=2026/10/10", "invalid_as_of"),
+        ("as_of=", "invalid_as_of"),
+        ("as_of=2027-10-11", "invalid_as_of"),
+        ("as_of=1&as_of=2", "invalid_query"),
+    ] {
+        let got = call(
+            &a,
+            "GET",
+            &format!("/api/leave/ledger?{q}"),
+            Some(t),
+            ADMIN,
+            None,
+        )
+        .await;
+        assert_eq!(
+            (got.status, got.json()),
+            (400, json!({"error": code})),
+            "{q}"
+        );
+    }
+    assert!(a.ichiban.as_ref().unwrap().calls.lock().unwrap().is_empty());
+    // 一番星の binding が無い環境 (staging) では 503
+    let none = app(FakePdfs::default(), None).await;
+    let got = call(&none, "GET", "/api/leave/ledger", Some(t), ADMIN, None).await;
+    assert_eq!(
+        (got.status, got.json()),
+        (503, json!({"error": "ichiban_not_configured"}))
+    );
+    // 一番星の失敗は 502 (社員の口・休暇の口)
+    for (fake, code) in [
+        (
+            ichiban_with(&[(EMPLOYEES_PATH, 500, json!({}))]),
+            "ichiban_upstream",
+        ),
+        (
+            ichiban_with(&[(EMPLOYEES_PATH, 200, ledger_employees())]),
+            "ichiban_unavailable",
+        ),
+    ] {
+        let b = app(FakePdfs::default(), Some(fake)).await;
+        put_settings(&b, t, json!({"dept_codes": ["10"]})).await;
+        let got = call(&b, "GET", "/api/leave/ledger", Some(t), ADMIN, None).await;
+        assert_eq!((got.status, got.json()), (502, json!({"error": code})));
+        for line in b.logs.lock().unwrap().iter() {
+            assert!(
+                !line.contains(&t.to_string()) && !line.contains("山田"),
+                "{line}"
+            );
+        }
+    }
 }
 
 /// staging の表示制限 (vars `STAGING_VISIBLE_MINUTES`): 受信から N 分を過ぎたページは一覧・詳細・更新・PDF で 404。
@@ -3312,6 +3613,69 @@ async fn candidates_group_rows_around_the_base_date() {
                 {"row_id": "20261020-1", "day": "2026-10-20", "item_name": "欠勤"}
             ]}
         ]})
+    );
+}
+
+/// 保存済みの期間が基準日の前後 7 日の外でも、窓をそこまで広げて候補に出し、紐づけ直せる
+#[tokio::test]
+async fn candidates_cover_saved_periods_outside_the_window() {
+    let t = tenant().await;
+    let p = page(t, &format!("{t}/a.pdf"), 1, RECEIVED).await;
+    // 基準日 2026-10-17 (前後 7 日 = 10/10〜10/24)・保存済みの期間 2026-10-06 (午前) → 窓は 10/06〜10/24
+    let rows = [
+        support::day_row("1021", "2026-10-06", "午前休", Some("20261006-9"), None),
+        support::day_row("1021", "2026-10-17", "有休", Some("20261017-1"), None),
+    ];
+    let a = link_app(t, link_ichiban("2026-10-06", "2026-10-24", &rows)).await;
+    assert_eq!(
+        put_base(&a, t, &p.to_string(), json!({"base_date": "2026-10-17"}))
+            .await
+            .status,
+        200
+    );
+    let page_uri = format!("/api/leave/pages/{p}");
+    let body = |ids: Value| {
+        json!({"employee_cd": "1021", "status": "linked", "ichiban_row_ids": ids,
+               "periods": [{"kind": "yukyu", "start_date": "2026-10-06", "end_date": "2026-10-06", "half": "am"}]})
+    };
+    // 行の指定の無い紐づけ (一番星は呼ばない) で期間だけ保存する
+    let got = call(&a, "PUT", &page_uri, Some(t), ADMIN, Some(body(json!([])))).await;
+    assert_eq!(got.status, 200);
+    assert!(ichiban_calls(&a).is_empty());
+    let uri = format!("/api/leave/pages/{p}/candidates?employee_cd=1021");
+    let got = call(&a, "GET", &uri, Some(t), ADMIN, None).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(
+        got.json(),
+        json!({"periods": [
+            {"kind": "yukyu", "start_date": "2026-10-06", "end_date": "2026-10-06", "half": "am", "rows": [
+                {"row_id": "20261006-9", "day": "2026-10-06", "item_name": "午前休"}
+            ]},
+            {"kind": "yukyu", "start_date": "2026-10-17", "end_date": "2026-10-17", "half": null, "rows": [
+                {"row_id": "20261017-1", "day": "2026-10-17", "item_name": "有休"}
+            ]}
+        ]})
+    );
+    let window =
+        leave::reconcile::days_paths("2026-10-06".parse().unwrap(), "2026-10-24".parse().unwrap());
+    assert_eq!(
+        ichiban_calls(&a),
+        vec![EMPLOYEES_PATH.to_owned(), window[0].clone()]
+    );
+    // 紐づけの更新の引き直しも同じ窓 (保存済みの日の行を紐づけ直せる)
+    let got = call(
+        &a,
+        "PUT",
+        &page_uri,
+        Some(t),
+        ADMIN,
+        Some(body(json!(["20261006-9"]))),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(
+        support::link_rows_of(p).await,
+        vec![saved("20261006-9", "2026-10-06", "午前休", None)]
     );
 }
 
