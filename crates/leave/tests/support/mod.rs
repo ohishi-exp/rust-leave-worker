@@ -613,6 +613,53 @@ pub async fn call(
     role: Option<&str>,
     body: Option<serde_json::Value>,
 ) -> Got {
+    match body {
+        Some(v) => {
+            send(
+                app,
+                method,
+                uri,
+                tenant_id,
+                role,
+                Some("application/json"),
+                serde_json::to_vec(&v).unwrap(),
+            )
+            .await
+        }
+        None => send(app, method, uri, tenant_id, role, None, Vec::new()).await,
+    }
+}
+
+/// 本文が生のバイト列 (PDF) のリクエストを打つ
+pub async fn call_bytes(
+    app: &App,
+    method: &str,
+    uri: &str,
+    tenant_id: Option<Uuid>,
+    role: Option<&str>,
+    body: Vec<u8>,
+) -> Got {
+    send(
+        app,
+        method,
+        uri,
+        tenant_id,
+        role,
+        Some("application/pdf"),
+        body,
+    )
+    .await
+}
+
+async fn send(
+    app: &App,
+    method: &str,
+    uri: &str,
+    tenant_id: Option<Uuid>,
+    role: Option<&str>,
+    content_type: Option<&str>,
+    body: Vec<u8>,
+) -> Got {
     let mut b = Request::builder().method(method).uri(uri);
     if let Some(t) = tenant_id {
         b = b.header("X-Tenant-ID", t.to_string());
@@ -622,13 +669,10 @@ pub async fn call(
             .header("X-User-Role", r)
             .header("X-User-Email", "admin@example.com");
     }
-    let body = match body {
-        Some(v) => {
-            b = b.header("content-type", "application/json");
-            Body::from(serde_json::to_vec(&v).unwrap())
-        }
-        None => Body::empty(),
-    };
+    if let Some(c) = content_type {
+        b = b.header("content-type", c);
+    }
+    let body = Body::from(body);
     let resp: Response<Body> = app
         .router
         .clone()

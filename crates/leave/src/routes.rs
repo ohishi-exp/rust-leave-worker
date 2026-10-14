@@ -1,4 +1,4 @@
-//! 管理 API の口 (17 本、worker が `/api` の下に nest するので実際の path は `/api/leave/…`)。
+//! 管理 API の口 (18 本、worker が `/api` の下に nest するので実際の path は `/api/leave/…`)。
 //!
 //! | method | path | 中身 |
 //! |---|---|---|
@@ -15,6 +15,7 @@
 //! | PUT / DELETE | `/leave/grants/{id}` | 付与を直す / 消す (`ledger`) |
 //! | GET / PUT | `/leave/opening` | 全員分の有給の期首残 / 一括保存 (`ledger`) |
 //! | GET | `/leave/alerts` | 未解消の警告 (毎朝の通知と同じ条件・同じ窓。乗務員・日の順) |
+//! | POST | `/leave/uploads` | 管理画面からの PDF の取り込み (本文 = PDF そのもの。毎回別の行。201 `{"pages": n}`) |
 //! | POST | `/leave/settings/test-notify` | 保存済みの通知先へ固定の文面を 1 通送る (毎朝の cron と同じ宛先・同じ送信) |
 //!
 //! **全部の口を [`require_admin`] が包む** (管理者でなければ 403。handler にも DB にも届かない)。
@@ -29,8 +30,9 @@ use std::sync::Arc;
 use alc_core_wasm::TenantId;
 use alc_worker_db::PgClient;
 use axum::body::Body;
+use axum::body::Bytes;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -43,6 +45,8 @@ use uuid::Uuid;
 use crate::auth::{actor, require_admin};
 use crate::cron::{window, Notifier};
 use crate::ichiban::{filter_employees, IchibanApi, DEPARTMENTS_PATH, EMPLOYEES_PATH};
+use crate::ingest::{check_pdf_bytes, MAX_PDF_BYTES};
+use crate::internal::{ingest_pdf, IngestFailure, NewPdf};
 use crate::ledger;
 use crate::pages::{
     validate_update, DocumentsQuery, DocumentsQueryRaw, ListQuery, ListQueryRaw, PageUpdateInput,
@@ -97,6 +101,11 @@ pub fn tenant_router() -> Router<LeaveState> {
         .route("/leave/settings", get(get_settings).put(put_settings))
         .route("/leave/settings/test-notify", post(test_notify))
         .route("/leave/alerts", get(list_alerts))
+        // 既定の 2MB を広げる。+1024 は上限をわずかに超えたものを handler の `pdf_too_large` (400) にするための余白
+        .route(
+            "/leave/uploads",
+            post(upload_pdf).layer(DefaultBodyLimit::max(MAX_PDF_BYTES + 1024)),
+        )
         .route("/leave/departments", get(departments))
         .route("/leave/employees", get(employees))
         .route("/leave/documents", get(list_documents))
@@ -175,6 +184,31 @@ async fn test_notify(
             (state.log)(&format!("test_notify: send {}", e.0));
             error(StatusCode::BAD_GATEWAY, "notify_failed")
         }
+    }
+}
+
+/// 管理画面からの PDF の取り込み。tenant は auth-worker のヘッダだけから決まる (本文からは決めない)。
+/// 同じファイルでも毎回別の key・別の行 (seed はランダム)。応答・ログは固定の語だけ
+async fn upload_pdf(
+    State(state): State<LeaveState>,
+    Extension(t): Extension<TenantId>,
+    body: Bytes,
+) -> Response {
+    if let Err(code) = check_pdf_bytes(&body) {
+        return bad_request(code);
+    }
+    let pdf = NewPdf {
+        tenant_id: t.0,
+        pdf: body.to_vec(),
+        received_at: (state.now)(),
+        mail_from: None,
+        subject: None,
+        key_seed: Uuid::new_v4().to_string(),
+    };
+    match ingest_pdf(&state.pg, state.pdfs.as_ref(), &state.log, pdf).await {
+        Ok(pages) => (StatusCode::CREATED, Json(json!({ "pages": pages }))).into_response(),
+        Err(IngestFailure::Drop(code)) => error(StatusCode::UNPROCESSABLE_ENTITY, code),
+        Err(IngestFailure::Failed) => error(StatusCode::SERVICE_UNAVAILABLE, "ingest_failed"),
     }
 }
 
