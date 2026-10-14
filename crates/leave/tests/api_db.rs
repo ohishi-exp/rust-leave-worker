@@ -3616,6 +3616,69 @@ async fn candidates_group_rows_around_the_base_date() {
     );
 }
 
+/// 保存済みの期間が基準日の前後 7 日の外でも、窓をそこまで広げて候補に出し、紐づけ直せる
+#[tokio::test]
+async fn candidates_cover_saved_periods_outside_the_window() {
+    let t = tenant().await;
+    let p = page(t, &format!("{t}/a.pdf"), 1, RECEIVED).await;
+    // 基準日 2026-10-17 (前後 7 日 = 10/10〜10/24)・保存済みの期間 2026-10-06 (午前) → 窓は 10/06〜10/24
+    let rows = [
+        support::day_row("1021", "2026-10-06", "午前休", Some("20261006-9"), None),
+        support::day_row("1021", "2026-10-17", "有休", Some("20261017-1"), None),
+    ];
+    let a = link_app(t, link_ichiban("2026-10-06", "2026-10-24", &rows)).await;
+    assert_eq!(
+        put_base(&a, t, &p.to_string(), json!({"base_date": "2026-10-17"}))
+            .await
+            .status,
+        200
+    );
+    let page_uri = format!("/api/leave/pages/{p}");
+    let body = |ids: Value| {
+        json!({"employee_cd": "1021", "status": "linked", "ichiban_row_ids": ids,
+               "periods": [{"kind": "yukyu", "start_date": "2026-10-06", "end_date": "2026-10-06", "half": "am"}]})
+    };
+    // 行の指定の無い紐づけ (一番星は呼ばない) で期間だけ保存する
+    let got = call(&a, "PUT", &page_uri, Some(t), ADMIN, Some(body(json!([])))).await;
+    assert_eq!(got.status, 200);
+    assert!(ichiban_calls(&a).is_empty());
+    let uri = format!("/api/leave/pages/{p}/candidates?employee_cd=1021");
+    let got = call(&a, "GET", &uri, Some(t), ADMIN, None).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(
+        got.json(),
+        json!({"periods": [
+            {"kind": "yukyu", "start_date": "2026-10-06", "end_date": "2026-10-06", "half": "am", "rows": [
+                {"row_id": "20261006-9", "day": "2026-10-06", "item_name": "午前休"}
+            ]},
+            {"kind": "yukyu", "start_date": "2026-10-17", "end_date": "2026-10-17", "half": null, "rows": [
+                {"row_id": "20261017-1", "day": "2026-10-17", "item_name": "有休"}
+            ]}
+        ]})
+    );
+    let window =
+        leave::reconcile::days_paths("2026-10-06".parse().unwrap(), "2026-10-24".parse().unwrap());
+    assert_eq!(
+        ichiban_calls(&a),
+        vec![EMPLOYEES_PATH.to_owned(), window[0].clone()]
+    );
+    // 紐づけの更新の引き直しも同じ窓 (保存済みの日の行を紐づけ直せる)
+    let got = call(
+        &a,
+        "PUT",
+        &page_uri,
+        Some(t),
+        ADMIN,
+        Some(body(json!(["20261006-9"]))),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(
+        support::link_rows_of(p).await,
+        vec![saved("20261006-9", "2026-10-06", "午前休", None)]
+    );
+}
+
 #[tokio::test]
 async fn candidates_reject_and_need_ichiban() {
     let (t, other) = (tenant().await, tenant().await);

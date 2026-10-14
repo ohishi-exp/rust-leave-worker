@@ -9,7 +9,7 @@
 //! | POST | `/leave/grants/auto?employee_cd=` | 法定付与を計算し、無い付与日だけ足す (manual は上書きしない) |
 //! | GET / PUT | `/leave/opening` | 全員分の期首残 / 一括保存 (両方 null の行は削除) |
 //! | GET | `/leave/ledger?as_of=YYYY-MM-DD` | 全員分の有給の年度 (4 月始まり) の一覧 (基準日の省略は今日 (JST)) |
-//! | GET | `/leave/pages/{id}/candidates?employee_cd=` | ページの窓 (基準日か受信日の前後 7 日) の一番星の休暇の行を期間にまとめる |
+//! | GET | `/leave/pages/{id}/candidates?employee_cd=` | ページの窓 (基準日か受信日の前後 7 日と保存済みの期間を合わせた範囲) の一番星の休暇の行を期間にまとめる |
 //!
 //! 紐づけの更新 (`PUT /leave/pages/{id}`) が受け取る一番星の行の確かめ ([`verified_link_rows`]) もここに置く。
 //!
@@ -47,7 +47,7 @@ use crate::grants::{
     Grant, GrantUpdateInput, NewGrantInput, Opening, OpeningGrants, OpeningPutInput,
 };
 use crate::ichiban::{IchibanApi, EMPLOYEES_PATH};
-use crate::pages::{Page, PageUpdate};
+use crate::pages::{Page, PageUpdate, Period};
 use crate::pg;
 use crate::reconcile::{
     calendar_days, candidate_periods, days_paths, expand_periods, parse_employees, pick_link_rows,
@@ -201,11 +201,28 @@ pub(crate) async fn fetch_days<'a>(
 /// 候補を探す窓の幅 (中心の日の前後の日数)
 pub const CANDIDATE_DAYS: i64 = 7;
 
-/// 候補を探す窓 (PDF の基準日、無ければ受信日 (JST) の前後 [`CANDIDATE_DAYS`] 日。両端を含む)
-pub fn candidate_window(page: &Page) -> (NaiveDate, NaiveDate) {
+/// 候補の窓を保存済みの期間で広げる上限 (月)。超えたら中心の前後だけ (異常な保存値で一番星を叩きすぎない)
+pub const CANDIDATE_MAX_MONTHS: u32 = 12;
+
+/// 候補を探す窓 (両端を含む)。PDF の基準日、無ければ受信日 (JST) の前後 [`CANDIDATE_DAYS`] 日と、そのページの保存済みの
+/// 期間 (`periods`) の最初の日〜最後の日を合わせた範囲 (保存済みの行を候補に出し、紐づけ直せるように)。
+/// 合わせた範囲が [`CANDIDATE_MAX_MONTHS`] か月を超えたら中心の前後だけ
+pub fn candidate_window(page: &Page, periods: &[Period]) -> (NaiveDate, NaiveDate) {
     let center = page.base_date.unwrap_or_else(|| jst_date(page.received_at));
     let span = chrono::Duration::days(CANDIDATE_DAYS);
-    (center - span, center + span)
+    let around = (center - span, center + span);
+    let from = periods
+        .iter()
+        .map(|p| p.start_date)
+        .fold(around.0, NaiveDate::min);
+    let to = periods
+        .iter()
+        .map(|p| p.end_date)
+        .fold(around.1, NaiveDate::max);
+    match add_months(from, CANDIDATE_MAX_MONTHS) {
+        Some(limit) if to <= limit => (from, to),
+        _ => around,
+    }
 }
 
 /// ページの窓 ([`candidate_window`]) で、乗務員 `code` の一番星の行を取る (`codes` は `code` 1 つだけの集合)。
@@ -225,10 +242,10 @@ async fn page_window_rows<'a>(
     )
     .await
     .map_err(|e| db_error(state, "page window", &e))?;
-    let page = got.ok_or_else(not_found)?.page;
+    let detail = got.ok_or_else(not_found)?;
     let api = ichiban_of(state)?;
     find_employee(state, &api, tenant_id, code).await?;
-    let (from, to) = candidate_window(&page);
+    let (from, to) = candidate_window(&detail.page, &detail.periods);
     fetch_rows(state, &api, codes, from, to)
         .await
         .map_err(bad_gateway)
@@ -833,6 +850,79 @@ mod tests {
         assert_eq!(
             consumption_from(d("2026-09-29"), Some(d("2024-04-01")), Some(&o)),
             d("2024-04-01")
+        );
+    }
+
+    #[test]
+    fn candidate_window_covers_saved_periods() {
+        let at: DateTime<Utc> = "2026-10-09T15:00:00Z".parse().unwrap();
+        let page = |base: Option<&str>| Page {
+            id: Uuid::nil(),
+            r2_key: String::new(),
+            page_no: 1,
+            mail_from: None,
+            subject: None,
+            received_at: at,
+            employee_cd: None,
+            status: "linked".into(),
+            linked_by: None,
+            linked_at: None,
+            note: None,
+            created_at: at,
+            base_date: base.map(d),
+        };
+        let period = |s: &str, e: &str| Period {
+            kind: "yukyu".into(),
+            start_date: d(s),
+            end_date: d(e),
+            half: None,
+        };
+        let based = page(Some("2026-10-17"));
+        // 保存なし: 基準日 (無ければ受信日 (JST)) の前後 7 日
+        assert_eq!(
+            candidate_window(&based, &[]),
+            (d("2026-10-10"), d("2026-10-24"))
+        );
+        assert_eq!(
+            candidate_window(&page(None), &[]),
+            (d("2026-10-03"), d("2026-10-17"))
+        );
+        // 窓の中の保存は窓を変えない
+        assert_eq!(
+            candidate_window(&based, &[period("2026-10-12", "2026-10-13")]),
+            (d("2026-10-10"), d("2026-10-24"))
+        );
+        // 窓の前・後の保存まで広げる (複数あれば最初〜最後)
+        assert_eq!(
+            candidate_window(&based, &[period("2026-10-06", "2026-10-06")]),
+            (d("2026-10-06"), d("2026-10-24"))
+        );
+        assert_eq!(
+            candidate_window(
+                &based,
+                &[
+                    period("2026-11-02", "2026-11-03"),
+                    period("2026-10-20", "2026-10-21")
+                ]
+            ),
+            (d("2026-10-10"), d("2026-11-03"))
+        );
+        // ちょうど 1 年までは広げ、超えたら中心の前後だけ
+        assert_eq!(
+            candidate_window(&based, &[period("2025-10-24", "2025-10-24")]),
+            (d("2025-10-24"), d("2026-10-24"))
+        );
+        assert_eq!(
+            candidate_window(&based, &[period("2025-10-23", "2025-10-23")]),
+            (d("2026-10-10"), d("2026-10-24"))
+        );
+        // 遠すぎる保存値も中心の前後だけ
+        assert_eq!(
+            candidate_window(
+                &page(Some("2026-10-17")),
+                &[period("+262142-12-31", "+262142-12-31")]
+            ),
+            (d("2026-10-10"), d("2026-10-24"))
         );
     }
 }
