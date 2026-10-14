@@ -159,6 +159,14 @@ pub mod sql {
         )
     }
 
+    /// tenant の全員分 (乗務員・付与日の順)
+    pub fn grants_all() -> String {
+        format!(
+            "SELECT {GRANT_COLUMNS} FROM alc_api.leave_grants \
+             WHERE tenant_id = $1 ORDER BY employee_cd, grant_date, id"
+        )
+    }
+
     /// 同じ (乗務員, 付与日) が在れば何も書かない (行が返らない = 409)
     pub fn grant_insert() -> String {
         format!(
@@ -287,6 +295,19 @@ pub async fn list_grants(
                     &sql::grants_by_employee(),
                     &[(&tenant_id, Type::UUID), (&employee_cd, Type::TEXT)],
                 )
+                .await?;
+            Ok(rows.iter().map(grant_from_row).collect())
+        })
+    })
+    .await
+}
+
+/// tenant の全員分の付与 (乗務員・付与日の順)
+pub async fn list_grants_all(pg: &mut PgClient, tenant_id: Uuid) -> Result<Vec<Grant>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(&sql::grants_all(), &[(&tenant_id, Type::UUID)])
                 .await?;
             Ok(rows.iter().map(grant_from_row).collect())
         })

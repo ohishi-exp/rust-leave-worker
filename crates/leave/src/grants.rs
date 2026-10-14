@@ -332,6 +332,18 @@ pub struct OpeningPut {
     pub deletes: Vec<String>,
 }
 
+/// 年度 (4 月始まり) の初日と末日。`d` を含む 4/1〜翌 3/31 (表せなければ `None`)
+pub fn fiscal_year_of(d: NaiveDate) -> Option<(NaiveDate, NaiveDate)> {
+    let y = if d.month() >= 4 {
+        d.year()
+    } else {
+        d.year() - 1
+    };
+    let start = NaiveDate::from_ymd_opt(y, 4, 1)?;
+    let end = NaiveDate::from_ymd_opt(y + 1, 3, 31)?;
+    Some((start, end))
+}
+
 /// `YYYY-MM-DD` だけを日付に
 pub fn parse_date(raw: &str) -> Option<NaiveDate> {
     if raw.len() != 10 {
@@ -1038,5 +1050,22 @@ mod tests {
             note: Some("あ".repeat(MAX_NOTE_CHARS + 1)),
         };
         assert_eq!(validate_update(long), Err("note_too_long"));
+    }
+
+    #[test]
+    fn fiscal_year_starts_in_april() {
+        let fy = |s| fiscal_year_of(d(s));
+        // 3/31 は前の年度、4/1 から新しい年度
+        assert_eq!(fy("2027-03-31"), Some((d("2026-04-01"), d("2027-03-31"))));
+        assert_eq!(fy("2026-04-01"), Some((d("2026-04-01"), d("2027-03-31"))));
+        assert_eq!(fy("2026-03-31"), Some((d("2025-04-01"), d("2026-03-31"))));
+        // 年をまたぐ (1 月・12 月)
+        assert_eq!(fy("2026-01-15"), Some((d("2025-04-01"), d("2026-03-31"))));
+        assert_eq!(fy("2026-12-31"), Some((d("2026-04-01"), d("2027-03-31"))));
+        // 閏年の 2/29 も同じ年度の末日は 3/31
+        assert_eq!(fy("2028-02-29"), Some((d("2027-04-01"), d("2028-03-31"))));
+        // 表せない
+        assert_eq!(fiscal_year_of(NaiveDate::MAX), None);
+        assert_eq!(fiscal_year_of(NaiveDate::MIN), None);
     }
 }

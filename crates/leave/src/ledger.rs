@@ -8,6 +8,7 @@
 //! | PUT / DELETE | `/leave/grants/{id}` | 付与を直す (source は manual になる) / 消す |
 //! | POST | `/leave/grants/auto?employee_cd=` | 法定付与を計算し、無い付与日だけ足す (manual は上書きしない) |
 //! | GET / PUT | `/leave/opening` | 全員分の期首残 / 一括保存 (両方 null の行は削除) |
+//! | GET | `/leave/ledger?as_of=YYYY-MM-DD` | 全員分の有給の年度 (4 月始まり) の一覧 (基準日の省略は今日 (JST)) |
 //! | GET | `/leave/pages/{id}/candidates?employee_cd=` | ページの窓 (基準日か受信日の前後 7 日) の一番星の休暇の行を期間にまとめる |
 //!
 //! 紐づけの更新 (`PUT /leave/pages/{id}`) が受け取る一番星の行の確かめ ([`verified_link_rows`]) もここに置く。
@@ -42,8 +43,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::grants::{
-    self, add_months, balance_with_opening, opening_grants, statutory, valid_employee_cd, Grant,
-    GrantUpdateInput, NewGrantInput, Opening, OpeningGrants, OpeningPutInput,
+    self, add_months, balance_with_opening, opening_grants, statutory, valid_employee_cd, Balance,
+    Grant, GrantUpdateInput, NewGrantInput, Opening, OpeningGrants, OpeningPutInput,
 };
 use crate::ichiban::{IchibanApi, EMPLOYEES_PATH};
 use crate::pages::{Page, PageUpdate};
@@ -394,8 +395,13 @@ async fn list_grants_inner(
     let days = fetch_days(&state, &api, &codes, used_from, today)
         .await
         .map_err(bad_gateway)?;
-    let inputs: Vec<_> = grant_rows.iter().map(Grant::input).collect();
-    let b = balance_with_opening(&inputs, &yukyu_usages(&days.rows), today, opening.as_ref());
+    let b = employee_balance(
+        &grant_rows,
+        &yukyu_usages(&days.rows),
+        used_from,
+        today,
+        opening.as_ref(),
+    );
     let applied = opening.filter(|o| o.applies(today));
     let data: Vec<GrantView> = grant_rows
         .into_iter()
@@ -421,6 +427,153 @@ async fn list_grants_inner(
             "consumption_from": used_from,
         },
         "opening": opening.map(|o| o.view()),
+        "data": data,
+    }))
+    .into_response())
+}
+
+/// 乗務員 1 人の基準日 `as_of` の残。消化は `used_from` 以降だけを数える (付与台帳の口と全員分の一覧で同じ計算)
+fn employee_balance(
+    grant_rows: &[Grant],
+    usages: &[(NaiveDate, i32)],
+    used_from: NaiveDate,
+    as_of: NaiveDate,
+    opening: Option<&OpeningGrants>,
+) -> Balance {
+    let inputs: Vec<_> = grant_rows.iter().map(Grant::input).collect();
+    let usages: Vec<_> = usages
+        .iter()
+        .copied()
+        .filter(|(d, _)| *d >= used_from)
+        .collect();
+    balance_with_opening(&inputs, &usages, as_of, opening)
+}
+
+#[derive(Deserialize, Debug, Default)]
+pub struct AsOfQuery {
+    pub as_of: Option<String>,
+}
+
+/// 基準日 (省略は `today`) とその年度。日付でない・`today` の 1 年後より後は 400 `invalid_as_of`
+fn as_of_of(
+    raw: Result<Query<AsOfQuery>, QueryRejection>,
+    today: NaiveDate,
+) -> Result<(NaiveDate, (NaiveDate, NaiveDate)), Response> {
+    let Ok(Query(q)) = raw else {
+        return Err(bad_request("invalid_query"));
+    };
+    let as_of = match q.as_of {
+        None => Some(today),
+        Some(raw) => grants::parse_date(&raw),
+    };
+    let limit = add_months(today, 12).unwrap_or(today);
+    as_of
+        .filter(|d| *d <= limit)
+        .and_then(|d| Some((d, grants::fiscal_year_of(d)?)))
+        .ok_or_else(|| bad_request("invalid_as_of"))
+}
+
+/// 全員分の一覧の 1 行 (日数。残の内訳は基準日の [`employee_balance`])
+#[derive(Serialize)]
+struct LedgerRowView {
+    employee_cd: String,
+    employee_name: Option<String>,
+    hire_date: Option<NaiveDate>,
+    /// 基準日以前で一番新しい付与 (期首残で置き換わった行は除く)
+    latest_grant: Option<serde_json::Value>,
+    /// 付与日が年度の初日〜基準日の付与の合計
+    granted_in_fy: f64,
+    /// 一番星の有給の取得のうち年度の初日〜基準日の合計
+    used_in_fy: f64,
+    remaining: f64,
+    expired: f64,
+    unallocated: f64,
+}
+
+/// `GET /leave/ledger?as_of=`: 自 tenant の部門に入る全員の、基準日を含む年度の有給。
+/// 一番星の休暇は全員分を 1 つの窓 (各人の消化の最初の日と年度の初日の早い方〜基準日) で 1 回だけ取る
+pub async fn ledger(
+    State(state): State<LeaveState>,
+    Extension(t): Extension<TenantId>,
+    raw: Result<Query<AsOfQuery>, QueryRejection>,
+) -> Response {
+    respond(ledger_inner(state, t.0, raw).await)
+}
+
+async fn ledger_inner(
+    state: LeaveState,
+    tenant_id: Uuid,
+    raw: Result<Query<AsOfQuery>, QueryRejection>,
+) -> Result<Response, Response> {
+    let (as_of, (fy_start, fy_end)) = as_of_of(raw, jst_date((state.now)()))?;
+    let api = ichiban_of(&state)?;
+    let mut employees = tenant_employees(&state, &api, tenant_id).await?;
+    employees.sort_by(|a, b| a.employee_code.cmp(&b.employee_code));
+    let mut grant_rows: BTreeMap<String, Vec<Grant>> = BTreeMap::new();
+    let all = pg::list_grants_all(&mut *state.pg.lock().await, tenant_id)
+        .await
+        .map_err(|e| db_error(&state, "ledger grants", &e))?;
+    for g in all {
+        grant_rows.entry(g.employee_cd.clone()).or_default().push(g);
+    }
+    let saved: BTreeMap<String, Opening> =
+        pg::list_openings(&mut *state.pg.lock().await, tenant_id)
+            .await
+            .map_err(|e| db_error(&state, "ledger openings", &e))?
+            .into_iter()
+            .collect();
+    let people: Vec<(Employee, Option<OpeningGrants>, NaiveDate)> = employees
+        .into_iter()
+        .map(|e| {
+            let opening = saved
+                .get(&e.employee_code)
+                .map(|o| opening_grants(*o, e.hire_date, e.retire_date));
+            let used_from = consumption_from(as_of, e.hire_date, opening.as_ref());
+            (e, opening, used_from)
+        })
+        .collect();
+    let mut usages: BTreeMap<String, Vec<(NaiveDate, i32)>> = BTreeMap::new();
+    if let Some(from) = people.iter().map(|p| p.2).min() {
+        let codes: BTreeSet<String> = people.iter().map(|p| p.0.employee_code.clone()).collect();
+        let days = fetch_days(&state, &api, &codes, from.min(fy_start), as_of)
+            .await
+            .map_err(bad_gateway)?;
+        for code in &codes {
+            usages.insert(code.clone(), yukyu_usages(&rows_of(&days.rows, code)));
+        }
+    }
+    let data: Vec<LedgerRowView> = people
+        .into_iter()
+        .map(|(e, opening, used_from)| {
+            let rows = grant_rows.remove(&e.employee_code).unwrap_or_default();
+            let used = usages.remove(&e.employee_code).unwrap_or_default();
+            let b = employee_balance(&rows, &used, used_from, as_of, opening.as_ref());
+            let applied = opening.filter(|o| o.applies(as_of));
+            let latest = rows.iter().rfind(|g| {
+                g.grant_date <= as_of && !applied.is_some_and(|o| o.supersedes(g.grant_date))
+            });
+            let in_fy = |d: NaiveDate| fy_start <= d && d <= as_of;
+            LedgerRowView {
+                latest_grant: latest.map(|g| json!({"grant_date": g.grant_date, "days": g.days})),
+                granted_in_fy: grants::days(
+                    rows.iter()
+                        .filter(|g| in_fy(g.grant_date))
+                        .map(|g| g.input().tenths)
+                        .sum(),
+                ),
+                used_in_fy: grants::days(used.iter().filter(|u| in_fy(u.0)).map(|u| u.1).sum()),
+                remaining: grants::days(b.remaining),
+                expired: grants::days(b.expired),
+                unallocated: grants::days(b.unallocated),
+                employee_cd: e.employee_code,
+                employee_name: e.employee_name,
+                hire_date: e.hire_date,
+            }
+        })
+        .collect();
+    Ok(Json(json!({
+        "as_of": as_of,
+        "fiscal_year": {"start": fy_start, "end": fy_end, "label": fy_start.year()},
         "data": data,
     }))
     .into_response())
