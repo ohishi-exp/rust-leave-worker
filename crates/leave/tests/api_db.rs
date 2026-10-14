@@ -953,9 +953,27 @@ async fn list_documents_states_counts_and_isolation() {
         data[1],
         json!({"r2_key": ka, "first_page_id": a1, "received_at": "2026-10-01T00:00:00Z",
                "mail_from": "sender@example.com", "subject": "休暇申請",
-               "page_count": 3, "unlinked_count": 3, "linked_count": 0, "ignored_count": 0})
+               "page_count": 3, "unlinked_count": 3, "linked_count": 0, "ignored_count": 0,
+               "base_date": null})
     );
     assert_eq!(data[0]["first_page_id"], json!(b1));
+    // 基準日は PDF 単位 (全ページに入れた後は集約にも出る。無い PDF は null のまま)
+    assert_eq!(
+        put_base(&app, t, &b1.to_string(), json!({"base_date": "2026-10-20"}))
+            .await
+            .status,
+        200
+    );
+    let got = get("?state=all").await;
+    let data = got.json()["data"].clone();
+    assert_eq!(
+        [
+            &data[0]["base_date"],
+            &data[1]["base_date"],
+            &data[2]["base_date"]
+        ],
+        [&json!("2026-10-20"), &Value::Null, &Value::Null]
+    );
     assert_eq!(
         [
             &data[0]["page_count"],

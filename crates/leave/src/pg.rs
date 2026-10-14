@@ -68,7 +68,8 @@ pub mod sql {
              count(*)::int8, \
              (count(*) FILTER (WHERE status = 'unlinked'))::int8, \
              (count(*) FILTER (WHERE status = 'linked'))::int8, \
-             (count(*) FILTER (WHERE status = 'ignored'))::int8 \
+             (count(*) FILTER (WHERE status = 'ignored'))::int8, \
+             max(base_date) \
              FROM alc_api.leave_pages WHERE tenant_id = $1 AND {} GROUP BY r2_key \
              HAVING $3::text = 'all' \
              OR ($3::text = 'open' AND count(*) FILTER (WHERE status = 'unlinked') > 0) \
@@ -846,6 +847,7 @@ fn document_from_row(row: &Row) -> Document {
         unlinked_count: row.get(6),
         linked_count: row.get(7),
         ignored_count: row.get(8),
+        base_date: row.get(9),
     }
 }
 
