@@ -487,6 +487,36 @@ pub fn add_days(f: &mut FakeIchiban, from: &str, to: &str, rows: &[serde_json::V
     }
 }
 
+/// 一番星の休暇の行 1 件 (`row_id`・`last_updated` 付き。[`add_days`] に渡す)
+pub fn day_row(
+    code: &str,
+    date: &str,
+    item: &str,
+    row_id: Option<&str>,
+    last_updated: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "employee_code": code, "date": date, "item_name": item,
+        "row_id": row_id, "last_updated": last_updated
+    })
+}
+
+/// leave_link_rows のページの行 (row_id, 乗務員, 日, 品名, 最終更新)。superuser で読む
+pub async fn link_rows_of(page_id: Uuid) -> Vec<(String, String, String, String, Option<String>)> {
+    admin()
+        .await
+        .query(
+            "SELECT row_id, employee_cd, day::text, item_name, last_updated FROM alc_api.leave_link_rows \
+             WHERE page_id = $1 ORDER BY row_id",
+            &[&page_id],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4)))
+        .collect()
+}
+
 pub struct App {
     pub router: Router,
     pub pdfs: Arc<FakePdfs>,

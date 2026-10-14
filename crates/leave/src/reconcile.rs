@@ -83,6 +83,10 @@ struct DayRow {
     employee_code: Value,
     date: NaiveDate,
     item_name: Option<String>,
+    #[serde(default)]
+    row_id: Option<String>,
+    #[serde(default)]
+    last_updated: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -98,21 +102,48 @@ fn code_of(v: &Value) -> Option<String> {
     }
 }
 
-/// `GET /api/leave/days` の本文 (`{"data": [{"employee_code", "date", "item_name"}]}`) を読み、`codes` に入る乗務員の行だけを
-/// 正規化して `out` に足す。対象外の語は捨て、表に無い語は数える。形が違えば `Err`
-pub fn parse_days<'a>(
+/// 一番星の休暇の行 1 件 (正規化前。乗務員コードは `codes` の側の文字列を借りる)
+#[derive(Debug, Clone, PartialEq)]
+pub struct IchibanRow<'a> {
+    pub employee_cd: &'a str,
+    pub date: NaiveDate,
+    /// 品名N の生の値 (null は空文字)
+    pub item_name: String,
+    /// `管理年月日(YYYYMMDD)-管理C` (編集されても変わらない)
+    pub row_id: Option<String>,
+    /// 最終更新 (`YYYY-MM-DD HH:MI:SS.mmm` の文字列のまま)
+    pub last_updated: Option<String>,
+}
+
+/// `GET /api/leave/days` の本文 (`{"data": [{"employee_code", "date", "item_name", "row_id", "last_updated"}]}`) を読み、
+/// `codes` に入る乗務員の行だけを返す (正規化はしない)。形が違えば `Err`。一番星の休暇の本文を読むのはここだけ
+pub fn read_day_rows<'a>(
     body: &[u8],
     codes: &'a BTreeSet<String>,
-    out: &mut IchibanDays<'a>,
-) -> Result<(), &'static str> {
+) -> Result<Vec<IchibanRow<'a>>, &'static str> {
     let parsed: DaysBody = serde_json::from_slice(body).map_err(|_| "ichiban_bad_response")?;
-    for row in parsed.data {
-        let Some(code) = code_of(&row.employee_code).and_then(|c| codes.get(&c)) else {
-            continue;
-        };
-        match normalize(row.item_name.as_deref().unwrap_or("")) {
-            Normalized::Leave(kind) => out.rows.push(IchibanDay {
+    Ok(parsed
+        .data
+        .into_iter()
+        .filter_map(|row| {
+            let code = code_of(&row.employee_code).and_then(|c| codes.get(&c))?;
+            Some(IchibanRow {
                 employee_cd: code,
+                date: row.date,
+                item_name: row.item_name.unwrap_or_default(),
+                row_id: row.row_id,
+                last_updated: row.last_updated,
+            })
+        })
+        .collect())
+}
+
+/// 行を正規化して `out` に足す。対象外の語は捨て、表に無い語は数える
+pub fn push_days<'a>(rows: &[IchibanRow<'a>], out: &mut IchibanDays<'a>) {
+    for row in rows {
+        match normalize(&row.item_name) {
+            Normalized::Leave(kind) => out.rows.push(IchibanDay {
+                employee_cd: row.employee_cd,
                 date: row.date,
                 kind,
             }),
@@ -120,7 +151,135 @@ pub fn parse_days<'a>(
             Normalized::Unknown(word) => *out.unknown.entry(word).or_default() += 1,
         }
     }
+}
+
+/// `GET /api/leave/days` の本文を読み ([`read_day_rows`])、`codes` に入る乗務員の行だけを
+/// 正規化して `out` に足す ([`push_days`])。形が違えば `Err`
+pub fn parse_days<'a>(
+    body: &[u8],
+    codes: &'a BTreeSet<String>,
+    out: &mut IchibanDays<'a>,
+) -> Result<(), &'static str> {
+    push_days(&read_day_rows(body, codes)?, out);
     Ok(())
+}
+
+/// 候補の期間に載せる一番星の行 1 件 (応答の形)
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct CandidateRow {
+    pub row_id: String,
+    pub day: NaiveDate,
+    pub item_name: String,
+}
+
+/// 候補の期間 1 件 (同じ区分・半日で暦日が続く一番星の行をまとめたもの。半日は単日)
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct CandidatePeriod {
+    pub kind: &'static str,
+    pub start_date: NaiveDate,
+    pub end_date: NaiveDate,
+    pub half: Option<&'static str>,
+    pub rows: Vec<CandidateRow>,
+}
+
+/// 乗務員 `employee_cd` の行のうち休暇の区分に当たり `row_id` を持つものを、同じ (区分, 半日) で暦日が続くもの
+/// ごとに 1 期間にまとめる (半日は同じ日だけ)。開始日・区分の順
+pub fn candidate_periods(rows: &[IchibanRow<'_>], employee_cd: &str) -> Vec<CandidatePeriod> {
+    let mut leaves: Vec<(DayKind, NaiveDate, &str, &str)> = rows
+        .iter()
+        .filter(|r| r.employee_cd == employee_cd)
+        .filter_map(|r| match (normalize(&r.item_name), r.row_id.as_deref()) {
+            (Normalized::Leave(kind), Some(id)) => Some((kind, r.date, id, r.item_name.as_str())),
+            _ => None,
+        })
+        .collect();
+    leaves.sort();
+    let mut out: Vec<CandidatePeriod> = Vec::new();
+    for (kind, date, row_id, item_name) in leaves {
+        let row = CandidateRow {
+            row_id: row_id.to_owned(),
+            day: date,
+            item_name: item_name.to_owned(),
+        };
+        let reach = Duration::days(if kind.half.is_some() { 0 } else { 1 });
+        match out.last_mut() {
+            Some(p) if p.kind == kind.kind && p.half == kind.half && date <= p.end_date + reach => {
+                p.end_date = date;
+                p.rows.push(row);
+            }
+            _ => out.push(CandidatePeriod {
+                kind: kind.kind,
+                start_date: date,
+                end_date: date,
+                half: kind.half,
+                rows: vec![row],
+            }),
+        }
+    }
+    out.sort_by_key(|p| (p.start_date, p.kind, p.half));
+    out
+}
+
+/// 紐づけたときの一番星の行 (`leave_link_rows` の 1 行。`item_name` は生の品名)
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkRow {
+    pub row_id: String,
+    pub employee_cd: String,
+    pub day: NaiveDate,
+    pub item_name: String,
+    pub last_updated: Option<String>,
+}
+
+impl TxOutput for LinkRow {}
+
+/// 受け取った `row_ids` を、一番星の行 (`rows`) のうち乗務員 `employee_cd` のものから引く。
+/// 1 つでも無い (別の乗務員の行を含む) なら `None`
+pub fn pick_link_rows(
+    rows: &[IchibanRow<'_>],
+    employee_cd: &str,
+    row_ids: &[String],
+) -> Option<Vec<LinkRow>> {
+    row_ids
+        .iter()
+        .map(|id| {
+            rows.iter()
+                .find(|r| r.employee_cd == employee_cd && r.row_id.as_ref() == Some(id))
+                .map(|r| LinkRow {
+                    row_id: id.clone(),
+                    employee_cd: r.employee_cd.to_owned(),
+                    day: r.date,
+                    item_name: r.item_name.clone(),
+                    last_updated: r.last_updated.clone(),
+                })
+        })
+        .collect()
+}
+
+/// 保存した (ページ, 行) を一番星の今の行と比べ、紐づけを解除するページを返す。`codes` に入らない乗務員の行は比べない。
+/// 解除の条件 (文字列のまま比べる): 同じ `row_id` の行が無い / 乗務員・日・品名のどれかが違う /
+/// 保存した最終更新が在り、今の最終更新と違う
+pub fn stale_pages(
+    saved: &[(Uuid, LinkRow)],
+    rows: &[IchibanRow<'_>],
+    codes: &BTreeSet<String>,
+) -> BTreeSet<Uuid> {
+    let now: BTreeMap<&str, &IchibanRow<'_>> = rows
+        .iter()
+        .filter_map(|r| Some((r.row_id.as_deref()?, r)))
+        .collect();
+    saved
+        .iter()
+        .filter(|(_, s)| codes.contains(&s.employee_cd))
+        .filter(|(_, s)| {
+            now.get(s.row_id.as_str()).is_none_or(|r| {
+                r.employee_cd != s.employee_cd
+                    || r.date != s.day
+                    || r.item_name != s.item_name
+                    || (s.last_updated.is_some() && s.last_updated != r.last_updated)
+            })
+        })
+        .map(|(page, _)| *page)
+        .collect()
 }
 
 /// 申請書の期間 1 行 (紐づけ済みのページのもの)
@@ -316,8 +475,13 @@ pub struct OpenAlert {
 impl TxOutput for OpenAlert {}
 
 /// 警告を乗務員ごとに並べた文面。長ければ [`MESSAGE_CHARS`] 字程度で分ける (各通の先頭に見出し)。
-/// `names` は乗務員コード → 氏名 (無ければコードだけ)
-pub fn messages(alerts: &[PendingAlert], names: &BTreeMap<String, String>) -> Vec<Message> {
+/// `names` は乗務員コード → 氏名 (無ければコードだけ)。`unlinked` (毎朝の解除の件数) が 1 以上なら 1 通目の見出しの
+/// 次の行に載せる (警告が無くても 1 通出す)
+pub fn messages(
+    alerts: &[PendingAlert],
+    names: &BTreeMap<String, String>,
+    unlinked: u64,
+) -> Vec<Message> {
     let mut order: Vec<usize> = (0..alerts.len()).collect();
     order.sort_by_key(|&i| {
         let a = &alerts[i];
@@ -352,15 +516,29 @@ pub fn messages(alerts: &[PendingAlert], names: &BTreeMap<String, String>) -> Ve
         }
     }
     let total = chunks.len();
+    let unlinked_line = format!("一番星が変わったため紐づけを解除: {unlinked} 件");
+    if total == 0 {
+        return if unlinked > 0 {
+            vec![Message {
+                text: format!("【勤怠申請】{unlinked_line}"),
+                alerts: Vec::new(),
+            }]
+        } else {
+            Vec::new()
+        };
+    }
     chunks
         .into_iter()
         .enumerate()
-        .map(|(n, (lines, idx, _))| {
+        .map(|(n, (mut lines, idx, _))| {
             let part = if total > 1 {
                 format!(" ({}/{total})", n + 1)
             } else {
                 String::new()
             };
+            if n == 0 && unlinked > 0 {
+                lines.insert(0, unlinked_line.clone());
+            }
             Message {
                 text: format!(
                     "【勤怠申請】一番星と申請書のずれ {} 件{part}\n{}",
@@ -630,9 +808,9 @@ mod tests {
             alert("1021", "2026-10-03", "yukyu", ICHIBAN_ONLY),
         ];
         let names = BTreeMap::from([("1021".to_owned(), "山田太郎".to_owned())]);
-        let got = messages(&alerts, &names);
+        let got = messages(&alerts, &names, 0);
         assert_eq!(got, vec![Message { text: "【勤怠申請】一番星と申請書のずれ 2 件\n1021 山田太郎: 10/03 有休 — 申請書なし\n1022: 10/05 労災 — 一番星に入力なし".into(), alerts: vec![1, 0] }]);
-        assert!(messages(&[], &names).is_empty());
+        assert!(messages(&[], &names, 0).is_empty());
     }
 
     #[test]
@@ -640,7 +818,7 @@ mod tests {
         let alerts: Vec<PendingAlert> = (0..120)
             .map(|i| alert(&format!("{:04}", i), "2026-10-03", "tokukyu", ICHIBAN_ONLY))
             .collect();
-        let got = messages(&alerts, &BTreeMap::new());
+        let got = messages(&alerts, &BTreeMap::new(), 0);
         assert_eq!(got.len(), 2);
         assert!(got[0].text.starts_with(
             "【勤怠申請】一番星と申請書のずれ 120 件 (1/2)\n0000: 10/03 特別休暇 — 申請書なし"
@@ -649,6 +827,214 @@ mod tests {
             .iter()
             .all(|m| m.text.chars().count() <= MESSAGE_CHARS + 40));
         assert_eq!(got.iter().map(|m| m.alerts.len()).sum::<usize>(), 120);
+    }
+
+    #[test]
+    fn messages_carry_the_unlinked_count() {
+        let names = BTreeMap::new();
+        // 警告が無くても解除があれば 1 通
+        assert_eq!(
+            messages(&[], &names, 2),
+            vec![Message {
+                text: "【勤怠申請】一番星が変わったため紐づけを解除: 2 件".into(),
+                alerts: vec![]
+            }]
+        );
+        let alerts = [alert("1021", "2026-10-03", "yukyu", ICHIBAN_ONLY)];
+        assert_eq!(
+            messages(&alerts, &names, 1),
+            vec![Message {
+                text: "【勤怠申請】一番星と申請書のずれ 1 件\n一番星が変わったため紐づけを解除: 1 件\n1021: 10/03 有休 — 申請書なし".into(),
+                alerts: vec![0]
+            }]
+        );
+        // 分けたときは 1 通目だけ
+        let many: Vec<PendingAlert> = (0..120)
+            .map(|i| alert(&format!("{:04}", i), "2026-10-03", "tokukyu", ICHIBAN_ONLY))
+            .collect();
+        let got = messages(&many, &names, 3);
+        assert_eq!(got.len(), 2);
+        assert!(got[0].text.starts_with(
+            "【勤怠申請】一番星と申請書のずれ 120 件 (1/2)\n一番星が変わったため紐づけを解除: 3 件\n0000:"
+        ));
+        assert!(!got[1].text.contains("紐づけを解除"));
+    }
+
+    fn row<'a>(
+        emp: &'a str,
+        date: &str,
+        item: &str,
+        row_id: Option<&str>,
+        last_updated: Option<&str>,
+    ) -> IchibanRow<'a> {
+        IchibanRow {
+            employee_cd: emp,
+            date: d(date),
+            item_name: item.into(),
+            row_id: row_id.map(Into::into),
+            last_updated: last_updated.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn day_rows_keep_raw_values() {
+        let c = codes(&["1021"]);
+        let body = serde_json::to_vec(&json!({"data": [
+            {"employee_code": " 1021 ", "date": "2026-10-01", "item_name": " 有休 ", "row_id": "20261001-1", "last_updated": "2026-10-01 09:00:00.000"},
+            {"employee_code": 1021, "date": "2026-10-02", "item_name": null},
+            {"employee_code": "2001", "date": "2026-10-02", "item_name": "有休", "row_id": "20261002-9"}
+        ]}))
+        .unwrap();
+        assert_eq!(
+            read_day_rows(&body, &c).unwrap(),
+            vec![
+                row(
+                    "1021",
+                    "2026-10-01",
+                    " 有休 ",
+                    Some("20261001-1"),
+                    Some("2026-10-01 09:00:00.000")
+                ),
+                row("1021", "2026-10-02", "", None, None)
+            ]
+        );
+        assert_eq!(read_day_rows(b"[]", &c), Err("ichiban_bad_response"));
+    }
+
+    #[test]
+    fn candidates_merge_consecutive_days_of_the_same_kind() {
+        let rows = [
+            row("1021", "2026-10-02", "有休", Some("b"), None),
+            row("1021", "2026-10-01", "有休（積置）", Some("a"), None),
+            // 1 日あくと分ける
+            row("1021", "2026-10-04", "有休", Some("c"), None),
+            // 区分が違えば分ける
+            row("1021", "2026-10-05", "労災", Some("d"), None),
+            // 半日は単日 (続く日でもまとめない)
+            row("1021", "2026-10-06", "午前休", Some("e"), None),
+            row("1021", "2026-10-07", "午前休", Some("f"), None),
+            row("1021", "2026-10-07", "午後休", Some("g"), None),
+            // 対象外・表に無い語・row_id 無し・別の乗務員は候補に入れない
+            row("1021", "2026-10-03", "休み", Some("h"), None),
+            row("1021", "2026-10-03", "謎", Some("i"), None),
+            row("1021", "2026-10-03", "有休", None, None),
+            row("1022", "2026-10-03", "有休", Some("j"), None),
+        ];
+        let got = candidate_periods(&rows, "1021");
+        // (区分 開始..終了 半日 [row_id])
+        let summary: Vec<String> = got
+            .iter()
+            .map(|p| {
+                let ids: Vec<&str> = p.rows.iter().map(|r| r.row_id.as_str()).collect();
+                format!(
+                    "{} {}..{} {:?} {ids:?}",
+                    p.kind, p.start_date, p.end_date, p.half
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                r#"yukyu 2026-10-01..2026-10-02 None ["a", "b"]"#,
+                r#"yukyu 2026-10-04..2026-10-04 None ["c"]"#,
+                r#"rousai 2026-10-05..2026-10-05 None ["d"]"#,
+                r#"yukyu 2026-10-06..2026-10-06 Some("am") ["e"]"#,
+                r#"yukyu 2026-10-07..2026-10-07 Some("am") ["f"]"#,
+                r#"yukyu 2026-10-07..2026-10-07 Some("pm") ["g"]"#,
+            ]
+        );
+        assert_eq!(
+            got[0].rows[0],
+            CandidateRow {
+                row_id: "a".into(),
+                day: d("2026-10-01"),
+                item_name: "有休（積置）".into()
+            }
+        );
+        // 同じ日の同じ区分の行は 1 期間に入れる
+        let dup = [
+            row("1021", "2026-10-01", "午前休", Some("x"), None),
+            row("1021", "2026-10-01", "午前休", Some("y"), None),
+        ];
+        let got = candidate_periods(&dup, "1021");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].rows.len(), 2);
+    }
+
+    #[test]
+    fn link_rows_must_exist_for_the_employee() {
+        let rows = [
+            row("1021", "2026-10-01", "有休", Some("a"), Some("t1")),
+            row("1022", "2026-10-02", "有休", Some("b"), None),
+        ];
+        assert_eq!(
+            pick_link_rows(&rows, "1021", &["a".into()]),
+            Some(vec![LinkRow {
+                row_id: "a".into(),
+                employee_cd: "1021".into(),
+                day: d("2026-10-01"),
+                item_name: "有休".into(),
+                last_updated: Some("t1".into())
+            }])
+        );
+        assert_eq!(pick_link_rows(&rows, "1021", &["b".into()]), None);
+        assert_eq!(
+            pick_link_rows(&rows, "1021", &["a".into(), "z".into()]),
+            None
+        );
+    }
+
+    #[test]
+    fn stale_pages_compare_rows_as_strings() {
+        let saved_row =
+            |row_id: &str, emp: &str, day: &str, item: &str, lu: Option<&str>| LinkRow {
+                row_id: row_id.into(),
+                employee_cd: emp.into(),
+                day: d(day),
+                item_name: item.into(),
+                last_updated: lu.map(Into::into),
+            };
+        let p = Uuid::from_u128;
+        let saved = [
+            // 同じ (最終更新も同じ) → 残す
+            (
+                p(1),
+                saved_row("a", "1021", "2026-10-01", "有休", Some("t1")),
+            ),
+            // 最終更新が変わった → 解除
+            (
+                p(2),
+                saved_row("b", "1021", "2026-10-02", "有休", Some("t1")),
+            ),
+            // 最終更新を持たず、品名が変わった → 解除
+            (p(3), saved_row("c", "1021", "2026-10-03", "有休", None)),
+            // 最終更新を持たず、中身が同じ → 残す (一番星の側に最終更新が付いても)
+            (p(4), saved_row("d", "1021", "2026-10-04", "有休", None)),
+            // 行が消えた → 解除
+            (p(5), saved_row("e", "1021", "2026-10-05", "有休", None)),
+            // 日が変わった・乗務員が変わった → 解除
+            (
+                p(6),
+                saved_row("f", "1021", "2026-10-06", "有休", Some("t1")),
+            ),
+            (
+                p(7),
+                saved_row("g", "1021", "2026-10-07", "有休", Some("t1")),
+            ),
+            // codes に入らない乗務員の行は比べない
+            (p(8), saved_row("h", "9999", "2026-10-08", "有休", None)),
+        ];
+        let rows = [
+            row("1021", "2026-10-01", "有休", Some("a"), Some("t1")),
+            row("1021", "2026-10-02", "有休", Some("b"), Some("t2")),
+            row("1021", "2026-10-03", "午前休", Some("c"), None),
+            row("1021", "2026-10-04", "有休", Some("d"), Some("t9")),
+            row("1021", "2026-10-16", "有休", Some("f"), Some("t1")),
+            row("1022", "2026-10-07", "有休", Some("g"), Some("t1")),
+            row("1021", "2026-10-09", "有休", None, None),
+        ];
+        let got = stale_pages(&saved, &rows, &codes(&["1021", "1022"]));
+        assert_eq!(got, BTreeSet::from([p(2), p(3), p(5), p(6), p(7)]));
     }
 
     #[test]

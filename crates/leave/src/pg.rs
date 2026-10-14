@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::cron::NotifyTarget;
 use crate::grants::{self, AutoGrant, Grant, GrantWrite, Opening, OpeningPut};
 use crate::pages::{Document, DocumentsQuery, ListQuery, Page, PageDetail, PageUpdate, Period};
-use crate::reconcile::{LinkedPeriod, Mismatch, OpenAlert, PendingAlert};
+use crate::reconcile::{LinkRow, LinkedPeriod, Mismatch, OpenAlert, PendingAlert};
 use crate::settings::{Settings, ValidSettings};
 
 pub mod sql {
@@ -43,7 +43,7 @@ pub mod sql {
 
     const PAGE_COLUMNS: &str =
         "id, r2_key, page_no, mail_from, subject, received_at, employee_cd, status, \
-         linked_by, linked_at, note, created_at";
+         linked_by, linked_at, note, created_at, base_date";
 
     /// 一覧・詳細・PDF の key に共通の「見えるページ」の条件。`$n` が NULL なら全部 (本番)、在れば受信がそれ以降の
     /// ページだけ (staging の表示制限。`STAGING_VISIBLE_MINUTES`)
@@ -114,6 +114,30 @@ pub mod sql {
          (tenant_id, r2_key, page_no, mail_from, subject, received_at, status) \
          SELECT $1, $2, g, $3, $4, $5, 'unlinked' FROM generate_series(1, $6::int) AS g \
          ON CONFLICT (r2_key, page_no) DO NOTHING";
+
+    /// PDF の基準日を同じ `r2_key` の全ページに書く (`$2` のページの PDF)
+    pub const BASE_DATE_UPDATE: &str = "UPDATE alc_api.leave_pages SET base_date = $3 \
+         WHERE tenant_id = $1 AND r2_key = \
+         (SELECT r2_key FROM alc_api.leave_pages WHERE tenant_id = $1 AND id = $2)";
+
+    pub const LINK_ROWS_DELETE: &str =
+        "DELETE FROM alc_api.leave_link_rows WHERE tenant_id = $1 AND page_id = $2";
+
+    /// 紐づけた一番星の行をまとめて入れる (空の配列なら 0 行)
+    pub const LINK_ROWS_INSERT: &str = "INSERT INTO alc_api.leave_link_rows \
+         (tenant_id, page_id, row_id, employee_cd, day, item_name, last_updated) \
+         SELECT $1, $2, u.r, u.e, u.d, u.i, u.l \
+         FROM unnest($3::text[], $4::text[], $5::date[], $6::text[], $7::text[]) AS u(r, e, d, i, l)";
+
+    /// 紐づけた一番星の行のうち、日が `$2`〜`$3` のもの (毎朝の比べ)
+    pub const LINK_ROWS_IN_WINDOW: &str =
+        "SELECT page_id, row_id, employee_cd, day, item_name, last_updated FROM alc_api.leave_link_rows \
+         WHERE tenant_id = $1 AND day BETWEEN $2 AND $3 ORDER BY page_id, row_id";
+
+    /// 紐づけを外す (乗務員C と備考は残す。紐づけ済みのページだけ)
+    pub const PAGE_UNLINK: &str = "UPDATE alc_api.leave_pages \
+         SET status = 'unlinked', linked_by = NULL, linked_at = NULL \
+         WHERE tenant_id = $1 AND id = $2 AND status = 'linked'";
 
     pub fn page_r2_key() -> String {
         format!(
@@ -692,6 +716,7 @@ fn page_from_row(row: &Row) -> Page {
         linked_at: row.get(9),
         note: row.get(10),
         created_at: row.get(11),
+        base_date: row.get(12),
     }
 }
 
@@ -893,17 +918,24 @@ pub async fn get_page(
     .await
 }
 
-/// 1 つの transaction で: ページを行ロック → 期間を全削除 → 挿入 → ページを更新。
+/// 1 つの transaction で: ページを行ロック → 期間を全削除 → 挿入 → 一番星の行を全削除 → `link_rows` を挿入 → ページを更新。
 /// `linked_by` / `linked_at` は `status = linked` のときだけ `actor` / 今にし、それ以外は消す。
+/// `link_rows` は確かめ済みの行 (`ledger::verified_link_rows`。linked 以外・行の指定が無ければ空 = 削除だけ)。
 /// 自 tenant に見えなければ何も書かずに `None`
 pub async fn update_page(
     pg: &mut PgClient,
     tenant_id: Uuid,
     id: Uuid,
     u: PageUpdate,
+    link_rows: Vec<LinkRow>,
     actor: Option<String>,
     visible_since: Option<DateTime<Utc>>,
 ) -> Result<Option<PageDetail>, Error> {
+    let row_ids: Vec<String> = link_rows.iter().map(|r| r.row_id.clone()).collect();
+    let codes: Vec<String> = link_rows.iter().map(|r| r.employee_cd.clone()).collect();
+    let days: Vec<NaiveDate> = link_rows.iter().map(|r| r.day).collect();
+    let items: Vec<String> = link_rows.iter().map(|r| r.item_name.clone()).collect();
+    let updated: Vec<Option<String>> = link_rows.into_iter().map(|r| r.last_updated).collect();
     pg.tenant_tx(tenant_id, move |tx| {
         Box::pin(async move {
             let ids = [
@@ -940,6 +972,20 @@ pub async fn update_page(
                 )
                 .await?;
             }
+            tx.execute_typed(sql::LINK_ROWS_DELETE, &ids).await?;
+            tx.execute_typed(
+                sql::LINK_ROWS_INSERT,
+                &[
+                    (&tenant_id, Type::UUID),
+                    (&id, Type::UUID),
+                    (&row_ids, Type::TEXT_ARRAY),
+                    (&codes, Type::TEXT_ARRAY),
+                    (&days, Type::DATE_ARRAY),
+                    (&items, Type::TEXT_ARRAY),
+                    (&updated, Type::TEXT_ARRAY),
+                ],
+            )
+            .await?;
             let row = tx
                 .query_typed_one(
                     &sql::page_update(),
@@ -958,6 +1004,106 @@ pub async fn update_page(
                 page: page_from_row(&row),
                 periods,
             }))
+        })
+    })
+    .await
+}
+
+/// PDF の基準日を、ページ `id` と同じ `r2_key` の全ページに書く (1 つの transaction で、見える条件は [`get_page`] と同じ)。
+/// 書いたページ数。自 tenant に見えなければ何も書かずに `None`
+pub async fn set_base_date(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    id: Uuid,
+    base_date: Option<NaiveDate>,
+    visible_since: Option<DateTime<Utc>>,
+) -> Result<Option<u64>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            if tx
+                .query_typed_opt(
+                    &sql::page_by_id(),
+                    &[
+                        (&tenant_id, Type::UUID),
+                        (&id, Type::UUID),
+                        (&visible_since, Type::TIMESTAMPTZ),
+                    ],
+                )
+                .await?
+                .is_none()
+            {
+                return Ok(None);
+            }
+            let n = tx
+                .execute_typed(
+                    sql::BASE_DATE_UPDATE,
+                    &[
+                        (&tenant_id, Type::UUID),
+                        (&id, Type::UUID),
+                        (&base_date, Type::DATE),
+                    ],
+                )
+                .await?;
+            Ok(Some(n))
+        })
+    })
+    .await
+}
+
+/// 紐づけた一番星の行のうち日が `from`〜`to` のもの (ページ, 行)
+pub async fn link_rows(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Result<Vec<(Uuid, LinkRow)>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(
+                    sql::LINK_ROWS_IN_WINDOW,
+                    &[
+                        (&tenant_id, Type::UUID),
+                        (&from, Type::DATE),
+                        (&to, Type::DATE),
+                    ],
+                )
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| {
+                    (
+                        r.get(0),
+                        LinkRow {
+                            row_id: r.get(1),
+                            employee_cd: r.get(2),
+                            day: r.get(3),
+                            item_name: r.get(4),
+                            last_updated: r.get(5),
+                        },
+                    )
+                })
+                .collect())
+        })
+    })
+    .await
+}
+
+/// ページ 1 枚の紐づけを外す (1 つの transaction で: 期間と一番星の行を消し、未紐づけに戻す。乗務員C と備考は残す)。
+/// 外したら 1 (紐づけ済みでなければ 0)
+pub async fn unlink_page(pg: &mut PgClient, tenant_id: Uuid, id: Uuid) -> Result<u64, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let ids = [
+                (
+                    &tenant_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                    Type::UUID,
+                ),
+                (&id, Type::UUID),
+            ];
+            tx.execute_typed(sql::PERIODS_DELETE, &ids).await?;
+            tx.execute_typed(sql::LINK_ROWS_DELETE, &ids).await?;
+            tx.execute_typed(sql::PAGE_UNLINK, &ids).await
         })
     })
     .await
