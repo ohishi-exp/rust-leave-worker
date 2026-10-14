@@ -79,6 +79,7 @@ pub struct Document {
     pub unlinked_count: i64,
     pub linked_count: i64,
     pub ignored_count: i64,
+    pub base_date: Option<NaiveDate>,
 }
 
 impl TxOutput for Document {}
