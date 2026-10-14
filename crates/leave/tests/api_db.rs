@@ -1297,7 +1297,8 @@ async fn alert_row(
         .unwrap();
 }
 
-/// 未解消の警告の一覧: 未解決かつ窓 (今日 2026-10-10 (JST) − 62 日 〜 昨日) の中だけを乗務員・日の順で。
+/// 未解消の警告の一覧: 未解決かつ窓 (2026-08-01 〜 昨日 = 今日 2026-10-10 (JST) − 1 日) の中だけを乗務員・日の順で。
+/// 応答に窓 (`from` / `to`) も載せる。
 /// 解決済み・窓の外 (未解決のまま表に残る行)・他の tenant の行は出ない
 #[tokio::test]
 async fn list_alerts_open_in_window_only() {
@@ -1309,7 +1310,13 @@ async fn list_alerts_open_in_window_only() {
     };
     // 1 件も無ければ空の配列
     let got = get(t).await;
-    assert_eq!((got.status, got.json()), (200, json!({"alerts": []})));
+    assert_eq!(
+        (got.status, got.json()),
+        (
+            200,
+            json!({"alerts": [], "from": "2026-08-01", "to": "2026-10-09"})
+        )
+    );
 
     let ichiban_only = ("yukyu", "ichiban_only");
     alert_row(t, "1022", "2026-10-03", ichiban_only, None, false).await;
@@ -1324,7 +1331,7 @@ async fn list_alerts_open_in_window_only() {
     .await;
     alert_row(t, "1021", "2026-08-09", ichiban_only, None, false).await;
     // 窓の外 (前日・今日) と解決済み
-    alert_row(t, "1021", "2026-08-08", ichiban_only, None, false).await;
+    alert_row(t, "1021", "2026-07-31", ichiban_only, None, false).await;
     alert_row(t, "1021", "2026-10-10", ichiban_only, None, false).await;
     alert_row(
         t,
@@ -1349,7 +1356,7 @@ async fn list_alerts_open_in_window_only() {
              "first_seen_at": "2026-10-01T00:00:00Z", "notified_at": "2026-10-09T23:00:00Z"},
             {"employee_cd": "1022", "day": "2026-10-03", "kind": "yukyu", "direction": "ichiban_only",
              "first_seen_at": "2026-10-01T00:00:00Z", "notified_at": null}
-        ]})
+        ], "from": "2026-08-01", "to": "2026-10-09"})
     );
     let got = get(other).await;
     assert_eq!(got.json()["alerts"].as_array().unwrap().len(), 1);
@@ -1771,6 +1778,117 @@ async fn calendar_matches_days_and_counts_rousai() {
         ),
         (Some(1), Some("山田太郎"), Some("2026-10"))
     );
+}
+
+/// カレンダーの申請書の側: 労災のページは、そのあと一番星の労災が続く日 (日曜・祝日は行が無くても続き、行の無い平日・土曜で
+/// 止まる) も覆う。祝日が取れない年があればログに固定語を 1 行
+#[tokio::test]
+async fn calendar_extends_rousai_pages() {
+    let t = tenant().await;
+    let rows: Vec<Value> = [
+        "2026-09-14",
+        "2026-09-18",
+        "2026-09-19",
+        "2026-09-24",
+        "2026-09-30",
+        "2026-10-01",
+        "2026-10-02",
+        "2026-10-03",
+        "2026-10-05",
+        "2026-10-07",
+    ]
+    .iter()
+    .map(|d| day("1021", d, "労災"))
+    .collect();
+    let mut f = ledger_ichiban(&rows);
+    support::add_days(&mut f, "2024-04-01", "2026-09-30", &rows);
+    let a = app(FakePdfs::default(), Some(f)).await;
+    put_settings(&a, t, json!({"dept_codes": ["10"]})).await;
+    let link =
+        |periods: Value| json!({"employee_cd": "1021", "status": "linked", "periods": periods});
+    let p1 = page(t, &format!("{t}/r1.pdf"), 1, "2026-09-14T00:00:00Z").await;
+    let p2 = page(t, &format!("{t}/r2.pdf"), 1, "2026-09-30T00:00:00Z").await;
+    // 前の年に終わった労災 (後ろに行が無い。2025 年の祝日は取れない)
+    let p3 = page(t, &format!("{t}/r3.pdf"), 1, "2025-12-29T00:00:00Z").await;
+    for (p, periods) in [
+        (
+            p1,
+            json!([{"kind": "rousai", "start_date": "2026-09-14", "end_date": "2026-09-18"}]),
+        ),
+        (
+            p2,
+            json!([{"kind": "rousai", "start_date": "2026-09-30", "end_date": "2026-09-30"}]),
+        ),
+        (
+            p3,
+            json!([{"kind": "rousai", "start_date": "2025-12-29", "end_date": "2025-12-30"}]),
+        ),
+    ] {
+        let uri = format!("/api/leave/pages/{p}");
+        let got = call(&a, "PUT", &uri, Some(t), ADMIN, Some(link(periods))).await;
+        assert_eq!(got.status, 200);
+    }
+    let get = |month: &'static str| {
+        let a = &a;
+        async move {
+            let uri = format!("/api/leave/calendar?employee_cd=1021&month={month}");
+            call(a, "GET", &uri, Some(t), ADMIN, None).await.json()
+        }
+    };
+    let name = |id: &Value| match id.as_str() {
+        Some(id) if id == p1.to_string() => "p1",
+        Some(id) if id == p2.to_string() => "p2",
+        _ => "-",
+    };
+    let pdf_days = |v: &Value| -> Vec<(String, String, String)> {
+        v["days"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| {
+                (
+                    d["date"].as_str().unwrap().to_owned(),
+                    name(&d["pdf"][0]["page_id"]).to_owned(),
+                    d["status"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    };
+    let x = |d: &str, p: &str, s: &str| (d.to_owned(), p.to_owned(), s.to_owned());
+    // 9 月: 9/19 (土) に行、9/20 (日)・9/21〜23 (祝) は飛ばし、9/24 (木) まで p1 が覆い、9/25 (金) で止まる
+    let v = get("2026-09").await;
+    assert_eq!(
+        pdf_days(&v),
+        vec![
+            x("2026-09-14", "p1", "match"),
+            x("2026-09-15", "p1", "pdf_only"),
+            x("2026-09-16", "p1", "pdf_only"),
+            x("2026-09-17", "p1", "pdf_only"),
+            x("2026-09-18", "p1", "match"),
+            x("2026-09-19", "p1", "match"),
+            x("2026-09-24", "p1", "match"),
+            x("2026-09-30", "p2", "match"),
+        ]
+    );
+    // 10 月: p2 が月をまたいで 10/1〜10/3 (土)・10/5 (月、10/4 (日) は飛ばす) を覆い、10/6 (火) で止まる。10/7 は一番星だけ
+    let v = get("2026-10").await;
+    assert_eq!(
+        pdf_days(&v),
+        vec![
+            x("2026-10-01", "p2", "match"),
+            x("2026-10-02", "p2", "match"),
+            x("2026-10-03", "p2", "match"),
+            x("2026-10-05", "p2", "match"),
+            x("2026-10-07", "-", "ichiban_only"),
+        ]
+    );
+    assert_eq!(
+        v["days"][0]["pdf"],
+        json!([{"kind": "rousai", "half": null, "page_id": p2.to_string()}])
+    );
+    // 2025 年の祝日が取れなかった (固定語だけ。カレンダー 1 回に 1 行)
+    let logs = a.logs.lock().unwrap();
+    assert_eq!(*logs, vec!["holidays_unavailable"; 2]);
 }
 
 #[tokio::test]

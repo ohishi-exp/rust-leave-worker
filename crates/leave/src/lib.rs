@@ -6,6 +6,7 @@
 //! - [`ingest`] / [`internal`] — 取り込む PDF の検査と R2 の key、取り込みの本体 [`internal::ingest_pdf`]
 //! - [`inbox`] — スキャンの inbox の取り込み (Queue の consumer。tenant は auth-worker が検証したチケットから)
 //! - [`ichiban`] — 一番星 Worker の口の抽象と応答の解釈
+//! - [`holidays`] — 日本の祝日の口の抽象と応答の解釈 (労災の紐づけの延長)
 //! - [`store`] — PDF の置き場の抽象
 //! - [`pg`] — SQL を流す 1 か所 (`tenant_tx` + `query_typed` 系だけ)
 //! - [`kinds`] / [`grants`] / [`reconcile`] — 品名N の正規化・有給の付与と残・突き合わせ (純粋関数)
@@ -16,6 +17,7 @@
 pub mod auth;
 pub mod cron;
 pub mod grants;
+pub mod holidays;
 pub mod ichiban;
 pub mod inbox;
 pub mod ingest;

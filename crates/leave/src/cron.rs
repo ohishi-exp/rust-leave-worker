@@ -1,11 +1,12 @@
 //! 毎朝の突き合わせ (worker の `#[event(scheduled)]` から呼ぶ。本番だけ — staging には一番星の binding が無い)。
 //!
 //! 有効な tenant ([`pg::enabled_tenants`]) ごとに:
-//! 1. 一番星の社員を tenant の `dept_codes` で絞る。休暇は「今日 − 62 日 〜 今日 − 1 日」を 1 回だけ取り、乗務員で絞って正規化する
+//! 1. 一番星の社員を tenant の `dept_codes` で絞る。休暇は窓 ([`window`] = [`ALERTS_FROM`] 〜 今日 − 1 日) を 1 回だけ取り、乗務員で絞って正規化する
 //!    紐づけたときに保存した一番星の行 (`leave_link_rows`、日が窓の中のもの) を今の行と比べ、消えた・変わった行を持つ
 //!    ページの紐づけを外す (`reconcile::stale_pages`。乗務員が部門から外れた行は比べない。一番星の取得に失敗した回は
 //!    ここまで来ないので外さない)。外した件数は通知の 1 通目に載せる
-//! 2. 紐づけ済みの期間を同じ窓で日ごとに展開する
+//! 2. 紐づけ済みの期間を同じ窓で日ごとに展開し、労災の期間はそのあと一番星の労災が続く日へ延ばす
+//!    (`reconcile::rousai_extension`。保存しない。祝日が取れなければ日曜だけ飛ばし、ログに `holidays_unavailable`)
 //! 3. (乗務員, 日, 区分) の差を取る (`今日 − grace_days` より後の日は待つ)
 //! 4. `leave_alerts` に書き、窓の中で今回ずれていない未解決の行を解決にする
 //! 5. 未解消 (未解決かつ窓の中) の警告を、通知済みかを問わず毎朝全部、乗務員ごとにまとめて LINE WORKS (グループか個人)
@@ -23,21 +24,28 @@ use futures_util::future::BoxFuture;
 use uuid::Uuid;
 
 use crate::grants::statutory;
+use crate::holidays::{self, HolidaysApi};
 use crate::ichiban::{IchibanApi, EMPLOYEES_PATH};
 use crate::pg;
 use crate::reconcile::{
-    days_paths, diff, expand_periods, messages, parse_employees, push_days, read_day_rows,
-    stale_pages, IchibanDays,
+    days_paths, diff, expand_periods, extension_span, messages, parse_employees, push_days,
+    read_day_rows, rousai_extension, stale_pages, IchibanDays, DAYS_MAX_SPAN,
 };
 
-/// 窓の長さ (今日 − 62 日 〜 今日 − 1 日)
-pub const WINDOW_DAYS: i64 = 62;
+/// 窓の始め (この日より前の漏れは数えない)
+pub const ALERTS_FROM: NaiveDate = NaiveDate::from_ymd_opt(2026, 8, 1).expect("ALERTS_FROM");
 
-/// 突き合わせの窓 (今日 − [`WINDOW_DAYS`] 日, 今日 − 1 日)。毎朝の通知と未解消の一覧 (`GET /api/leave/alerts`) が同じこれを使う
+/// 窓の長さの上限 (日)。一番星の休暇の口は 1 回 92 日まで・Service Binding の呼び出しは 1 リクエスト 32 回までなので、
+/// 社員の口 1 回と休暇の口 30 回に収める (約 7.5 年。超えたら窓の始めを切り上げる)
+pub const WINDOW_MAX_DAYS: i64 = DAYS_MAX_SPAN * 30;
+
+/// 突き合わせの窓 ([`ALERTS_FROM`] 〜 今日 − 1 日。[`WINDOW_MAX_DAYS`] を超えたら始めを切り上げる。始めが終わりより後なら
+/// 空の窓)。毎朝の照合・解除と未解消の一覧 (`GET /api/leave/alerts`) が同じこれを使う
 pub fn window(today: NaiveDate) -> (NaiveDate, NaiveDate) {
+    let to = today - Duration::days(1);
     (
-        today - Duration::days(WINDOW_DAYS),
-        today - Duration::days(1),
+        ALERTS_FROM.max(to - Duration::days(WINDOW_MAX_DAYS - 1)),
+        to,
     )
 }
 
@@ -105,6 +113,8 @@ pub struct TenantResult {
     pub grants: u64,
     /// 一番星の行が消えた・変わったので紐づけを外したページの数
     pub unlinked: u64,
+    /// 労災の延長に使う祝日が取れなかった (日曜だけ飛ばした)
+    pub holidays_unavailable: bool,
     /// 失敗した段 (途中で止まった)
     pub failed: Option<String>,
 }
@@ -128,7 +138,7 @@ impl Summary {
             .map(|(i, t)| match &t.failed {
                 Some(stage) => format!("#{} failed={stage}", i + 1),
                 None => format!(
-                    "#{} unlinked={} mismatches={} upserted={} resolved={} pending={} sent={} notified={} grants={}",
+                    "#{} unlinked={} mismatches={} upserted={} resolved={} pending={} sent={} notified={} grants={}{}",
                     i + 1,
                     t.unlinked,
                     t.mismatches,
@@ -137,7 +147,12 @@ impl Summary {
                     t.pending,
                     t.sent_messages,
                     t.notified,
-                    t.grants
+                    t.grants,
+                    if t.holidays_unavailable {
+                        format!(" {}", holidays::UNAVAILABLE)
+                    } else {
+                        String::new()
+                    }
                 ),
             })
             .collect();
@@ -190,6 +205,7 @@ async fn fetch_ichiban(
 pub async fn run(
     pg: &mut PgClient,
     ichiban: &dyn IchibanApi,
+    holidays: &dyn HolidaysApi,
     notifier: &dyn Notifier,
     today: NaiveDate,
 ) -> Summary {
@@ -216,6 +232,7 @@ pub async fn run(
         let mut result = TenantResult::default();
         if let Err(stage) = run_tenant(
             pg,
+            holidays,
             notifier,
             &t,
             &employees_body,
@@ -236,6 +253,7 @@ pub async fn run(
 #[allow(clippy::too_many_arguments)]
 async fn run_tenant(
     pg: &mut PgClient,
+    holidays: &dyn HolidaysApi,
     notifier: &dyn Notifier,
     t: &pg::EnabledTenant,
     employees_body: &[u8],
@@ -268,11 +286,25 @@ async fn run_tenant(
     let periods = pg::linked_periods(pg, t.tenant_id, None, from, to)
         .await
         .map_err(|e| db_stage("linked_periods", &e))?;
+    // 労災の期間は一番星の労災が続く日へ延ばす (延ばした日は漏れにならない。祝日は労災の期間があるときだけ取る)
+    let holiday_days = match extension_span(&periods, from, to) {
+        Some((a, b)) => {
+            let (days, unavailable) = holidays::load(holidays, a, b).await;
+            result.holidays_unavailable = unavailable;
+            days
+        }
+        None => BTreeSet::new(),
+    };
+    let mut pdf = expand_periods(&periods, from, to);
+    pdf.extend(rousai_extension(
+        &days.rows,
+        &periods,
+        &holiday_days,
+        from,
+        to,
+    ));
     // 自 tenant の部門から外れた乗務員の紐づけは比べない (一番星の側に行が無く、pdf_only が出続けるため)
-    let pdf: Vec<_> = expand_periods(&periods, from, to)
-        .into_iter()
-        .filter(|p| codes.contains(&p.employee_cd))
-        .collect();
+    pdf.retain(|p| codes.contains(&p.employee_cd));
     let cutoff = today - Duration::days(i64::from(t.grace_days));
     let mismatches = diff(&days.rows, &pdf, cutoff);
     result.mismatches = mismatches.len();
@@ -354,6 +386,19 @@ mod tests {
             f.line(),
             "cron: tenants=0 [] unknown_items=0 [] failed=ichiban_unavailable"
         );
+    }
+
+    #[test]
+    fn window_is_from_alerts_from_to_yesterday() {
+        let d = |s: &str| s.parse::<NaiveDate>().unwrap();
+        assert_eq!(window(d("2026-10-10")), (d("2026-08-01"), d("2026-10-09")));
+        // 始めが終わりより後なら空の窓 (一番星は呼ばない)
+        assert_eq!(window(d("2026-08-01")), (d("2026-08-01"), d("2026-07-31")));
+        assert!(days_paths(d("2026-08-01"), d("2026-07-31")).is_empty());
+        // 92 × 30 日を超えたら始めを切り上げる (休暇の口は 30 回まで)
+        let (from, to) = window(d("2040-01-01"));
+        assert_eq!((to - from).num_days() + 1, WINDOW_MAX_DAYS);
+        assert_eq!(days_paths(from, to).len(), 30);
     }
 
     #[test]

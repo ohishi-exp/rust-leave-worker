@@ -24,6 +24,7 @@ use axum::{middleware, Router};
 use futures_util::future::BoxFuture;
 use futures_util::lock::Mutex;
 use leave::cron::{Notifier, NotifyError, NotifyTarget};
+use leave::holidays::{HolidaysApi, HolidaysError, HolidaysResponse};
 use leave::ichiban::{IchibanApi, IchibanError, IchibanResponse};
 use leave::inbox::{Inbox, InboxObject, TicketVerifier, VerifyError};
 use leave::reconcile::days_paths;
@@ -399,6 +400,42 @@ impl IchibanApi for FakeIchiban {
     }
 }
 
+/// 偽の祝日の口 (年 → 本文)。登録の無い年は呼び出しの失敗
+#[derive(Default)]
+pub struct FakeHolidays {
+    pub years: HashMap<i32, serde_json::Value>,
+    pub calls: StdMutex<Vec<i32>>,
+}
+
+impl FakeHolidays {
+    /// 2026 年の祝日 (9/21〜9/23・10/12。テストに要る分)
+    pub fn japan_2026() -> Self {
+        Self {
+            years: HashMap::from([(
+                2026,
+                serde_json::json!({
+                    "2026-09-21": "敬老の日", "2026-09-22": "国民の休日",
+                    "2026-09-23": "秋分の日", "2026-10-12": "スポーツの日"
+                }),
+            )]),
+            ..Default::default()
+        }
+    }
+}
+
+impl HolidaysApi for FakeHolidays {
+    fn year(&self, year: i32) -> BoxFuture<'_, Result<HolidaysResponse, HolidaysError>> {
+        Box::pin(async move {
+            self.calls.lock().unwrap().push(year);
+            let body = self.years.get(&year).ok_or(HolidaysError)?;
+            Ok(HolidaysResponse {
+                status: 200,
+                body: serde_json::to_vec(body).unwrap(),
+            })
+        })
+    }
+}
+
 /// テストの「今」(日本時間では 2026-10-10 の 9 時)
 pub const NOW: &str = "2026-10-10T00:00:00Z";
 
@@ -606,6 +643,7 @@ fn build(
         pg: Arc::new(Mutex::new(pg)),
         pdfs: pdfs.clone(),
         ichiban: ichiban.clone().map(|i| i as Arc<dyn IchibanApi>),
+        holidays: Arc::new(FakeHolidays::japan_2026()),
         notifier,
         log: Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_owned())),
         now: Arc::new(|| NOW.parse().unwrap()),

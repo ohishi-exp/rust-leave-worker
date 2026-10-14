@@ -2,7 +2,7 @@
 //!
 //! | method | path | 中身 |
 //! |---|---|---|
-//! | GET | `/leave/calendar?employee_cd=&month=YYYY-MM` | 日ごとの一番星と申請書の突き合わせ・月末の有給残・労災日数 |
+//! | GET | `/leave/calendar?employee_cd=&month=YYYY-MM` | 日ごとの一番星と申請書の突き合わせ (労災のページはそのあと一番星の労災が続く日も覆う)・月末の有給残・労災日数 |
 //! | GET | `/leave/grants?employee_cd=` | 付与台帳と今日 (JST) の残・期首残 |
 //! | POST | `/leave/grants` | 手で付与を足す (source = manual) |
 //! | PUT / DELETE | `/leave/grants/{id}` | 付与を直す (source は manual になる) / 消す |
@@ -46,13 +46,14 @@ use crate::grants::{
     self, add_months, balance_with_opening, opening_grants, statutory, valid_employee_cd, Balance,
     Grant, GrantUpdateInput, NewGrantInput, Opening, OpeningGrants, OpeningPutInput,
 };
+use crate::holidays;
 use crate::ichiban::{IchibanApi, EMPLOYEES_PATH};
 use crate::pages::{Page, PageUpdate, Period};
 use crate::pg;
 use crate::reconcile::{
-    calendar_days, candidate_periods, days_paths, expand_periods, parse_employees, pick_link_rows,
-    push_days, read_day_rows, rousai_days, rows_of, yukyu_usages, Employee, IchibanDays,
-    IchibanRow, LinkRow,
+    calendar_days, candidate_periods, days_paths, expand_periods, extension_span, parse_employees,
+    pick_link_rows, push_days, read_day_rows, rousai_days, rousai_extension, rows_of, yukyu_usages,
+    Employee, IchibanDays, IchibanRow, LinkRow,
 };
 use crate::routes::{
     bad_request, db_error, error, ichiban_get, ichiban_not_configured, not_found, parse_id,
@@ -350,7 +351,8 @@ async fn calendar_inner(
     let used_from = consumption_from(month_end, emp.hire_date, opening.as_ref());
     let year_start = NaiveDate::from_ymd_opt(month_start.year(), 1, 1).unwrap_or(month_start);
     let codes = BTreeSet::from([code.clone()]);
-    let days = fetch_days(&state, &api, &codes, used_from.min(year_start), month_end)
+    let read_from = used_from.min(year_start);
+    let days = fetch_days(&state, &api, &codes, read_from, month_end)
         .await
         .map_err(bad_gateway)?;
     let mine = rows_of(&days.rows, &code);
@@ -363,13 +365,30 @@ async fn calendar_inner(
         .into_iter()
         .filter(|(d, _)| *d >= used_from)
         .collect();
+    // 申請書の側: 月の期間と、労災の期間を一番星の続く労災の日へ延ばした日 (読んだ範囲で数え、月の日だけ出す)
+    let holiday_days = match extension_span(&periods, read_from, month_end) {
+        Some((a, b)) => {
+            let (got, unavailable) = holidays::load(state.holidays.as_ref(), a, b).await;
+            if unavailable {
+                (state.log)(holidays::UNAVAILABLE);
+            }
+            got
+        }
+        None => BTreeSet::new(),
+    };
+    let mut pdf = expand_periods(&periods, month_start, month_end);
+    pdf.extend(
+        rousai_extension(&mine, &periods, &holiday_days, read_from, month_end)
+            .into_iter()
+            .filter(|p| month_start <= p.date),
+    );
     let inputs: Vec<_> = grant_rows.iter().map(Grant::input).collect();
     let b = balance_with_opening(&inputs, &usages, month_end, opening.as_ref());
     Ok(Json(json!({
         "employee_cd": code,
         "employee_name": emp.employee_name,
         "month": month,
-        "days": calendar_days(&in_month, &expand_periods(&periods, month_start, month_end)),
+        "days": calendar_days(&in_month, &pdf),
         "yukyu": {
             "as_of": month_end,
             "remaining": grants::days(b.remaining),

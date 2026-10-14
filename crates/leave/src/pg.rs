@@ -220,12 +220,12 @@ pub mod sql {
     pub const OPENINGS_DELETE: &str = "DELETE FROM alc_api.leave_opening \
          WHERE tenant_id = $1 AND employee_cd = ANY($2::text[])";
 
-    /// 紐づけ済みのページの期間のうち `$3`〜`$4` に掛かるもの (`$2` が NULL なら全乗務員)
+    /// 紐づけ済みのページの期間のうち `$3`〜`$4` に掛かるもの (`$2` が NULL なら全乗務員)。労災は `$3` より前に終わったものも
     pub const LINKED_PERIODS: &str = "SELECT p.employee_cd, p.id, pr.kind, pr.start_date, pr.end_date, pr.half \
          FROM alc_api.leave_periods pr \
          JOIN alc_api.leave_pages p ON p.id = pr.page_id AND p.tenant_id = pr.tenant_id \
          WHERE pr.tenant_id = $1 AND p.tenant_id = $1 AND p.status = 'linked' AND p.employee_cd IS NOT NULL \
-         AND ($2::text IS NULL OR p.employee_cd = $2) AND pr.end_date >= $3 AND pr.start_date <= $4 \
+         AND ($2::text IS NULL OR p.employee_cd = $2) AND (pr.end_date >= $3 OR pr.kind = 'rousai') AND pr.start_date <= $4 \
          ORDER BY p.employee_cd, pr.start_date, pr.id";
 
     /// tenant をまたぐ一覧 (SECURITY DEFINER の関数。164_leave_enabled_tenants.sql)
@@ -499,7 +499,8 @@ pub async fn put_openings(
     .await
 }
 
-/// 紐づけ済みの期間のうち `from`〜`to` に掛かるもの (`employee_cd` が `None` なら全乗務員)
+/// 紐づけ済みの期間のうち `from`〜`to` に掛かるもの (`employee_cd` が `None` なら全乗務員)。労災の期間は `from` より前に
+/// 終わったものも返す (`to` までに始まるもの。そのあと一番星の労災が続く日へ延ばす起点 — `reconcile::rousai_extension`)
 pub async fn linked_periods(
     pg: &mut PgClient,
     tenant_id: Uuid,

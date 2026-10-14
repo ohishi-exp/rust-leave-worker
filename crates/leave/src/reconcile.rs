@@ -1,14 +1,14 @@
 //! 一番星の休暇入力と、申請書 (紐づけ済みの期間) の突き合わせ (純粋関数)。
 //!
 //! - 一番星の `GET /api/leave/days` の本文を読み、乗務員で絞って区分に正規化する ([`parse_days`])
-//! - 期間 (開始〜終了) を日ごとに展開する ([`expand_periods`])
+//! - 期間 (開始〜終了) を日ごとに展開する ([`expand_periods`])。労災は一番星の続く労災の日へ延ばす ([`rousai_extension`])
 //! - (乗務員, 日, 区分) の差を取る ([`diff`]。半日の am / pm は比べない)
 //! - カレンダーの日ごとの状態 ([`day_status`]) と、通知の文面 ([`messages`])
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use alc_worker_db::TxOutput;
-use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc, Weekday};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -325,6 +325,75 @@ pub fn expand_periods(periods: &[LinkedPeriod], from: NaiveDate, to: NaiveDate) 
     out
 }
 
+/// 労災の延長を数え始める日〜窓の終わり (祝日を取る範囲)。労災の期間が無い・数える日が無いなら `None`
+pub fn extension_span(
+    periods: &[LinkedPeriod],
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Option<(NaiveDate, NaiveDate)> {
+    periods
+        .iter()
+        .filter(|p| p.kind == ROUSAI)
+        .map(|p| (p.end_date + Duration::days(1)).max(from))
+        .min()
+        .filter(|start| *start <= to)
+        .map(|start| (start, to))
+}
+
+/// 労災の区分の語
+pub const ROUSAI: &str = "rousai";
+
+/// 紐づけ済みの労災の期間を、そのあと一番星に同じ乗務員の労災の行が続く日へ延ばす (保存しない。毎回計算する)。
+///
+/// 期間の終わりの翌日 (窓 `from` より前なら `from`) から 1 日ずつ見て、労災の行が在る日はそのページが覆う日にし、
+/// 行が無くても日曜・祝日 (`holidays`) は飛ばして続け、行の無いそれ以外の日 (土曜を含む) で止まる。`to` で終わる。
+/// 労災の期間そのものに入る日は出さない (その期間が覆う)。同じ日を複数のページが延長で覆うときは、起点 (期間の終わり)
+/// が後のページ。労災以外の期間は延ばさない
+pub fn rousai_extension(
+    ichiban: &[IchibanDay<'_>],
+    periods: &[LinkedPeriod],
+    holidays: &BTreeSet<NaiveDate>,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Vec<PdfDay> {
+    let rows: HashSet<(&str, NaiveDate)> = ichiban
+        .iter()
+        .filter(|r| r.kind.kind == ROUSAI)
+        .map(|r| (r.employee_cd, r.date))
+        .collect();
+    let rousai: Vec<&LinkedPeriod> = periods.iter().filter(|p| p.kind == ROUSAI).collect();
+    let covered = |emp: &str, d: NaiveDate| {
+        rousai
+            .iter()
+            .any(|p| p.employee_cd == emp && p.start_date <= d && d <= p.end_date)
+    };
+    let mut best: BTreeMap<(&str, NaiveDate), (NaiveDate, Uuid)> = BTreeMap::new();
+    for p in &rousai {
+        let emp = p.employee_cd.as_str();
+        let mut d = (p.end_date + Duration::days(1)).max(from);
+        while d <= to {
+            if rows.contains(&(emp, d)) {
+                if !covered(emp, d) {
+                    let e = best.entry((emp, d)).or_insert((p.end_date, p.page_id));
+                    *e = (*e).max((p.end_date, p.page_id));
+                }
+            } else if d.weekday() != Weekday::Sun && !holidays.contains(&d) {
+                break;
+            }
+            d += Duration::days(1);
+        }
+    }
+    best.into_iter()
+        .map(|((emp, date), (_, page_id))| PdfDay {
+            employee_cd: emp.to_owned(),
+            date,
+            kind: ROUSAI.to_owned(),
+            half: None,
+            page_id,
+        })
+        .collect()
+}
+
 pub const ICHIBAN_ONLY: &str = "ichiban_only";
 pub const PDF_ONLY: &str = "pdf_only";
 
@@ -570,7 +639,7 @@ pub fn yukyu_usages(rows: &[IchibanDay<'_>]) -> Vec<(NaiveDate, i32)> {
 /// 労災の日数 (`from`〜`to`、同じ日は 1 日)
 pub fn rousai_days(rows: &[IchibanDay<'_>], from: NaiveDate, to: NaiveDate) -> usize {
     rows.iter()
-        .filter(|r| r.kind.kind == "rousai" && from <= r.date && r.date <= to)
+        .filter(|r| r.kind.kind == ROUSAI && from <= r.date && r.date <= to)
         .map(|r| r.date)
         .collect::<HashSet<_>>()
         .len()
@@ -707,6 +776,143 @@ mod tests {
             date: d(date),
             kind: DayKind { kind, half },
         }
+    }
+
+    /// 延長した (乗務員, 日, ページ)
+    fn ext(
+        ichiban: &[IchibanDay<'_>],
+        periods: &[LinkedPeriod],
+        holidays: &[&str],
+        from: &str,
+        to: &str,
+    ) -> Vec<(String, String, u128)> {
+        let holidays: BTreeSet<NaiveDate> = holidays.iter().map(|h| d(h)).collect();
+        rousai_extension(ichiban, periods, &holidays, d(from), d(to))
+            .into_iter()
+            .inspect(|p| assert_eq!((p.kind.as_str(), p.half.as_deref()), (ROUSAI, None)))
+            .map(|p| (p.employee_cd, p.date.to_string(), p.page_id.as_u128()))
+            .collect()
+    }
+
+    fn page_period(page: u128, kind: &str, from: &str, to: &str) -> LinkedPeriod {
+        LinkedPeriod {
+            page_id: Uuid::from_u128(page),
+            ..period("1021", kind, from, to, None)
+        }
+    }
+
+    fn e(day: &str, page: u128) -> (String, String, u128) {
+        ("1021".into(), day.into(), page)
+    }
+
+    #[test]
+    fn rousai_extends_over_sundays_until_a_day_without_a_row() {
+        // 10/02 (金) で終わる期間。10/03 (土) は行が在る、10/04 (日) は行が無くても続き、10/07 (水) で止まる
+        let rows = [
+            ich("1021", "2026-10-03", "rousai", None),
+            ich("1021", "2026-10-05", "rousai", None),
+            ich("1021", "2026-10-06", "rousai", None),
+            ich("1021", "2026-10-08", "rousai", None),
+            ich("1022", "2026-10-07", "rousai", None),
+            ich("1021", "2026-10-07", "yukyu", None),
+        ];
+        let periods = [page_period(7, ROUSAI, "2026-10-01", "2026-10-02")];
+        assert_eq!(
+            ext(&rows, &periods, &[], "2026-08-01", "2026-10-09"),
+            vec![e("2026-10-03", 7), e("2026-10-05", 7), e("2026-10-06", 7)]
+        );
+        // 窓の終わりで止まる
+        assert_eq!(
+            ext(&rows, &periods, &[], "2026-08-01", "2026-10-05"),
+            vec![e("2026-10-03", 7), e("2026-10-05", 7)]
+        );
+        // 土曜は飛ばさない (行が無ければ止まる)
+        assert_eq!(
+            ext(&rows[1..], &periods, &[], "2026-08-01", "2026-10-09"),
+            vec![]
+        );
+        // 労災以外の期間は延ばさない
+        let yukyu = [page_period(7, "yukyu", "2026-10-01", "2026-10-02")];
+        assert_eq!(ext(&rows, &yukyu, &[], "2026-08-01", "2026-10-09"), vec![]);
+    }
+
+    #[test]
+    fn rousai_extends_over_holidays() {
+        // 9/18 (金) で終わる期間。9/20 (日)・9/21〜23 (祝) は行が無くても続き、9/25 (金) で止まる
+        let rows = [
+            ich("1021", "2026-09-19", "rousai", None),
+            ich("1021", "2026-09-24", "rousai", None),
+            ich("1021", "2026-09-28", "rousai", None),
+        ];
+        let periods = [page_period(7, ROUSAI, "2026-09-14", "2026-09-18")];
+        let holidays = ["2026-09-21", "2026-09-22", "2026-09-23"];
+        assert_eq!(
+            ext(&rows, &periods, &holidays, "2026-08-01", "2026-10-09"),
+            vec![e("2026-09-19", 7), e("2026-09-24", 7)]
+        );
+        // 祝日が取れなければ日曜だけ飛ばす (9/21 (月) で止まる)
+        assert_eq!(
+            ext(&rows, &periods, &[], "2026-08-01", "2026-10-09"),
+            vec![e("2026-09-19", 7)]
+        );
+    }
+
+    #[test]
+    fn rousai_extension_starts_at_the_window() {
+        // 窓より前に終わった期間は窓の始め (8/1 (土)) から数える
+        let rows = [
+            ich("1021", "2026-08-01", "rousai", None),
+            ich("1021", "2026-08-03", "rousai", None),
+        ];
+        let periods = [page_period(7, ROUSAI, "2026-07-01", "2026-07-20")];
+        assert_eq!(
+            ext(&rows, &periods, &[], "2026-08-01", "2026-10-09"),
+            vec![e("2026-08-01", 7), e("2026-08-03", 7)]
+        );
+        assert_eq!(
+            extension_span(&periods, d("2026-08-01"), d("2026-10-09")),
+            Some((d("2026-08-01"), d("2026-10-09")))
+        );
+    }
+
+    #[test]
+    fn overlapping_rousai_pages_prefer_the_later_start() {
+        // A (10/01〜10/02) の延長は B (10/05〜10/06) の日を飛ばして続くが、B の後の日は B が覆う
+        let days: Vec<String> = ["03", "05", "06", "07", "08"]
+            .iter()
+            .map(|day| format!("2026-10-{day}"))
+            .collect();
+        let rows: Vec<_> = days
+            .iter()
+            .map(|day| ich("1021", day, "rousai", None))
+            .collect();
+        let periods = [
+            page_period(8, ROUSAI, "2026-10-05", "2026-10-06"),
+            page_period(7, ROUSAI, "2026-10-01", "2026-10-02"),
+        ];
+        assert_eq!(
+            ext(&rows, &periods, &[], "2026-08-01", "2026-10-09"),
+            vec![e("2026-10-03", 7), e("2026-10-07", 8), e("2026-10-08", 8)]
+        );
+    }
+
+    #[test]
+    fn extension_span_is_from_the_earliest_start() {
+        let w = (d("2026-08-01"), d("2026-10-09"));
+        assert_eq!(extension_span(&[], w.0, w.1), None);
+        let yukyu = [period("1021", "yukyu", "2026-09-01", "2026-09-02", None)];
+        assert_eq!(extension_span(&yukyu, w.0, w.1), None);
+        let two = [
+            page_period(7, ROUSAI, "2026-09-01", "2026-09-30"),
+            page_period(8, ROUSAI, "2026-09-01", "2026-09-10"),
+        ];
+        assert_eq!(
+            extension_span(&two, w.0, w.1),
+            Some((d("2026-09-11"), d("2026-10-09")))
+        );
+        // 窓の終わりまで期間が覆うなら数える日が無い
+        let full = [page_period(7, ROUSAI, "2026-09-01", "2026-10-09")];
+        assert_eq!(extension_span(&full, w.0, w.1), None);
     }
 
     #[test]

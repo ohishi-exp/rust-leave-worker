@@ -1,5 +1,5 @@
 //! crates/leave の trait の Workers での実装: R2 の binding (`LEAVE_R2`・スキャンの inbox `LEAVE_INBOX`)・
-//! 一番星 Worker の Service Binding (`ICHIBAN_DB`)・LINE WORKS への送信 (auth-worker の Service Binding `AUTH_WORKER`)・
+//! 一番星 Worker の Service Binding (`ICHIBAN_DB`)・日本の祝日 (holidays-jp への外向きの `fetch`)・LINE WORKS への送信 (auth-worker の Service Binding `AUTH_WORKER`)・
 //! チケットの検証 (auth-worker の RPC、Service Binding `AUTH_MCRED`)。
 //!
 //! 値と future は JS の値で `Send` でないので、`worker::send` の `SendWrapper`・`SendFuture` で包む (Workers は単一 thread)。
@@ -9,13 +9,14 @@
 
 use futures_util::future::BoxFuture;
 use leave::cron::{send_body, Notifier, NotifyError, NotifyTarget, LINEWORKS_SEND_URL};
+use leave::holidays::{holidays_url, HolidaysApi, HolidaysError, HolidaysResponse};
 use leave::ichiban::{IchibanApi, IchibanError, IchibanResponse};
 use leave::inbox::{Inbox, InboxObject, TicketVerifier, VerifyError};
 use leave::store::{PdfStore, StoreError};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use worker::send::{SendFuture, SendWrapper};
-use worker::{Bucket, Fetcher, Headers, Method, Request, RequestInit};
+use worker::{Bucket, Fetch, Fetcher, Headers, Method, Request, RequestInit};
 
 /// R2 の bucket (binding `LEAVE_R2`)
 pub struct R2Pdfs(SendWrapper<Bucket>);
@@ -81,6 +82,33 @@ impl IchibanApi for IchibanBinding {
                 status,
                 body: body.to_vec(),
             })
+        }))
+    }
+}
+
+/// 日本の祝日 (holidays-jp。binding の無い外向きの `fetch`)
+pub struct HolidaysJp;
+
+/// 祝日の応答の本文の上限 (1 年ぶんは数 KB)
+const HOLIDAYS_BODY_LIMIT: usize = 256 * 1024;
+
+impl HolidaysApi for HolidaysJp {
+    fn year(&self, year: i32) -> BoxFuture<'_, Result<HolidaysResponse, HolidaysError>> {
+        Box::pin(SendFuture::new(async move {
+            let mut init = RequestInit::new();
+            init.with_method(Method::Get);
+            let req =
+                Request::new_with_init(&holidays_url(year), &init).map_err(|_| HolidaysError)?;
+            let mut resp = Fetch::Request(req)
+                .send()
+                .await
+                .map_err(|_| HolidaysError)?;
+            let status = resp.status_code();
+            let body = resp.bytes().await.map_err(|_| HolidaysError)?;
+            if body.len() > HOLIDAYS_BODY_LIMIT {
+                return Err(HolidaysError);
+            }
+            Ok(HolidaysResponse { status, body })
         }))
     }
 }
