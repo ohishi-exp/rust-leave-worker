@@ -15,7 +15,8 @@ worker-build --release && npx wrangler@4.144.0 deploy --dry-run
 DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip しない)。
 
 ## 規範
-- 管理 API の口は `/api/leave/…` だけ。**全部管理者限定** (`auth::is_admin` の 1 か所)。403 のテストも足す。
+- 管理 API の口は `/api/leave/…` だけ。**2 層**: leave.use 層 (管理者か `leave.use`・`*`。参照・紐づけ・取り込み。403 は `forbidden`) と
+  admin 層 (管理者か `*`。設定・通知テスト・有給と期首残の書き込み。403 は `admin_only`)。判定は `auth.rs`、割り当ては `routes.rs`。**新しい口は既定で admin 層**。403 のテストも足す。
   例外は定時実行 (`#[event(scheduled)]`、本番だけ・`crates/leave/src/cron.rs`。tenant をまたぐのは
   `leave_enabled_tenants()` だけ)と、スキャンの inbox の Queue
   (`#[event(queue)]`、`crates/leave/src/inbox.rs`。tenant は auth-worker の `verifyTicket` の結果だけから取る)。
@@ -31,6 +32,6 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
 - DB は `PgClient::tenant_tx` + `query_typed` 系だけ。SQL は `crates/leave/src/pg.rs` の 1 か所。
   名前付き prepared statement 禁止。WHERE に tenant_id も明示する。
 - 応答・ログには固定の語だけ (識別子・入力値・生のエラー文を出さない)。
-- `coverage_100.toml` の登録を外さない。CI の本数 (lib 89・api_db 85・cron_db 17) はテストを足したら上げる。
+- `coverage_100.toml` の登録を外さない。CI の本数 (lib 92・api_db 85・cron_db 17) はテストを足したら上げる。
 - public repo: ホスト名・tenant UUID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (alc-vein-worker と同じ rev)。
