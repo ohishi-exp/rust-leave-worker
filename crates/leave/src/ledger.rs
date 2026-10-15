@@ -1,4 +1,4 @@
-//! 乗務員ごとのカレンダーと有給の付与台帳の口 (`routes::tenant_router` が `require_admin` の内側に載せる)。
+//! 乗務員ごとのカレンダーと有給の付与台帳の口 (`routes::tenant_router` が載せる。参照の GET は leave.use 層、付与・期首残の書き込みは admin 層)。
 //!
 //! | method | path | 中身 |
 //! |---|---|---|
