@@ -41,11 +41,66 @@ async fn put_settings(app: &App, t: Uuid, body: Value) -> support::Got {
     .await
 }
 
-/// 7 本の口 (method 違いを含めて 8 組) すべてについて、管理者でなければ 403 で、DB にも置き場にも一番星にも届かない
+/// 口 23 本 (method ごと) すべてについて、2 層の判定 (crates/leave/src/auth.rs) を確かめる。
+/// 通らない人は 403 で、DB にも置き場にも一番星にも届かない (admin 層は `admin_only`、leave.use 層は `forbidden`)。
+/// 管理者と全権限 `*` は全部通り、権限 `leave.use` だけの人は leave.use 層だけ通る
 mod forbidden {
     use super::*;
+    use leave::ingest::minimal_pdf;
+    use support::{call_as, CallBody};
 
-    async fn assert_forbidden(method: &str, path: &str, body: Option<Value>) {
+    #[derive(Clone, Copy, Debug)]
+    enum Layer {
+        LeaveUse,
+        Admin,
+    }
+
+    /// (`X-User-Role`, `X-User-Permissions`) の組
+    type Who = (Option<&'static str>, Option<&'static str>);
+
+    /// どちらの層も通らない (大文字・前後の付け足し・別の名前は権限にならない)
+    const NOBODY: [Who; 9] = [
+        (None, None),
+        (Some("viewer"), None),
+        (Some("payroll"), None),
+        (Some("Admin"), None),
+        (Some(""), None),
+        (Some("viewer"), Some("")),
+        (Some("viewer"), Some("leave.usex")),
+        (Some("viewer"), Some("Leave.use")),
+        (Some("viewer"), Some("admin")),
+    ];
+
+    /// 権限 `leave.use` だけを持つ (leave.use 層だけ通る)
+    const LEAVE_USERS: [Who; 3] = [
+        (Some("viewer"), Some("leave.use")),
+        (Some("payroll"), Some("a leave.use b")),
+        (None, Some("leave.use")),
+    ];
+
+    /// どちらの層も通る (管理者、または role に関わらず全権限 `*`)
+    const ALL_LAYERS: [Who; 3] = [
+        (Some("admin"), None),
+        (Some("viewer"), Some("*")),
+        (None, Some("*")),
+    ];
+
+    fn denied_and_allowed(layer: Layer) -> (Vec<Who>, &'static str, Vec<Who>) {
+        match layer {
+            Layer::LeaveUse => (
+                NOBODY.to_vec(),
+                "forbidden",
+                [ALL_LAYERS, LEAVE_USERS].concat(),
+            ),
+            Layer::Admin => (
+                [NOBODY.to_vec(), LEAVE_USERS.to_vec()].concat(),
+                "admin_only",
+                ALL_LAYERS.to_vec(),
+            ),
+        }
+    }
+
+    async fn assert_layer(method: &str, path: &str, body: CallBody, layer: Layer) {
         let t = tenant().await;
         let p = page(t, &format!("{t}/a.pdf"), 1, "2026-10-01T00:00:00Z").await;
         let path = path.replace("{id}", &p.to_string());
@@ -54,19 +109,18 @@ mod forbidden {
             Some(ichiban_with(&[(DEPARTMENTS_PATH, 200, json!([]))])),
         )
         .await;
-        for role in [
-            None,
-            Some("viewer"),
-            Some("payroll"),
-            Some("Admin"),
-            Some(""),
-        ] {
-            let got = call(&a, method, &path, Some(t), role, body.clone()).await;
-            assert_eq!(got.status, 403, "{method} {path} role={role:?}");
-            assert_eq!(got.json(), json!({"error": "forbidden"}));
+        let (denied, code, allowed) = denied_and_allowed(layer);
+        for (role, perms) in denied {
+            let got = call_as(&a, method, &path, Some(t), role, perms, body.clone()).await;
+            assert_eq!(
+                got.status, 403,
+                "{method} {path} {layer:?} role={role:?} permissions={perms:?}"
+            );
+            assert_eq!(got.json(), json!({"error": code}));
         }
         assert!(a.pdfs.reads.lock().unwrap().is_empty());
-        assert!(a.ichiban.unwrap().calls.lock().unwrap().is_empty());
+        assert!(a.pdfs.stored.lock().unwrap().is_empty());
+        assert!(a.ichiban.as_ref().unwrap().calls.lock().unwrap().is_empty());
         // ページも設定も変わっていない
         let detail = call(
             &app(FakePdfs::default(), None).await,
@@ -89,19 +143,28 @@ mod forbidden {
         )
         .await;
         assert_eq!(s.json()["updated_at"], Value::Null);
+        // 通る人は handler に届く (中身は各口のテストで見る。handler は 403 を返さない)
+        for (role, perms) in allowed {
+            let got = call_as(&a, method, &path, Some(t), role, perms, body.clone()).await;
+            assert_ne!(
+                got.status, 403,
+                "{method} {path} {layer:?} role={role:?} permissions={perms:?}"
+            );
+        }
     }
 
     #[tokio::test]
     async fn get_settings() {
-        assert_forbidden("GET", "/api/leave/settings", None).await;
+        assert_layer("GET", "/api/leave/settings", CallBody::Empty, Layer::Admin).await;
     }
 
     #[tokio::test]
     async fn put_settings() {
-        assert_forbidden("PUT", "/api/leave/settings", Some(json!({"grace_days": 3}))).await;
+        let body = CallBody::Json(json!({"grace_days": 3}));
+        assert_layer("PUT", "/api/leave/settings", body, Layer::Admin).await;
     }
 
-    /// 管理者でなければ 403 で、送信の口にも DB にも届かない
+    /// 管理者だけ。通らない人では送信の口にも届かない
     #[tokio::test]
     async fn test_notify() {
         let t = tenant().await;
@@ -110,145 +173,225 @@ mod forbidden {
         let a = app_with_notifier(n.clone()).await;
         let got = super::put_settings(&a, t, json!({"notify_recipient_id": r})).await;
         assert_eq!(got.status, 200);
-        for role in [
-            None,
-            Some("viewer"),
-            Some("payroll"),
-            Some("Admin"),
-            Some(""),
-        ] {
-            let got = call(
+        let (denied, code, allowed) = denied_and_allowed(Layer::Admin);
+        for (role, perms) in denied {
+            let got = call_as(
                 &a,
                 "POST",
                 "/api/leave/settings/test-notify",
                 Some(t),
                 role,
-                None,
+                perms,
+                CallBody::Empty,
             )
             .await;
-            assert_eq!(got.status, 403, "role={role:?}");
-            assert_eq!(got.json(), json!({"error": "forbidden"}));
+            assert_eq!(got.status, 403, "role={role:?} permissions={perms:?}");
+            assert_eq!(got.json(), json!({"error": code}));
         }
         assert_eq!(*n.calls.lock().unwrap(), 0);
+        for (role, perms) in allowed {
+            let got = call_as(
+                &a,
+                "POST",
+                "/api/leave/settings/test-notify",
+                Some(t),
+                role,
+                perms,
+                CallBody::Empty,
+            )
+            .await;
+            assert_eq!(got.status, 200, "role={role:?} permissions={perms:?}");
+        }
+        assert_eq!(*n.calls.lock().unwrap(), ALL_LAYERS.len());
     }
 
     #[tokio::test]
     async fn list_alerts() {
-        assert_forbidden("GET", "/api/leave/alerts", None).await;
+        assert_layer("GET", "/api/leave/alerts", CallBody::Empty, Layer::LeaveUse).await;
+    }
+
+    /// PDF の取り込み。通らない人では置き場にも DB にも届かない
+    #[tokio::test]
+    async fn uploads() {
+        let body = CallBody::Pdf(minimal_pdf(1));
+        assert_layer("POST", "/api/leave/uploads", body, Layer::LeaveUse).await;
     }
 
     #[tokio::test]
     async fn departments() {
-        assert_forbidden("GET", "/api/leave/departments", None).await;
+        assert_layer(
+            "GET",
+            "/api/leave/departments",
+            CallBody::Empty,
+            Layer::LeaveUse,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn employees() {
-        assert_forbidden("GET", "/api/leave/employees", None).await;
+        assert_layer(
+            "GET",
+            "/api/leave/employees",
+            CallBody::Empty,
+            Layer::LeaveUse,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn list_pages() {
-        assert_forbidden("GET", "/api/leave/pages", None).await;
+        assert_layer("GET", "/api/leave/pages", CallBody::Empty, Layer::LeaveUse).await;
     }
 
     #[tokio::test]
     async fn list_documents() {
-        assert_forbidden("GET", "/api/leave/documents", None).await;
+        assert_layer(
+            "GET",
+            "/api/leave/documents",
+            CallBody::Empty,
+            Layer::LeaveUse,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn get_page() {
-        assert_forbidden("GET", "/api/leave/pages/{id}", None).await;
+        assert_layer(
+            "GET",
+            "/api/leave/pages/{id}",
+            CallBody::Empty,
+            Layer::LeaveUse,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn put_page() {
-        assert_forbidden(
-            "PUT",
-            "/api/leave/pages/{id}",
-            Some(json!({"status": "ignored"})),
-        )
-        .await;
+        let body = CallBody::Json(json!({"status": "ignored"}));
+        assert_layer("PUT", "/api/leave/pages/{id}", body, Layer::LeaveUse).await;
     }
 
     #[tokio::test]
     async fn get_pdf() {
-        assert_forbidden("GET", "/api/leave/pages/{id}/pdf", None).await;
-    }
-
-    #[tokio::test]
-    async fn candidates() {
-        assert_forbidden(
+        assert_layer(
             "GET",
-            "/api/leave/pages/{id}/candidates?employee_cd=1021",
-            None,
+            "/api/leave/pages/{id}/pdf",
+            CallBody::Empty,
+            Layer::LeaveUse,
         )
         .await;
     }
 
-    /// 管理者でなければ 403 で、基準日も変わらない
+    #[tokio::test]
+    async fn candidates() {
+        assert_layer(
+            "GET",
+            "/api/leave/pages/{id}/candidates?employee_cd=1021",
+            CallBody::Empty,
+            Layer::LeaveUse,
+        )
+        .await;
+    }
+
+    /// 通らない人では基準日も変わらない
     #[tokio::test]
     async fn put_base_date() {
-        assert_forbidden(
+        let body = CallBody::Json(json!({"base_date": "2026-10-20"}));
+        assert_layer(
             "PUT",
             "/api/leave/pages/{id}/base-date",
-            Some(json!({"base_date": "2026-10-20"})),
+            body,
+            Layer::LeaveUse,
         )
         .await;
     }
 
     #[tokio::test]
     async fn calendar() {
-        assert_forbidden(
+        assert_layer(
             "GET",
             "/api/leave/calendar?employee_cd=1021&month=2026-10",
-            None,
+            CallBody::Empty,
+            Layer::LeaveUse,
         )
         .await;
     }
 
     #[tokio::test]
     async fn list_grants() {
-        assert_forbidden("GET", "/api/leave/grants?employee_cd=1021", None).await;
+        assert_layer(
+            "GET",
+            "/api/leave/grants?employee_cd=1021",
+            CallBody::Empty,
+            Layer::LeaveUse,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn create_grant() {
-        let body = json!({"employee_cd": "1021", "grant_date": "2026-04-01", "days": 1});
-        assert_forbidden("POST", "/api/leave/grants", Some(body)).await;
+        let body =
+            CallBody::Json(json!({"employee_cd": "1021", "grant_date": "2026-04-01", "days": 1}));
+        assert_layer("POST", "/api/leave/grants", body, Layer::Admin).await;
     }
 
     #[tokio::test]
     async fn auto_grants() {
-        assert_forbidden("POST", "/api/leave/grants/auto?employee_cd=1021", None).await;
+        assert_layer(
+            "POST",
+            "/api/leave/grants/auto?employee_cd=1021",
+            CallBody::Empty,
+            Layer::Admin,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn update_grant() {
-        let body = json!({"days": 1, "expires_on": "2028-01-01"});
-        assert_forbidden("PUT", "/api/leave/grants/{id}", Some(body)).await;
+        let body = CallBody::Json(json!({"days": 1, "expires_on": "2028-01-01"}));
+        assert_layer("PUT", "/api/leave/grants/{id}", body, Layer::Admin).await;
     }
 
     #[tokio::test]
     async fn delete_grant() {
-        assert_forbidden("DELETE", "/api/leave/grants/{id}", None).await;
+        assert_layer(
+            "DELETE",
+            "/api/leave/grants/{id}",
+            CallBody::Empty,
+            Layer::Admin,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn list_openings() {
-        assert_forbidden("GET", "/api/leave/opening", None).await;
+        assert_layer(
+            "GET",
+            "/api/leave/opening",
+            CallBody::Empty,
+            Layer::LeaveUse,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn ledger() {
-        assert_forbidden("GET", "/api/leave/ledger?as_of=2026-04-01", None).await;
+        assert_layer(
+            "GET",
+            "/api/leave/ledger?as_of=2026-04-01",
+            CallBody::Empty,
+            Layer::LeaveUse,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn put_openings() {
-        let body = json!({"as_of": "2026-09-30", "rows": [{"employee_cd": "1021", "carryover": 1, "current": 2}]});
-        assert_forbidden("PUT", "/api/leave/opening", Some(body)).await;
+        let body = CallBody::Json(
+            json!({"as_of": "2026-09-30", "rows": [{"employee_cd": "1021", "carryover": 1, "current": 2}]}),
+        );
+        assert_layer("PUT", "/api/leave/opening", body, Layer::Admin).await;
     }
 }
 
@@ -3558,19 +3701,6 @@ mod uploads {
         let got = call_bytes(&a, "POST", PATH, Some(t), ADMIN, minimal_pdf(MAX_PAGES + 1)).await;
         assert_eq!(got.status, 422);
         assert_eq!(got.json(), json!({"error": "too_many_pages"}));
-        assert!(a.pdfs.stored.lock().unwrap().is_empty());
-        assert!(pages_of(t).await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn is_admin_only() {
-        let t = tenant().await;
-        let a = app(FakePdfs::default(), None).await;
-        for role in [None, Some("viewer"), Some("Admin"), Some("")] {
-            let got = call_bytes(&a, "POST", PATH, Some(t), role, minimal_pdf(1)).await;
-            assert_eq!(got.status, 403, "role={role:?}");
-            assert_eq!(got.json(), json!({"error": "forbidden"}));
-        }
         assert!(a.pdfs.stored.lock().unwrap().is_empty());
         assert!(pages_of(t).await.is_empty());
     }

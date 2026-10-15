@@ -681,21 +681,11 @@ pub async fn call(
     role: Option<&str>,
     body: Option<serde_json::Value>,
 ) -> Got {
-    match body {
-        Some(v) => {
-            send(
-                app,
-                method,
-                uri,
-                tenant_id,
-                role,
-                Some("application/json"),
-                serde_json::to_vec(&v).unwrap(),
-            )
-            .await
-        }
-        None => send(app, method, uri, tenant_id, role, None, Vec::new()).await,
-    }
+    let body = match body {
+        Some(v) => CallBody::Json(v),
+        None => CallBody::Empty,
+    };
+    call_as(app, method, uri, tenant_id, role, None, body).await
 }
 
 /// 本文が生のバイト列 (PDF) のリクエストを打つ
@@ -707,27 +697,32 @@ pub async fn call_bytes(
     role: Option<&str>,
     body: Vec<u8>,
 ) -> Got {
-    send(
-        app,
-        method,
-        uri,
-        tenant_id,
-        role,
-        Some("application/pdf"),
-        body,
-    )
-    .await
+    call_as(app, method, uri, tenant_id, role, None, CallBody::Pdf(body)).await
 }
 
-async fn send(
+/// [`call_as`] の本文
+#[derive(Clone)]
+pub enum CallBody {
+    Empty,
+    Json(serde_json::Value),
+    Pdf(Vec<u8>),
+}
+
+/// [`call`] に権限のヘッダー (`X-User-Permissions`) を足したもの。本文は空・JSON・PDF のバイト列
+pub async fn call_as(
     app: &App,
     method: &str,
     uri: &str,
     tenant_id: Option<Uuid>,
     role: Option<&str>,
-    content_type: Option<&str>,
-    body: Vec<u8>,
+    permissions: Option<&str>,
+    body: CallBody,
 ) -> Got {
+    let (content_type, body) = match body {
+        CallBody::Empty => (None, Vec::new()),
+        CallBody::Json(v) => (Some("application/json"), serde_json::to_vec(&v).unwrap()),
+        CallBody::Pdf(b) => (Some("application/pdf"), b),
+    };
     let mut b = Request::builder().method(method).uri(uri);
     if let Some(t) = tenant_id {
         b = b.header("X-Tenant-ID", t.to_string());
@@ -736,6 +731,9 @@ async fn send(
         b = b
             .header("X-User-Role", r)
             .header("X-User-Email", "admin@example.com");
+    }
+    if let Some(p) = permissions {
+        b = b.header("X-User-Permissions", p);
     }
     if let Some(c) = content_type {
         b = b.header("content-type", c);
