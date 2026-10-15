@@ -4,7 +4,8 @@
 //! 口はすべて `/api/leave/…` (auth-worker の `/alc-proxy` が `/api/…` のまま Service Binding で転送する)。
 //!
 //! **この Worker は JWT を検証せず、auth-worker が付け直した tenant / role ヘッダーを信頼する**
-//! (`alc_core_wasm::require_tenant_header` と crates/leave の `auth::require_admin`)。本番・staging とも
+//! (`alc_core_wasm::require_tenant_header` と、crates/leave の `auth` の 2 層 = 管理者 (か全権限 `*`) の `require_admin` と
+//! 管理者か権限 `leave.use` の `require_leave_use`)。本番・staging とも
 //! workers.dev を開けず (`workers_dev` / `preview_urls` = false、`routes` を持たない)、入口は Service Binding だけ
 //! (wrangler.toml と scripts/check-exposure.sh が保証する)。
 //!

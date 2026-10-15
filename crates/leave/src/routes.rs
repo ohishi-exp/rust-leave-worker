@@ -21,9 +21,14 @@
 //! | POST | `/leave/uploads` | 管理画面からの PDF の取り込み (本文 = PDF そのもの。毎回別の行。201 `{"pages": n}`) |
 //! | POST | `/leave/settings/test-notify` | 保存済みの通知先へ固定の文面を 1 通送る (毎朝の cron と同じ宛先・同じ送信) |
 //!
-//! **全部の口を [`require_admin`] が包む** (管理者でなければ 403。handler にも DB にも届かない)。
+//! **口は method ごとに 2 層に分けて包む** (`crate::auth`。どちらも不一致は 403 で、handler にも DB にも届かない):
+//! - leave.use 層 ([`require_leave_use`]、管理者か権限 `leave.use`): settings・test-notify・grants の書き込み
+//!   (POST `/leave/grants`・`/leave/grants/auto`・PUT / DELETE `/leave/grants/{id}`)・PUT `/leave/opening` **以外**の全部
+//! - admin 層 ([`require_admin`]、管理者か全権限 `*`): 上の残り
+//!
 //! tenant ヘッダーの検査 (`alc_core_wasm::require_tenant_header`、無ければ 401) は worker がこの外側に掛ける。
-//! 口を足すときは [`tenant_router`] に 1 行足す (admin の layer は route_layer なので新しい口にも掛かる)。
+//! 口を足すときは既定の admin 層 (`admin_router`) に 1 行足す (layer は route_layer なので新しい口にも掛かる)。
+//! leave.use 層 (`leave_use_router`) へは、管理者以外に開けると決めた口だけを移す。
 //!
 //! 応答の本文のエラーは固定の語だけ (`{"error":"..."}`)。ログ ([`LogSink`]) に出すのも段の名前と kind だけで、
 //! 識別子・入力の値・エラーの生の文を出さない。
@@ -45,7 +50,7 @@ use futures_util::lock::Mutex;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::auth::{actor, require_admin};
+use crate::auth::{actor, require_admin, require_leave_use};
 use crate::cron::{window, Notifier};
 use crate::holidays::HolidaysApi;
 use crate::ichiban::{filter_employees, IchibanApi, DEPARTMENTS_PATH, EMPLOYEES_PATH};
@@ -103,10 +108,15 @@ pub const TEST_NOTIFY_PATH: &str = "/api/leave/settings/test-notify";
 pub const TEST_NOTIFY_TEXT: &str =
     "勤怠申請システムからのテスト通知です。この通知が届けば毎朝の警告も届きます。";
 
+/// 2 層を合わせた router。同じ path で method が層をまたぐもの (settings・grants・opening) は、
+/// axum の merge が method ごとに 1 つの path へまとめる (同じ method を両方に置くと起動時に panic する)
 pub fn tenant_router() -> Router<LeaveState> {
+    leave_use_router().merge(admin_router())
+}
+
+/// leave.use 層: 管理者か、権限 `leave.use` を持つ人 ([`require_leave_use`])。ここへ移すのは明示的に選んだ口だけ
+fn leave_use_router() -> Router<LeaveState> {
     Router::new()
-        .route("/leave/settings", get(get_settings).put(put_settings))
-        .route("/leave/settings/test-notify", post(test_notify))
         .route("/leave/alerts", get(list_alerts))
         // 既定の 2MB を広げる。+1024 は上限をわずかに超えたものを handler の `pdf_too_large` (400) にするための余白
         .route(
@@ -122,16 +132,20 @@ pub fn tenant_router() -> Router<LeaveState> {
         .route("/leave/pages/{id}/candidates", get(ledger::candidates))
         .route("/leave/pages/{id}/base-date", put(put_base_date))
         .route("/leave/calendar", get(ledger::calendar))
-        .route(
-            "/leave/grants",
-            get(ledger::list_grants).post(ledger::create_grant),
-        )
-        .route("/leave/grants/auto", post(ledger::auto_grants))
-        .route(
-            "/leave/opening",
-            get(ledger::list_openings).put(ledger::put_openings),
-        )
+        .route("/leave/grants", get(ledger::list_grants))
+        .route("/leave/opening", get(ledger::list_openings))
         .route("/leave/ledger", get(ledger::ledger))
+        .route_layer(middleware::from_fn(require_leave_use))
+}
+
+/// admin 層 (既定): 管理者か全権限 `*` ([`require_admin`])。新しい口はここに足す
+fn admin_router() -> Router<LeaveState> {
+    Router::new()
+        .route("/leave/settings", get(get_settings).put(put_settings))
+        .route("/leave/settings/test-notify", post(test_notify))
+        .route("/leave/grants", post(ledger::create_grant))
+        .route("/leave/grants/auto", post(ledger::auto_grants))
+        .route("/leave/opening", put(ledger::put_openings))
         .route(
             "/leave/grants/{id}",
             put(ledger::update_grant).delete(ledger::delete_grant),
