@@ -4,7 +4,7 @@
 //! - [`auth`] — 管理者の判定 (1 か所) と操作した人の識別子
 //! - [`settings`] / [`pages`] — 入力の検証と応答の形 (純粋関数)
 //! - [`ingest`] / [`internal`] — 取り込む PDF の検査と R2 の key、取り込みの本体 [`internal::ingest_pdf`]
-//! - [`inbox`] — スキャンの inbox の取り込み (Queue の consumer。tenant は auth-worker が検証したチケットから)
+//! - [`inbox`] — スキャンの inbox の取り込み (一覧を開いたときの sweep。tenant は auth-worker が検証したチケットから)
 //! - [`ichiban`] — 一番星 Worker の口の抽象と応答の解釈
 //! - [`holidays`] — 日本の祝日の口の抽象と応答の解釈 (労災の紐づけの延長)
 //! - [`store`] — PDF の置き場の抽象

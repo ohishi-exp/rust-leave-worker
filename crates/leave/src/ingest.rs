@@ -33,7 +33,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// 何度呼んでも同じになる R2 の key (Queue の再配送で二重に取り込まないため)。`seed` (inbox の object key) は
+/// 何度呼んでも同じになる R2 の key (同じ object を sweep で 2 回拾っても二重に取り込まないため)。`seed` (inbox の object key) は
 /// そのまま使わず、sha256 の先頭 32 桁だけを入れる (入力の文字を key に持ち込まない)
 pub fn seeded_object_key(tenant_id: Uuid, received_at: DateTime<Utc>, seed: &str) -> String {
     format!(

@@ -20,7 +20,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 lopdf = { version = "0.34", default-features = false, features = ["nom_parser"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# スキャンの PDF とチケットの照合・Queue の再配送でも同じになる R2 の key (Cargo.lock に既に在る版)
+# スキャンの PDF とチケットの照合・sweep で 2 回拾っても同じになる R2 の key (Cargo.lock に既に在る版)
 sha2 = { version = "0.11", default-features = false }
 # 型付きの文の型 (`Type`) と `Row`。接続は張らない (wasm 用の feature `js` は直下の worker と alc-worker-db が付ける)
 tokio-postgres = { version = "0.7", default-features = false, features = ["with-chrono-0_4", "with-uuid-1"] }

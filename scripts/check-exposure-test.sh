@@ -93,11 +93,5 @@ mutate "staging の services が本番の auth-worker を指す" \
   's = s.replace("service = \"auth-worker-staging\"", "service = \"auth-worker\"", 1)'
 mutate "staging の r2_buckets が本番の bucket leave-inbox を指す" \
   's = s.replace("bucket_name = \"leave-inbox-staging\"", "bucket_name = \"leave-inbox\"", 1)'
-mutate "staging の queue consumer が本番の queue leave-inbox を消費する" \
-  's = s.replace("queue = \"leave-inbox-staging\"\n", "queue = \"leave-inbox\"\n", 1)'
-mutate "staging の queue consumer の dead letter queue が本番のもの" \
-  's = s.replace("dead_letter_queue = \"leave-inbox-staging-dlq\"", "dead_letter_queue = \"leave-inbox-dlq\"", 1)'
-mutate "staging に本番の queue の consumer を前に挿す" \
-  's = s.replace("[env.staging.observability]", "[[env.staging.queues.consumers]]\nqueue = \"leave-inbox\"\n\n[env.staging.observability]", 1)'
 
 exit "$fail"

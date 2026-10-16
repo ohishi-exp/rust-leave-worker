@@ -45,7 +45,7 @@ path = "crates/leave/src/ingest.rs"
 [[files]]
 path = "crates/leave/src/internal.rs"
 
-# スキャンの inbox の取り込み (Queue の consumer の中身。ack / retry の全経路を tests/api_db.rs が実 DB・偽の inbox・偽の検証で通す)
+# スキャンの inbox の取り込み (sweep が通す中身。ack / retry の全経路を tests/api_db.rs が実 DB・偽の inbox・偽の検証で通す)
 [[files]]
 path = "crates/leave/src/inbox.rs"
 

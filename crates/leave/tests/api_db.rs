@@ -3215,7 +3215,7 @@ async fn staging_hides_pages_older_than_visible_minutes() {
     assert_eq!(got.body, b"%PDF-old");
 }
 
-/// スキャンの inbox の取り込み (Queue の consumer。worker の `#[event(queue)]` が呼ぶ `inbox::handle`)
+/// スキャンの inbox の取り込み (sweep と、それが通す `inbox::handle_batch`)
 mod inbox {
     use super::*;
     use std::sync::Mutex as StdMutex;
@@ -3308,7 +3308,7 @@ mod inbox {
         got.json()["data"].as_array().unwrap().clone()
     }
 
-    /// チケットの tenant に入る (mail_from / subject は NULL)。再配送しても同じ key・同じ行で、二重にならない
+    /// チケットの tenant に入る (mail_from / subject は NULL)。sweep で 2 回拾っても同じ key・同じ行で、二重にならない
     #[tokio::test]
     async fn stores_for_the_ticket_tenant_once() {
         let t = tenant().await;
@@ -3343,7 +3343,7 @@ mod inbox {
         assert_eq!(r.handle(put_event()).await, Outcome::Ack);
         assert_eq!(r.logs().last().unwrap(), "inbox: object gone");
 
-        // 削除に失敗して再配送された: 同じ key に置き直し、行は増えない
+        // 削除に失敗して次の sweep でまた拾われた: 同じ key に置き直し、行は増えない
         r.inbox
             .objects
             .lock()
@@ -3513,7 +3513,7 @@ mod inbox {
         assert_eq!(r.logs(), vec!["ingest: r2 put failed"]);
         assert!(r.deleted().is_empty());
 
-        // 取り込めたが inbox を消せなかった: retry (次の配送は同じ key・同じ行で冪等)
+        // 取り込めたが inbox を消せなかった: retry (次の sweep は同じ key・同じ行で冪等)
         let r = setup(
             FakePdfs::default(),
             FakeInbox {

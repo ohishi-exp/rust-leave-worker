@@ -38,7 +38,7 @@ enabled = true
 binding = "LEAVE_HYPERDRIVE"
 id = "6bdf446634034f989d4e094d5510b162"
 
-# 本番の R2 (休暇申請書の PDF の置き場。書くのはスキャンの inbox の取り込み (Queue)、管理 API は読むだけ)。
+# 本番の R2 (休暇申請書の PDF の置き場。書くのはスキャンの inbox の取り込み (sweep)、管理 API は読むだけ)。
 # binding は env に継承されないので、staging は下で別の bucket を指す
 [[r2_buckets]]
 binding = "LEAVE_R2"
@@ -63,17 +63,11 @@ binding = "AUTH_WORKER"
 service = "auth-worker"
 
 # スキャンの inbox (複合機 → nuxt-leave の WebDAV が置く。customMetadata.ticket に auth-worker のチケット)。
-# R2 のイベント通知 (object-create・suffix .pdf) が Queue leave-inbox に積み、下の consumer (src/lib.rs の queue) が取り込む。
-# staging は下で別の bucket・別の queue を指す (scripts/check-exposure.sh が検査)
+# 一覧の口 (GET /api/leave/documents) を開いたときに inbox を list して取り込む (sweep。src/lib.rs の fetch)。
+# staging は下で別の bucket を指す (scripts/check-exposure.sh が検査)
 [[r2_buckets]]
 binding = "LEAVE_INBOX"
 bucket_name = "leave-inbox"
-
-[[queues.consumers]]
-queue = "leave-inbox"
-dead_letter_queue = "leave-inbox-dlq"
-max_batch_size = 5
-max_retries = 5
 
 # auth-worker の named entrypoint (RPC)。inbox のチケットを verifyTicket(ticket, "leave-scan") で検証する
 # (この Worker は鍵を持たない。会社 ID は検証結果だけから取る)
@@ -135,16 +129,10 @@ secret_name = "INTERNAL_SHARED_SECRET"
 [env.staging.triggers]
 crons = []
 
-# スキャンの inbox (staging の bucket と queue。binding も consumer も env に継承されないので再宣言する)
+# スキャンの inbox (staging の bucket。binding は env に継承されないので再宣言する)
 [[env.staging.r2_buckets]]
 binding = "LEAVE_INBOX"
 bucket_name = "leave-inbox-staging"
-
-[[env.staging.queues.consumers]]
-queue = "leave-inbox-staging"
-dead_letter_queue = "leave-inbox-staging-dlq"
-max_batch_size = 5
-max_retries = 5
 
 # チケットの検証は auth-worker の staging へ (env 下の services は `-staging` の service だけ。scripts/check-exposure.sh)
 [[env.staging.services]]
