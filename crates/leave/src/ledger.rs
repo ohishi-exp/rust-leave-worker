@@ -53,7 +53,7 @@ use crate::pg;
 use crate::reconcile::{
     calendar_days, candidate_periods, days_paths, expand_periods, extension_span, parse_employees,
     pick_link_rows, push_days, read_day_rows, rousai_days, rousai_extension, rows_of, yukyu_usages,
-    Employee, IchibanDays, IchibanRow, LinkRow,
+    Employee, IchibanDays, IchibanRow, LinkRow, DAYS_MAX_SPAN,
 };
 use crate::routes::{
     bad_request, db_error, error, ichiban_get, ichiban_not_configured, not_found, parse_id,
@@ -99,6 +99,9 @@ fn consumption_from(
 pub struct EmployeeQuery {
     pub employee_cd: Option<String>,
     pub month: Option<String>,
+    /// 候補の口だけが読む探す期間 (両方あるときだけ使う。[`parse_search_range`])
+    pub from: Option<String>,
+    pub to: Option<String>,
 }
 
 fn employee_cd_of(
@@ -226,8 +229,25 @@ pub fn candidate_window(page: &Page, periods: &[Period]) -> (NaiveDate, NaiveDat
     }
 }
 
+/// 候補の口の探す期間 (`from`/`to`、両端を含む)。どちらも無ければ `None` (ページの窓)。片方だけ・日付として読めない・
+/// `from > to`・幅が [`DAYS_MAX_SPAN`] 日 (両端を含む) を超えるときは `invalid_range`
+pub fn parse_search_range(
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<Option<(NaiveDate, NaiveDate)>, &'static str> {
+    let (from, to) = match (from, to) {
+        (None, None) => return Ok(None),
+        (Some(f), Some(t)) => (grants::parse_date(f), grants::parse_date(t)),
+        _ => return Err("invalid_range"),
+    };
+    match (from, to) {
+        (Some(f), Some(t)) if f <= t && (t - f).num_days() < DAYS_MAX_SPAN => Ok(Some((f, t))),
+        _ => Err("invalid_range"),
+    }
+}
+
 /// ページの窓 ([`candidate_window`]) で、乗務員 `code` の一番星の行を取る (`codes` は `code` 1 つだけの集合)。
-/// 窓は保存済みの期間に `extra` (紐づけの保存で送られた期間) を足して広げる (候補の口は空)。
+/// `range` があればその範囲 (ページの基準日・保存済みの期間は見ない)。窓は保存済みの期間に `extra` (紐づけの保存で送られた期間) を足して広げる (候補の口は空)。
 /// ページが自 tenant に見えない・乗務員が自 tenant の部門から外れたら 404、一番星が無ければ 503、一番星の失敗は 502
 async fn page_window_rows<'a>(
     state: &LeaveState,
@@ -236,6 +256,7 @@ async fn page_window_rows<'a>(
     code: &str,
     codes: &'a BTreeSet<String>,
     extra: &[Period],
+    range: Option<(NaiveDate, NaiveDate)>,
 ) -> Result<Vec<IchibanRow<'a>>, Response> {
     let got = pg::get_page(
         &mut *state.pg.lock().await,
@@ -249,13 +270,13 @@ async fn page_window_rows<'a>(
     let api = ichiban_of(state)?;
     find_employee(state, &api, tenant_id, code).await?;
     let periods = [detail.periods.as_slice(), extra].concat();
-    let (from, to) = candidate_window(&detail.page, &periods);
+    let (from, to) = range.unwrap_or_else(|| candidate_window(&detail.page, &periods));
     fetch_rows(state, &api, codes, from, to)
         .await
         .map_err(bad_gateway)
 }
 
-/// `GET /leave/pages/{id}/candidates?employee_cd=`: ページの窓の一番星の休暇の行を、続く日ごとの期間にまとめて返す
+/// `GET /leave/pages/{id}/candidates?employee_cd=&from=&to=`: ページの窓 (`from`/`to` があればその期間) の一番星の休暇の行を、続く日ごとの期間にまとめて返す
 pub async fn candidates(
     State(state): State<LeaveState>,
     Extension(t): Extension<TenantId>,
@@ -272,9 +293,11 @@ async fn candidates_inner(
     raw: Result<Query<EmployeeQuery>, QueryRejection>,
 ) -> Result<Response, Response> {
     let id = parse_id(&id).ok_or_else(not_found)?;
-    let code = employee_cd_of(raw)?.employee_cd.unwrap_or_default();
+    let q = employee_cd_of(raw)?;
+    let range = parse_search_range(q.from.as_deref(), q.to.as_deref()).map_err(bad_request)?;
+    let code = q.employee_cd.unwrap_or_default();
     let codes = BTreeSet::from([code.clone()]);
-    let rows = page_window_rows(&state, tenant_id, id, &code, &codes, &[]).await?;
+    let rows = page_window_rows(&state, tenant_id, id, &code, &codes, &[], range).await?;
     Ok(Json(json!({ "periods": candidate_periods(&rows, &code) })).into_response())
 }
 
@@ -292,7 +315,7 @@ pub(crate) async fn verified_link_rows(
     }
     let code = u.employee_cd.clone().unwrap_or_default();
     let codes = BTreeSet::from([code.clone()]);
-    let rows = page_window_rows(state, tenant_id, page_id, &code, &codes, &u.periods).await?;
+    let rows = page_window_rows(state, tenant_id, page_id, &code, &codes, &u.periods, None).await?;
     pick_link_rows(&rows, &code, &u.ichiban_row_ids).ok_or_else(|| bad_request("unknown_row"))
 }
 
@@ -873,6 +896,30 @@ mod tests {
             consumption_from(d("2026-09-29"), Some(d("2024-04-01")), Some(&o)),
             d("2024-04-01")
         );
+    }
+
+    #[test]
+    fn search_range_validation() {
+        let ok = |f: &str, t: &str| parse_search_range(Some(f), Some(t));
+        assert_eq!(parse_search_range(None, None), Ok(None));
+        assert_eq!(
+            ok("2026-10-01", "2026-10-01"),
+            Ok(Some((d("2026-10-01"), d("2026-10-01"))))
+        );
+        // 両端を含めて 92 日までは通り、93 日は弾く
+        assert!(ok("2026-10-01", "2026-12-31").is_ok());
+        assert_eq!(ok("2026-10-01", "2027-01-01"), Err("invalid_range"));
+        assert!(ok("2026-10-01", "2026-12-30").is_ok());
+        for (f, t) in [
+            (Some("2026-10-01"), None),
+            (None, Some("2026-10-01")),
+            (Some("2026-10-02"), Some("2026-10-01")),
+            (Some("2026-13-01"), Some("2026-10-01")),
+            (Some("2026-10-01"), Some("x")),
+            (Some("2026-1-1"), Some("2026-10-01")),
+        ] {
+            assert_eq!(parse_search_range(f, t), Err("invalid_range"));
+        }
     }
 
     #[test]
