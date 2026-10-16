@@ -1,23 +1,22 @@
-//! スキャンの inbox の取り込み (Queue `leave-inbox` の consumer。worker の `#[event(queue)]` が 1 メッセージずつ呼ぶ)。
+//! スキャンの inbox の取り込み (一覧の口を開いたときに [`sweep`] が拾う)。
 //!
 //! 複合機 → nuxt-leave の WebDAV が R2 bucket `leave-inbox` に PDF を置き、`customMetadata.ticket` に auth-worker の
-//! 署名付きチケットを載せる。R2 のイベント通知 (object-create) が Queue に積み、ここへ届く。
+//! 署名付きチケットを載せる。一覧の口 (`GET /api/leave/documents`) を開いたとき、list の結果から [`InboxEvent`] の形の本文を組んでここへ通す。
 //!
-//! 流れ: 通知の JSON ([`InboxEvent`]) → 対象の action か・大きさ → inbox の object を読む → チケットを auth-worker の
+//! 流れ: 本文の JSON ([`InboxEvent`]) → 対象の action か・大きさ → inbox の object を読む → チケットを auth-worker の
 //! RPC `verifyTicket` で検証 ([`TicketVerifier`]。**この Worker は鍵を持たない**) → 本文の sha256 がチケットと一致 →
-//! [`check_pdf_bytes`] → [`ingest_pdf`] (key は inbox の object key から決定的に作る = 再配送でも二重にならない) →
-//! inbox の object を消して ack。
+//! [`check_pdf_bytes`] → [`ingest_pdf`] (key は inbox の object key から決定的に作る = 同じ object を sweep で 2 回拾っても二重にならない) →
+//! inbox の object を消して ack (inbox から外す)。
 //!
 //! - **tenant はチケットの検証結果だけから取る** (inbox の key・メタデータからは読まない)。会社は機械用資格情報で
 //!   確定している (送信元の照合は無い)
 //! - 取り込めない object (チケットが無い・不正・sha256 の不一致・PDF でない・読めない) は消して ack (再試行しない)
-//! - **DB の接続は検証の後**: batch の全メッセージの検証 (R2・RPC) を済ませ、通ったものがあるときだけ 1 本張る
+//! - **DB の接続は検証の後**: batch の全件の検証 (R2・RPC) を済ませ、通ったものがあるときだけ 1 本張る
 //!   ([`handle_batch`]。RPC の先が同じ DB に繋ぎにいっても、こちらが先に握っていないので詰まらない)
-//! - R2・DB・RPC の一時的な失敗 (`verifyTicket` の `{error: "unavailable"}` を含む) は retry (Queue の max_retries の後は dead letter queue)。object が既に無ければ ack
+//! - R2・DB・RPC の一時的な失敗 (`verifyTicket` の `{error: "unavailable"}` を含む) は retry (inbox に残して次に一覧を開いたときにやり直す)。object が既に無ければ ack
 //! - ログは段の名前と固定の語だけ (チケット・PDF の中身・object key は出さない。tenant は取り込み後のログに出す)
 //!
-//! 一覧の口 (`GET /api/leave/documents`) を開いたときにも inbox を拾う ([`sweep`]。本番で R2 のイベント通知が Queue に
-//! 届かないため)。list の結果から通知と同じ形の本文を組み、同じ [`handle_batch`] に通す。判定は [`may_sweep`]
+//! 拾う口は [`sweep`] (list の結果の本文を [`handle_batch`] に通す)。判定は [`may_sweep`]
 
 use std::fmt::Display;
 use std::future::Future;
@@ -48,7 +47,7 @@ const STORE_ACTIONS: [&str; 2] = ["PutObject", "CompleteMultipartUpload"];
 pub struct InboxEvent {
     pub action: String,
     pub object: EventObject,
-    /// 受信時刻 (`leave_pages.received_at`)。再配送でも同じ値なので、決定的な key の年月もぶれない
+    /// 受信時刻 (`leave_pages.received_at`)。sweep で何度拾っても同じ値なので、決定的な key の年月もぶれない
     pub event_time: DateTime<Utc>,
 }
 
@@ -153,13 +152,13 @@ pub enum Verdict {
     Ready(Verified),
 }
 
-/// 取り込めない object を消して ack (消せなければ retry。次の配送でもう一度消す)
+/// 取り込めない object を消して ack (消せなければ retry。次に拾うときもう一度消す)
 async fn discard(d: &InboxDeps<'_>, key: &str, reason: &str) -> Verdict {
     (d.log)(&format!("inbox dropped: {reason}"));
     Verdict::Done(settle(d, key).await)
 }
 
-/// inbox の object を消して ack。消せなければ retry (取り込みは冪等なので、もう一度通してよい)
+/// inbox の object を消して ack (inbox から外す)。消せなければ retry (取り込みは冪等なので、もう一度通してよい)
 async fn settle(d: &InboxDeps<'_>, key: &str) -> Outcome {
     match d.inbox.delete(key).await {
         Ok(()) => Outcome::Ack,
@@ -261,7 +260,7 @@ async fn ingest(d: &InboxDeps<'_>, pg: &Mutex<PgClient>, v: Verified) -> Outcome
 /// 1 batch を 2 段で処理して、メッセージごとの扱い (入力と同じ順) を返す。
 /// 1. 全メッセージの検証段 ([`verify`])。**この間は DB に繋がない**
 /// 2. 検証を通ったものがあるときだけ `connect` を 1 回呼び、その接続を使い回して取り込む。
-///    繋がらなければ検証を通ったものを全部 retry (Queue の max_retries の後は dead letter queue)
+///    繋がらなければ検証を通ったものを全部 retry (inbox に残して次の回)
 pub async fn handle_batch<F, Fut, E>(
     d: &InboxDeps<'_>,
     bodies: Vec<serde_json::Value>,

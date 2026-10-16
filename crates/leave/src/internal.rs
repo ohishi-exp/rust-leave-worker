@@ -26,7 +26,7 @@ pub struct NewPdf {
     /// `leave_pages.mail_from` (スキャンは `None` = NULL)
     pub mail_from: Option<String>,
     pub subject: Option<String>,
-    /// R2 の key をこれから決定的に作る (Queue の再配送で同じ key・同じ行になる)
+    /// R2 の key をこれから決定的に作る (同じ object を sweep で 2 回拾っても同じ key・同じ行になる)
     pub key_seed: String,
 }
 
@@ -35,11 +35,11 @@ pub struct NewPdf {
 pub enum IngestFailure {
     /// 意図して捨てる (ページ数が読めない・多すぎる)。語は固定
     Drop(&'static str),
-    /// R2 か DB の失敗 (一時的なもの。Queue は retry)。段の名前はログに出してある
+    /// R2 か DB の失敗 (一時的なもの。inbox に残して次の回に retry)。段の名前はログに出してある
     Failed,
 }
 
-/// 取り込みの本体 (Queue の consumer と Web の取り込み口が呼ぶ): ページ数 ([`count_pages`]) → R2 に put → 全ページを INSERT。
+/// 取り込みの本体 (inbox の sweep と Web の取り込み口が呼ぶ): ページ数 ([`count_pages`]) → R2 に put → 全ページを INSERT。
 /// INSERT が失敗しても R2 の object は消さない (key は決定的。前の配送で入った行がその object を指していることがあり、
 /// 再試行は同じ key に put し直すため)。R2 の await は transaction の外 (`tenant_tx` は INSERT の 1 回だけ)
 pub async fn ingest_pdf(

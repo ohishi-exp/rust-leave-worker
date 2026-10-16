@@ -11,9 +11,8 @@
 //!
 //! 定時実行 (`scheduled`、本番だけ) は毎朝一番星と申請書を突き合わせ、ずれを LINE WORKS へ送る (crates/leave の `cron`)。
 //!
-//! Queue (`queue`) はスキャンの inbox (R2 bucket `leave-inbox` のイベント通知) を 1 メッセージずつ取り込む
-//! (中身は crates/leave の `inbox::handle_batch`。tenant は auth-worker の RPC `verifyTicket` が返したものだけ)。
-//! 一覧の口 (`GET /api/leave/documents`) を開いたときにも、DB に繋ぐ前に inbox を list して取り込む (`inbox::sweep`)。
+//! スキャンの inbox (R2 bucket `leave-inbox`) は、一覧の口 (`GET /api/leave/documents`) を開いたときに、DB に繋ぐ前に inbox を list して取り込む (`inbox::sweep`。
+//! tenant は auth-worker の RPC `verifyTicket` が返したものだけ)。
 
 // worker 本体は wasm32 専用。native の `cargo build` / `clippy` / `test` (workspace の root で打つもの) では空の crate にして、
 // crates/leave だけを検査させる
@@ -35,8 +34,8 @@ use leave::cron::Notifier;
 use leave::{tenant_router, Clock, LeaveState, LogSink, TEST_NOTIFY_PATH};
 use tower_service::Service;
 use worker::{
-    console_error, console_log, event, Context, Date, Env, HttpRequest, MessageBatch, MessageExt,
-    Result, ScheduleContext, ScheduledEvent, WorkerVersionMetadata,
+    console_error, console_log, event, Context, Date, Env, HttpRequest, Result, ScheduleContext,
+    ScheduledEvent, WorkerVersionMetadata,
 };
 
 use crate::bindings::{
@@ -239,33 +238,4 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     let today = leave::ledger::jst_date(now());
     let summary = leave::cron::run(&mut pg, &ichiban, &HolidaysJp, notifier.as_ref(), today).await;
     console_log!("leave: {}", summary.line());
-}
-
-/// スキャンの inbox の取り込み (wrangler.toml の `[[queues.consumers]]`)。メッセージごとに ack / retry を決める。
-/// binding が無ければ全部 retry、DB に繋がらなければ検証を通ったものを retry (Queue の max_retries の後は dead letter queue)
-#[event(queue)]
-async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) -> Result<()> {
-    let Some((pdfs, inbox, verifier)) = inbox_bindings(&env) else {
-        batch.retry_all();
-        return Ok(());
-    };
-    let log = log_sink();
-    let deps = leave::inbox::InboxDeps {
-        pdfs: &pdfs,
-        inbox: &inbox,
-        verifier: &verifier,
-        log: &log,
-    };
-    // 検証 (R2・verifyTicket) を全部済ませてから、通ったものがあるときだけ DB に繋ぐ。verifyTicket の先が同じ DB
-    // (DO は同時に 1 本) に繋ぎにいくので、先に握らない。繋がらなければ検証を通ったものを retry
-    let messages = batch.messages()?;
-    let bodies = messages.iter().map(|m| m.body().clone()).collect();
-    let outcomes = leave::inbox::handle_batch(&deps, bodies, || db::connect(&env)).await;
-    for (message, outcome) in messages.iter().zip(outcomes) {
-        match outcome {
-            leave::inbox::Outcome::Ack => message.ack(),
-            leave::inbox::Outcome::Retry => message.retry(),
-        }
-    }
-    Ok(())
 }

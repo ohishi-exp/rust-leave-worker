@@ -110,7 +110,7 @@ pub mod sql {
          (tenant_id, page_id, kind, start_date, end_date, half) VALUES ($1, $2, $3, $4, $5, $6)";
 
     /// 1 通の PDF の全ページ (page_no 1..=$6) を 1 文で入れる。同じ key が既に在れば何もしない
-    /// (Queue の再配送。key は inbox の object key から決まる — `ingest::seeded_object_key`)
+    /// (同じ object を sweep で 2 回拾う。key は inbox の object key から決まる — `ingest::seeded_object_key`)
     pub const PAGES_INSERT: &str = "INSERT INTO alc_api.leave_pages \
          (tenant_id, r2_key, page_no, mail_from, subject, received_at, status) \
          SELECT $1, $2, g, $3, $4, $5, 'unlinked' FROM generate_series(1, $6::int) AS g \
