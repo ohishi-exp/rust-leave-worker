@@ -1505,6 +1505,97 @@ async fn list_alerts_open_in_window_only() {
     assert_eq!(got.json()["alerts"].as_array().unwrap().len(), 1);
 }
 
+/// 紐づけて保存したら、その期間の日の未解決の `ichiban_only` を同じ PUT ですぐ閉じる (翌朝の突き合わせを待たない)。
+/// 期間が覆わない日・別の区分・`pdf_only`・別 tenant の同じ鍵は残る。linked でない保存は閉じない。
+/// 窓の外の日も鍵が合えば閉じる (毎朝の解決は窓の中だけだが、窓の外の行は一覧にも通知にも出ないので意図した差)
+#[tokio::test]
+async fn link_page_resolves_ichiban_only_alerts() {
+    let (t, other) = (tenant().await, tenant().await);
+    let p = page(t, &format!("{t}/a.pdf"), 1, "2026-10-01T00:00:00Z").await;
+    let a = app(FakePdfs::default(), None).await;
+    let uri = format!("/api/leave/pages/{p}");
+    let yukyu = ("yukyu", "ichiban_only");
+    alert_row(t, "1380", "2026-10-03", yukyu, None, false).await;
+    alert_row(t, "1380", "2026-10-04", yukyu, None, false).await;
+    alert_row(t, "1380", "2026-10-05", yukyu, None, false).await;
+    alert_row(
+        t,
+        "1380",
+        "2026-10-03",
+        ("kekkin", "ichiban_only"),
+        None,
+        false,
+    )
+    .await;
+    alert_row(t, "1380", "2026-10-03", ("yukyu", "pdf_only"), None, false).await;
+    alert_row(t, "1381", "2026-10-03", yukyu, None, false).await;
+    alert_row(t, "1380", "2026-07-20", yukyu, None, false).await;
+    alert_row(other, "1380", "2026-10-03", yukyu, None, false).await;
+    let open = |t: Uuid| {
+        let a = &a;
+        async move {
+            let v = call(a, "GET", "/api/leave/alerts", Some(t), ADMIN, None)
+                .await
+                .json();
+            v["alerts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| {
+                    format!(
+                        "{} {} {} {}",
+                        x["employee_cd"], x["day"], x["kind"], x["direction"]
+                    )
+                    .replace('"', "")
+                })
+                .collect::<Vec<String>>()
+        }
+    };
+    let before = open(t).await;
+    assert_eq!(before.len(), 6);
+    let resolved_july = || async {
+        support::admin()
+            .await
+            .query_one(
+                "SELECT resolved_at IS NOT NULL FROM alc_api.leave_alerts WHERE tenant_id = $1 AND day = '2026-07-20'",
+                &[&t],
+            )
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    };
+
+    // linked でない保存は閉じない
+    let periods = json!([
+        {"kind": "yukyu", "start_date": "2026-10-03", "end_date": "2026-10-03", "half": "pm"},
+        {"kind": "yukyu", "start_date": "2026-10-04", "end_date": "2026-10-04"},
+        {"kind": "yukyu", "start_date": "2026-07-20", "end_date": "2026-07-20"}
+    ]);
+    let body = json!({"employee_cd": "1380", "status": "unlinked", "periods": periods});
+    let got = call(&a, "PUT", &uri, Some(t), ADMIN, Some(body)).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(open(t).await, before);
+    assert!(!resolved_july().await);
+
+    let body = json!({"employee_cd": "1380", "status": "linked", "periods": periods});
+    let got = call(&a, "PUT", &uri, Some(t), ADMIN, Some(body)).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(
+        open(t).await,
+        vec![
+            "1380 2026-10-03 kekkin ichiban_only",
+            "1380 2026-10-03 yukyu pdf_only",
+            "1380 2026-10-05 yukyu ichiban_only",
+            "1381 2026-10-03 yukyu ichiban_only",
+        ]
+    );
+    assert!(resolved_july().await);
+    assert_eq!(
+        open(other).await,
+        vec!["1380 2026-10-03 yukyu ichiban_only"]
+    );
+}
+
 /// 接続が切れた DB では、どの口も 500 の固定の語で、ログは段の名前と kind だけ
 #[tokio::test]
 async fn db_errors_are_500() {

@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::cron::NotifyTarget;
 use crate::grants::{self, AutoGrant, Grant, GrantWrite, Opening, OpeningPut};
 use crate::pages::{Document, DocumentsQuery, ListQuery, Page, PageDetail, PageUpdate, Period};
-use crate::reconcile::{LinkRow, LinkedPeriod, Mismatch, OpenAlert, PendingAlert};
+use crate::reconcile::{self, LinkRow, LinkedPeriod, Mismatch, OpenAlert, PendingAlert};
 use crate::settings::{Settings, ValidSettings};
 
 pub mod sql {
@@ -254,6 +254,12 @@ pub mod sql {
          WHERE a.tenant_id = $1 AND a.resolved_at IS NULL AND a.day BETWEEN $2 AND $3 \
          AND NOT EXISTS (SELECT 1 FROM unnest($4::text[], $5::date[], $6::text[], $7::text[]) AS u(e, d, k, r) \
          WHERE u.e = a.employee_cd AND u.d = a.day AND u.k = a.kind AND u.r = a.direction)";
+
+    /// 紐づけた期間の鍵 (`$2`〜`$4`) に当たる未解決の `ichiban_only` を解決にする (保存した PUT と同じ transaction)。
+    /// 窓は見ない (窓の外の行は一覧にも通知にも出ないので、閉じても差は無い)。`pdf_only` は閉じない
+    pub const ALERTS_RESOLVE_LINKED: &str = "UPDATE alc_api.leave_alerts SET resolved_at = NOW() \
+         WHERE tenant_id = $1 AND resolved_at IS NULL AND direction = 'ichiban_only' \
+         AND (employee_cd, day, kind) IN (SELECT e, d, k FROM unnest($2::text[], $3::date[], $4::text[]) AS u(e, d, k))";
 
     /// 未解消の警告 = 未解決かつ窓 (`$2`〜`$3`) の中。毎朝の通知 ([`super::record_alerts`]) と一覧
     /// ([`super::open_alerts`]) が同じこの 1 文を使う。窓の外へ出た未解決の行は `resolved_at` が NULL のまま表に
@@ -942,7 +948,7 @@ pub async fn get_page(
     .await
 }
 
-/// 1 つの transaction で: ページを行ロック → 期間を全削除 → 挿入 → 一番星の行を全削除 → `link_rows` を挿入 → ページを更新。
+/// 1 つの transaction で: ページを行ロック → 期間を全削除 → 挿入 → 一番星の行を全削除 → `link_rows` を挿入 → 保存した期間に当たる `ichiban_only` の警告を解決 (`reconcile::linked_alert_keys`) → ページを更新。
 /// `linked_by` / `linked_at` は `status = linked` のときだけ `actor` / 今にし、それ以外は消す。
 /// `link_rows` は確かめ済みの行 (`ledger::verified_link_rows`。linked 以外・行の指定が無ければ空 = 削除だけ)。
 /// 自 tenant に見えなければ何も書かずに `None`
@@ -960,6 +966,7 @@ pub async fn update_page(
     let days: Vec<NaiveDate> = link_rows.iter().map(|r| r.day).collect();
     let items: Vec<String> = link_rows.iter().map(|r| r.item_name.clone()).collect();
     let updated: Vec<Option<String>> = link_rows.into_iter().map(|r| r.last_updated).collect();
+    let (alert_codes, alert_days, alert_kinds) = reconcile::linked_alert_keys(id, &u);
     pg.tenant_tx(tenant_id, move |tx| {
         Box::pin(async move {
             let ids = [
@@ -1010,6 +1017,18 @@ pub async fn update_page(
                 ],
             )
             .await?;
+            if !alert_codes.is_empty() {
+                tx.execute_typed(
+                    sql::ALERTS_RESOLVE_LINKED,
+                    &[
+                        (&tenant_id, Type::UUID),
+                        (&alert_codes, Type::TEXT_ARRAY),
+                        (&alert_days, Type::DATE_ARRAY),
+                        (&alert_kinds, Type::TEXT_ARRAY),
+                    ],
+                )
+                .await?;
+            }
             let row = tx
                 .query_typed_one(
                     &sql::page_update(),
