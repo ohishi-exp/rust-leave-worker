@@ -15,17 +15,22 @@
 //!   ([`handle_batch`]。RPC の先が同じ DB に繋ぎにいっても、こちらが先に握っていないので詰まらない)
 //! - R2・DB・RPC の一時的な失敗 (`verifyTicket` の `{error: "unavailable"}` を含む) は retry (Queue の max_retries の後は dead letter queue)。object が既に無ければ ack
 //! - ログは段の名前と固定の語だけ (チケット・PDF の中身・object key は出さない。tenant は取り込み後のログに出す)
+//!
+//! 一覧の口 (`GET /api/leave/documents`) を開いたときにも inbox を拾う ([`sweep`]。本番で R2 のイベント通知が Queue に
+//! 届かないため)。list の結果から通知と同じ形の本文を組み、同じ [`handle_batch`] に通す。判定は [`may_sweep`]
 
 use std::fmt::Display;
 use std::future::Future;
 
 use alc_worker_db::PgClient;
+use axum::http::{HeaderMap, Method};
 use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
 use futures_util::lock::Mutex;
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::auth::can_use_leave;
 use crate::ingest::{check_pdf_bytes, sha256_hex, MAX_PDF_BYTES};
 use crate::internal::{ingest_pdf, IngestFailure, NewPdf};
 use crate::routes::LogSink;
@@ -60,8 +65,19 @@ pub struct InboxObject {
     pub ticket: Option<String>,
 }
 
+/// inbox の list の 1 件 (メタデータだけ)
+#[derive(Debug, Clone, PartialEq)]
+pub struct InboxListed {
+    pub key: String,
+    pub size: u64,
+    /// 置かれた時刻 (通知の `eventTime` の代わりに `leave_pages.received_at` にする)
+    pub uploaded: DateTime<Utc>,
+}
+
 /// inbox の bucket (binding `LEAVE_INBOX`)。Worker での実装は直下の `src/bindings.rs`
 pub trait Inbox: Send + Sync {
+    /// 先頭から `limit` 件まで (key の辞書順。続きは読まない)
+    fn list(&self, limit: u32) -> BoxFuture<'_, Result<Vec<InboxListed>, StoreError>>;
     /// 無ければ `Ok(None)`
     fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<InboxObject>, StoreError>>;
     fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), StoreError>>;
@@ -280,10 +296,113 @@ where
     outcomes
 }
 
+/// [`sweep`] で list する件数 (R2 の 1 回の上限。key は UUID 前置なので、超えるとそれより後ろは見えない)
+pub const SWEEP_LIST_LIMIT: u32 = 1000;
+/// [`sweep`] 1 回で取り込む件数 (置かれた時刻の新しい順。残りは次に開いたとき)
+pub const SWEEP_BATCH: usize = 10;
+
+/// 一覧の口 (worker から見た path)
+const SWEEP_PATH: &str = "/api/leave/documents";
+
+/// 一覧の口 `GET /api/leave/documents` で、router が通す人 (tenant ヘッダーが uuid として読める、かつ leave.use 層) の
+/// ときだけ真。tenant の条件は `alc_core_wasm::require_tenant_header` と同じ (`to_str` → `Uuid::parse_str`、trim しない)。
+/// 偽なら sweep せず router に任せる (401 / 403)
+pub fn may_sweep(method: &Method, path: &str, headers: &HeaderMap) -> bool {
+    method == Method::GET
+        && path == SWEEP_PATH
+        && headers
+            .get("X-Tenant-ID")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| Uuid::parse_str(v).is_ok())
+        && can_use_leave(headers)
+}
+
+/// inbox を list して、大きさ 0 を除き、置かれた時刻の新しい順に `batch` 件を [`handle_batch`] に通す
+/// (通知と同じ形の本文を組む。失敗し続ける古い object が新しいものを塞がない)。Retry に終わったものは inbox に残り、
+/// 次の回にやり直す。結果は固定の語と件数で 1 行ログに出し、扱い (処理した順) を返す。list の失敗はログだけ
+pub async fn sweep<F, Fut, E>(d: &InboxDeps<'_>, batch: usize, connect: F) -> Vec<Outcome>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<PgClient, E>>,
+    E: Display,
+{
+    let mut listed = match d.inbox.list(SWEEP_LIST_LIMIT).await {
+        Ok(l) => l,
+        Err(e) => {
+            (d.log)(&format!("inbox sweep: {}", e.0));
+            return Vec::new();
+        }
+    };
+    listed.retain(|o| o.size > 0);
+    listed.sort_by_key(|o| std::cmp::Reverse(o.uploaded));
+    let bodies = listed
+        .into_iter()
+        .take(batch)
+        .map(|o| {
+            serde_json::json!({
+                "action": STORE_ACTIONS[0],
+                "object": { "key": o.key, "size": o.size },
+                "eventTime": o.uploaded,
+            })
+        })
+        .collect();
+    let outcomes = handle_batch(d, bodies, connect).await;
+    let retry = outcomes.iter().filter(|o| **o == Outcome::Retry).count();
+    (d.log)(&format!(
+        "inbox sweep: done={} retry={retry}",
+        outcomes.len() - retry
+    ));
+    outcomes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
     use serde_json::json;
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(*k, HeaderValue::from_str(v).unwrap());
+        }
+        h
+    }
+
+    const TENANT: &str = "00000000-0000-4000-8000-000000000001";
+
+    #[test]
+    fn sweeps_only_the_list_for_leave_users() {
+        let get = Method::GET;
+        let user = headers(&[("X-Tenant-ID", TENANT), ("X-User-Permissions", "leave.use")]);
+        let admin = headers(&[("X-Tenant-ID", TENANT), ("X-User-Role", "admin")]);
+        assert!(may_sweep(&get, SWEEP_PATH, &user));
+        assert!(may_sweep(&get, SWEEP_PATH, &admin));
+        // 別の method・別の path
+        assert!(!may_sweep(&Method::POST, SWEEP_PATH, &admin));
+        assert!(!may_sweep(&get, "/api/leave/pages", &admin));
+        assert!(!may_sweep(&get, "/api/leave/documents/", &admin));
+        // tenant ヘッダーが無い・uuid でない・前後に空白 (require_tenant_header は trim しない)・文字列にならない
+        assert!(!may_sweep(
+            &get,
+            SWEEP_PATH,
+            &headers(&[("X-User-Role", "admin")])
+        ));
+        for bad in [
+            "x",
+            " 00000000-0000-4000-8000-000000000001",
+            "00000000-0000-4000-8000-000000000001 ",
+        ] {
+            let h = headers(&[("X-Tenant-ID", bad), ("X-User-Role", "admin")]);
+            assert!(!may_sweep(&get, SWEEP_PATH, &h));
+        }
+        let mut opaque = admin.clone();
+        opaque.insert("X-Tenant-ID", HeaderValue::from_bytes(b"\xff").unwrap());
+        assert!(!may_sweep(&get, SWEEP_PATH, &opaque));
+        // leave.use も admin も無い
+        let viewer = headers(&[("X-Tenant-ID", TENANT), ("X-User-Role", "viewer")]);
+        assert!(!may_sweep(&get, SWEEP_PATH, &viewer));
+    }
 
     #[test]
     fn ticket_is_parsed_or_none() {

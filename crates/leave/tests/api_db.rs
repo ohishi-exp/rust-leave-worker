@@ -3132,7 +3132,8 @@ mod inbox {
     use alc_worker_db::PgClient;
     use futures_util::future::BoxFuture;
     use leave::inbox::{
-        handle_batch, InboxDeps, Outcome, TicketVerifier, VerifyError, TICKET_PURPOSE,
+        handle_batch, sweep, InboxDeps, Outcome, TicketVerifier, VerifyError, SWEEP_BATCH,
+        SWEEP_LIST_LIMIT, TICKET_PURPOSE,
     };
     use leave::ingest::{minimal_pdf, sha256_hex, MAX_PAGES, MAX_PDF_BYTES};
     use leave::LogSink;
@@ -3624,6 +3625,183 @@ mod inbox {
         assert_eq!(r.logs(), vec!["ingest insert: 23503"]);
         assert_eq!(r.pdfs.stored.lock().unwrap().len(), 1);
         assert!(r.deleted().is_empty());
+    }
+
+    impl Run {
+        async fn sweep(&self) -> Vec<Outcome> {
+            let deps = InboxDeps {
+                pdfs: &self.pdfs,
+                inbox: &self.inbox,
+                verifier: &self.verifier,
+                log: &self.log,
+            };
+            let connect = || async { Ok::<_, String>(app_client().await) };
+            sweep(&deps, SWEEP_BATCH, connect).await
+        }
+
+        /// inbox に置く (置かれた時刻つき)
+        fn put(&self, key: &str, bytes: Vec<u8>, uploaded: &str) {
+            self.inbox
+                .objects
+                .lock()
+                .unwrap()
+                .insert(key.to_owned(), (bytes, Some(TICKET.to_owned())));
+            self.inbox
+                .uploaded
+                .lock()
+                .unwrap()
+                .insert(key.to_owned(), uploaded.parse().unwrap());
+        }
+
+        fn remaining(&self) -> Vec<String> {
+            let mut keys: Vec<String> =
+                self.inbox.objects.lock().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        }
+    }
+
+    async fn documents_of(t: Uuid) -> Vec<Value> {
+        let a = app(FakePdfs::default(), None).await;
+        let got = call(
+            &a,
+            "GET",
+            "/api/leave/documents?state=all",
+            Some(t),
+            ADMIN,
+            None,
+        )
+        .await;
+        assert_eq!(got.status, 200);
+        got.json()["data"].as_array().unwrap().clone()
+    }
+
+    /// 一覧を開いたときの取り込み: list から通知と同じ形で通し、取り込んだものは inbox から消える。
+    /// 置かれた時刻の新しい順に 10 件で打ち切り (残りは次の回)、大きさ 0 は除く。received_at は置かれた時刻
+    #[tokio::test]
+    async fn sweep_takes_the_newest_ten_and_leaves_the_rest() {
+        let t = tenant().await;
+        let pdf = minimal_pdf(1);
+        let r = setup(
+            FakePdfs::default(),
+            FakeInbox::default(),
+            FakeVerifier::returning(ticket_for(t, &pdf)),
+        )
+        .await;
+        // key の順と置かれた時刻の順を逆にする (key の先頭が古い)
+        for i in 0..12 {
+            r.put(
+                &format!("{i:02}-scan.pdf"),
+                pdf.clone(),
+                &format!("2026-10-16T01:{i:02}:00Z"),
+            );
+        }
+        r.put("99-empty.pdf", Vec::new(), "2026-10-16T02:00:00Z");
+        assert_eq!(r.sweep().await, vec![Outcome::Ack; 10]);
+        assert_eq!(*r.inbox.list_limits.lock().unwrap(), vec![SWEEP_LIST_LIMIT]);
+        assert_eq!(
+            r.remaining(),
+            vec!["00-scan.pdf", "01-scan.pdf", "99-empty.pdf"]
+        );
+        assert_eq!(r.logs().last().unwrap(), "inbox sweep: done=10 retry=0");
+        let docs = documents_of(t).await;
+        assert_eq!(docs.len(), 10);
+        assert_eq!(docs[0]["received_at"], "2026-10-16T01:11:00Z");
+        assert_eq!(docs[9]["received_at"], "2026-10-16T01:02:00Z");
+
+        // 次の回に残りを取り込む (大きさ 0 は残ったまま)
+        assert_eq!(r.sweep().await, vec![Outcome::Ack; 2]);
+        assert_eq!(r.remaining(), vec!["99-empty.pdf"]);
+        assert_eq!(documents_of(t).await.len(), 12);
+        assert_eq!(r.logs().last().unwrap(), "inbox sweep: done=2 retry=0");
+    }
+
+    /// 会社はチケットの tenant で決まる (開いた人の会社とは無関係)。他社の PDF は自社の一覧に出ない
+    #[tokio::test]
+    async fn sweep_stores_for_the_ticket_tenant_only() {
+        let (t, other) = (tenant().await, tenant().await);
+        let pdf = minimal_pdf(2);
+        let r = setup(
+            FakePdfs::default(),
+            FakeInbox::default(),
+            FakeVerifier::returning(ticket_for(other, &pdf)),
+        )
+        .await;
+        r.put(KEY, pdf, "2026-10-16T01:06:00Z");
+        assert_eq!(r.sweep().await, vec![Outcome::Ack]);
+        assert!(documents_of(t).await.is_empty());
+        let docs = documents_of(other).await;
+        assert_eq!(docs.len(), 1);
+        assert_eq!(pages_of(other).await.len(), 2);
+    }
+
+    /// 同じ object を 2 回 (続けて・同時に) 拾っても 1 件 (本保存の key は inbox の key から決まり、pages は ON CONFLICT)
+    #[tokio::test]
+    async fn sweeping_the_same_object_twice_stores_it_once() {
+        let t = tenant().await;
+        let pdf = minimal_pdf(2);
+        let r = setup(
+            FakePdfs::default(),
+            FakeInbox::default(),
+            FakeVerifier::returning(ticket_for(t, &pdf)),
+        )
+        .await;
+        // 同時: 両方が inbox から読んでから、別々の接続で INSERT する
+        r.put(KEY, pdf.clone(), "2026-10-16T01:06:00Z");
+        let (a, b) = tokio::join!(r.sweep(), r.sweep());
+        assert_eq!((a, b), (vec![Outcome::Ack], vec![Outcome::Ack]));
+        assert!(r.remaining().is_empty());
+        assert_eq!(r.pdfs.stored.lock().unwrap().len(), 1);
+        assert_eq!(documents_of(t).await.len(), 1);
+        assert_eq!(pages_of(t).await.len(), 2);
+
+        // 続けて: 消し損ねて残ったものをもう一度拾う
+        r.put(KEY, pdf, "2026-10-16T01:06:00Z");
+        assert_eq!(r.sweep().await, vec![Outcome::Ack]);
+        assert_eq!(r.sweep().await, Vec::<Outcome>::new());
+        assert_eq!(documents_of(t).await.len(), 1);
+        assert_eq!(pages_of(t).await.len(), 2);
+        assert_eq!(r.logs().last().unwrap(), "inbox sweep: done=0 retry=0");
+    }
+
+    /// 一時的な失敗は inbox に残して次の回にやり直す。list の失敗はログだけで、DB に繋がない
+    #[tokio::test]
+    async fn sweep_keeps_retried_objects_and_survives_list_failure() {
+        let t = tenant().await;
+        let pdf = minimal_pdf(1);
+        let r = setup(
+            FakePdfs::default(),
+            FakeInbox::default(),
+            FakeVerifier::returning(Err(VerifyError)),
+        )
+        .await;
+        r.put(KEY, pdf, "2026-10-16T01:06:00Z");
+        assert_eq!(r.sweep().await, vec![Outcome::Retry]);
+        assert_eq!(r.remaining(), vec![KEY]);
+        assert_eq!(
+            r.logs(),
+            vec!["inbox: verify failed", "inbox sweep: done=0 retry=1"]
+        );
+        assert!(pages_of(t).await.is_empty());
+
+        let r = setup(
+            FakePdfs::default(),
+            FakeInbox {
+                fail_list: true,
+                ..Default::default()
+            },
+            FakeVerifier::returning(Ok(Value::Null)),
+        )
+        .await;
+        let deps = InboxDeps {
+            pdfs: &r.pdfs,
+            inbox: &r.inbox,
+            verifier: &r.verifier,
+            log: &r.log,
+        };
+        let connect = || async { Err::<PgClient, String>("must not be called".to_owned()) };
+        assert!(sweep(&deps, SWEEP_BATCH, connect).await.is_empty());
+        assert_eq!(r.logs(), vec!["inbox sweep: list"]);
     }
 }
 

@@ -12,7 +12,8 @@
 //! 定時実行 (`scheduled`、本番だけ) は毎朝一番星と申請書を突き合わせ、ずれを LINE WORKS へ送る (crates/leave の `cron`)。
 //!
 //! Queue (`queue`) はスキャンの inbox (R2 bucket `leave-inbox` のイベント通知) を 1 メッセージずつ取り込む
-//! (中身は crates/leave の `inbox::handle`。tenant は auth-worker の RPC `verifyTicket` が返したものだけ)。
+//! (中身は crates/leave の `inbox::handle_batch`。tenant は auth-worker の RPC `verifyTicket` が返したものだけ)。
+//! 一覧の口 (`GET /api/leave/documents`) を開いたときにも、DB に繋ぐ前に inbox を list して取り込む (`inbox::sweep`)。
 
 // worker 本体は wasm32 専用。native の `cargo build` / `clippy` / `test` (workspace の root で打つもの) では空の crate にして、
 // crates/leave だけを検査させる
@@ -85,8 +86,46 @@ fn error_response(status: StatusCode, code: &str) -> Response<Body> {
     resp
 }
 
+/// inbox の取り込みに使う binding (inbox の R2・本保存の R2・auth-worker の `verifyTicket`)。どれかが無ければ `None`
+fn inbox_bindings(env: &Env) -> Option<(R2Pdfs, R2Inbox, AuthTicketVerifier)> {
+    let (Ok(inbox), Ok(bucket), Ok(auth)) = (
+        env.bucket(LEAVE_INBOX_BINDING),
+        env.bucket(LEAVE_R2_BINDING),
+        env.service(AUTH_MCRED_BINDING),
+    ) else {
+        console_error!("leave: inbox bindings missing");
+        return None;
+    };
+    Some((
+        R2Pdfs::new(bucket),
+        R2Inbox::new(inbox),
+        AuthTicketVerifier::new(auth),
+    ))
+}
+
+/// 一覧を開いたときの inbox の取り込み (`inbox::sweep`)。失敗しても一覧の応答は止めない (ログだけ)。
+/// sweep の接続 (取り込み用) は返る前に閉じるので、呼び元の一覧用の接続と同時に 2 本握らない
+async fn sweep_inbox(env: &Env) {
+    let Some((pdfs, inbox, verifier)) = inbox_bindings(env) else {
+        return;
+    };
+    let log = log_sink();
+    let deps = leave::inbox::InboxDeps {
+        pdfs: &pdfs,
+        inbox: &inbox,
+        verifier: &verifier,
+        log: &log,
+    };
+    leave::inbox::sweep(&deps, leave::inbox::SWEEP_BATCH, || db::connect(env)).await;
+}
+
 #[event(fetch)]
 async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Body>> {
+    // 一覧の口 (router が通す人だけ) は、DB に繋ぐ前に inbox を取り込む。verifyTicket の先 (auth-worker) が同じ DB に
+    // 繋ぎにいくので、こちらが一覧用の接続を握る前に済ませる (staging の DO は同時に 1 本)
+    if leave::inbox::may_sweep(req.method(), req.uri().path(), req.headers()) {
+        sweep_inbox(&env).await;
+    }
     // 全リクエストで routing の前に繋ぐ (ippoan/alc-vein-worker と同じ)
     let pg = match db::connect(&env).await {
         Ok(c) => c,
@@ -206,18 +245,10 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
 /// binding が無ければ全部 retry、DB に繋がらなければ検証を通ったものを retry (Queue の max_retries の後は dead letter queue)
 #[event(queue)]
 async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) -> Result<()> {
-    let (Ok(inbox), Ok(bucket), Ok(auth)) = (
-        env.bucket(LEAVE_INBOX_BINDING),
-        env.bucket(LEAVE_R2_BINDING),
-        env.service(AUTH_MCRED_BINDING),
-    ) else {
-        console_error!("leave: inbox bindings missing");
+    let Some((pdfs, inbox, verifier)) = inbox_bindings(&env) else {
         batch.retry_all();
         return Ok(());
     };
-    let pdfs = R2Pdfs::new(bucket);
-    let inbox = R2Inbox::new(inbox);
-    let verifier = AuthTicketVerifier::new(auth);
     let log = log_sink();
     let deps = leave::inbox::InboxDeps {
         pdfs: &pdfs,
