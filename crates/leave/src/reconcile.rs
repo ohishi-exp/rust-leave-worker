@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::ichiban::filter_employees;
 use crate::kinds::{label, normalize, DayKind, Normalized};
+use crate::pages::PageUpdate;
 
 /// 一番星の休暇の口 (`from` / `to` は両端を含み 92 日まで)
 pub const DAYS_PATH: &str = "/api/leave/days";
@@ -323,6 +324,47 @@ pub fn expand_periods(periods: &[LinkedPeriod], from: NaiveDate, to: NaiveDate) 
     }
     out.sort();
     out
+}
+
+/// 保存する期間で閉じてよい `ichiban_only` の鍵 (乗務員, 日, 区分) を 3 本の列で返す。毎朝の差 ([`diff`]) と同じく、
+/// 紐づけ済み (`linked`) で乗務員の在るページの期間を [`expand_periods`] で日に展開する (半日の am / pm は見ない)。
+/// それ以外のページは空。労災の延長 ([`rousai_extension`]) は含めない (毎朝の計算に任せる)
+pub fn linked_alert_keys(
+    page_id: Uuid,
+    u: &PageUpdate,
+) -> (Vec<String>, Vec<NaiveDate>, Vec<String>) {
+    let mut keys = (Vec::new(), Vec::new(), Vec::new());
+    let Some(emp) = u.employee_cd.as_ref().filter(|_| u.status == "linked") else {
+        return keys;
+    };
+    let periods: Vec<LinkedPeriod> = u
+        .periods
+        .iter()
+        .map(|p| LinkedPeriod {
+            employee_cd: emp.clone(),
+            page_id,
+            kind: p.kind.clone(),
+            start_date: p.start_date,
+            end_date: p.end_date,
+            half: p.half.clone(),
+        })
+        .collect();
+    let (Some(from), Some(to)) = (
+        periods.iter().map(|p| p.start_date).min(),
+        periods.iter().map(|p| p.end_date).max(),
+    ) else {
+        return keys;
+    };
+    let days: BTreeSet<(String, NaiveDate, String)> = expand_periods(&periods, from, to)
+        .into_iter()
+        .map(|p| (p.employee_cd, p.date, p.kind))
+        .collect();
+    for (e, d, k) in days {
+        keys.0.push(e);
+        keys.1.push(d);
+        keys.2.push(k);
+    }
+    keys
 }
 
 /// 労災の延長を数え始める日〜窓の終わり (祝日を取る範囲)。労災の期間が無い・数える日が無いなら `None`
@@ -763,6 +805,74 @@ mod tests {
         );
         let dates: Vec<String> = got.iter().map(|p| p.date.to_string()).collect();
         assert_eq!(dates, vec!["2026-10-01", "2026-10-02"]);
+    }
+
+    fn update(
+        status: &str,
+        emp: Option<&str>,
+        periods: &[(&str, &str, &str, Option<&str>)],
+    ) -> PageUpdate {
+        PageUpdate {
+            employee_cd: emp.map(Into::into),
+            status: status.into(),
+            note: None,
+            periods: periods
+                .iter()
+                .map(|(kind, from, to, half)| crate::pages::Period {
+                    kind: (*kind).into(),
+                    start_date: d(from),
+                    end_date: d(to),
+                    half: half.map(Into::into),
+                })
+                .collect(),
+            ichiban_row_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn linked_alert_keys_cover_every_day_of_the_periods() {
+        let u = update(
+            "linked",
+            Some("1380"),
+            &[
+                ("yukyu", "2026-10-01", "2026-10-03", None),
+                ("yukyu", "2026-10-02", "2026-10-02", None),
+                ("tokukyu", "2026-10-02", "2026-10-02", None),
+                ("yukyu", "2026-10-06", "2026-10-06", Some("pm")),
+            ],
+        );
+        let (e, days, k) = linked_alert_keys(Uuid::from_u128(7), &u);
+        let got: Vec<(String, String, String)> = e
+            .into_iter()
+            .zip(days)
+            .zip(k)
+            .map(|((e, d), k)| (e, d.to_string(), k))
+            .collect();
+        let want: Vec<(String, String, String)> = [
+            ("2026-10-01", "yukyu"),
+            ("2026-10-02", "tokukyu"),
+            ("2026-10-02", "yukyu"),
+            ("2026-10-03", "yukyu"),
+            ("2026-10-06", "yukyu"),
+        ]
+        .iter()
+        .map(|(d, k)| ("1380".to_owned(), (*d).to_owned(), (*k).to_owned()))
+        .collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn linked_alert_keys_are_empty_unless_linked_with_an_employee() {
+        let p = [("yukyu", "2026-10-03", "2026-10-03", Some("pm"))];
+        let empty = (Vec::new(), Vec::new(), Vec::new());
+        for u in [
+            update("unlinked", Some("1380"), &p),
+            update("ignored", Some("1380"), &p),
+            update("linked", None, &p),
+            update("linked", Some("1380"), &[]),
+        ] {
+            assert_eq!(linked_alert_keys(Uuid::from_u128(7), &u), empty);
+        }
     }
 
     fn ich<'a>(
