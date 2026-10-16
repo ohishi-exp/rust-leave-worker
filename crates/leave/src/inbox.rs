@@ -369,13 +369,15 @@ mod tests {
         h
     }
 
-    const TENANT: &str = "00000000-0000-4000-8000-000000000001";
-
     #[test]
     fn sweeps_only_the_list_for_leave_users() {
+        let tenant = Uuid::from_u128(1).to_string();
         let get = Method::GET;
-        let user = headers(&[("X-Tenant-ID", TENANT), ("X-User-Permissions", "leave.use")]);
-        let admin = headers(&[("X-Tenant-ID", TENANT), ("X-User-Role", "admin")]);
+        let user = headers(&[
+            ("X-Tenant-ID", tenant.as_str()),
+            ("X-User-Permissions", "leave.use"),
+        ]);
+        let admin = headers(&[("X-Tenant-ID", tenant.as_str()), ("X-User-Role", "admin")]);
         assert!(may_sweep(&get, SWEEP_PATH, &user));
         assert!(may_sweep(&get, SWEEP_PATH, &admin));
         // 別の method・別の path
@@ -388,19 +390,15 @@ mod tests {
             SWEEP_PATH,
             &headers(&[("X-User-Role", "admin")])
         ));
-        for bad in [
-            "x",
-            " 00000000-0000-4000-8000-000000000001",
-            "00000000-0000-4000-8000-000000000001 ",
-        ] {
-            let h = headers(&[("X-Tenant-ID", bad), ("X-User-Role", "admin")]);
+        for bad in ["x".to_owned(), format!(" {tenant}"), format!("{tenant} ")] {
+            let h = headers(&[("X-Tenant-ID", bad.as_str()), ("X-User-Role", "admin")]);
             assert!(!may_sweep(&get, SWEEP_PATH, &h));
         }
         let mut opaque = admin.clone();
         opaque.insert("X-Tenant-ID", HeaderValue::from_bytes(b"\xff").unwrap());
         assert!(!may_sweep(&get, SWEEP_PATH, &opaque));
         // leave.use も admin も無い
-        let viewer = headers(&[("X-Tenant-ID", TENANT), ("X-User-Role", "viewer")]);
+        let viewer = headers(&[("X-Tenant-ID", tenant.as_str()), ("X-User-Role", "viewer")]);
         assert!(!may_sweep(&get, SWEEP_PATH, &viewer));
     }
 
