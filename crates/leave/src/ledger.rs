@@ -227,6 +227,7 @@ pub fn candidate_window(page: &Page, periods: &[Period]) -> (NaiveDate, NaiveDat
 }
 
 /// ページの窓 ([`candidate_window`]) で、乗務員 `code` の一番星の行を取る (`codes` は `code` 1 つだけの集合)。
+/// 窓は保存済みの期間に `extra` (紐づけの保存で送られた期間) を足して広げる (候補の口は空)。
 /// ページが自 tenant に見えない・乗務員が自 tenant の部門から外れたら 404、一番星が無ければ 503、一番星の失敗は 502
 async fn page_window_rows<'a>(
     state: &LeaveState,
@@ -234,6 +235,7 @@ async fn page_window_rows<'a>(
     page_id: Uuid,
     code: &str,
     codes: &'a BTreeSet<String>,
+    extra: &[Period],
 ) -> Result<Vec<IchibanRow<'a>>, Response> {
     let got = pg::get_page(
         &mut *state.pg.lock().await,
@@ -246,7 +248,8 @@ async fn page_window_rows<'a>(
     let detail = got.ok_or_else(not_found)?;
     let api = ichiban_of(state)?;
     find_employee(state, &api, tenant_id, code).await?;
-    let (from, to) = candidate_window(&detail.page, &detail.periods);
+    let periods = [detail.periods.as_slice(), extra].concat();
+    let (from, to) = candidate_window(&detail.page, &periods);
     fetch_rows(state, &api, codes, from, to)
         .await
         .map_err(bad_gateway)
@@ -271,12 +274,12 @@ async fn candidates_inner(
     let id = parse_id(&id).ok_or_else(not_found)?;
     let code = employee_cd_of(raw)?.employee_cd.unwrap_or_default();
     let codes = BTreeSet::from([code.clone()]);
-    let rows = page_window_rows(&state, tenant_id, id, &code, &codes).await?;
+    let rows = page_window_rows(&state, tenant_id, id, &code, &codes, &[]).await?;
     Ok(Json(json!({ "periods": candidate_periods(&rows, &code) })).into_response())
 }
 
 /// 紐づけの更新で受け取った一番星の行 (`ichiban_row_ids`) を確かめ、保存する中身を返す。
-/// `status = linked` で行が在るときだけ、ページの窓で一番星を引き直す (全部が在り、本文の乗務員の行でなければ 400
+/// `status = linked` で行が在るときだけ、ページの窓 (送られた期間 `u.periods` でも広げる) で一番星を引き直す (全部が在り、本文の乗務員の行でなければ 400
 /// `unknown_row`)。それ以外は空で、一番星も部門も見ない
 pub(crate) async fn verified_link_rows(
     state: &LeaveState,
@@ -289,7 +292,7 @@ pub(crate) async fn verified_link_rows(
     }
     let code = u.employee_cd.clone().unwrap_or_default();
     let codes = BTreeSet::from([code.clone()]);
-    let rows = page_window_rows(state, tenant_id, page_id, &code, &codes).await?;
+    let rows = page_window_rows(state, tenant_id, page_id, &code, &codes, &u.periods).await?;
     pick_link_rows(&rows, &code, &u.ichiban_row_ids).ok_or_else(|| bad_request("unknown_row"))
 }
 

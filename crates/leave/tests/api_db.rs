@@ -4480,6 +4480,44 @@ async fn link_page_saves_ichiban_rows() {
 }
 
 #[tokio::test]
+async fn link_page_window_includes_the_sent_periods() {
+    let t = tenant().await;
+    let p = page(t, &format!("{t}/a.pdf"), 1, RECEIVED).await;
+    // 基準日を 2026-10-20 に動かすと窓は 10-13〜10-27 で、期間の日 (9-30) はその外
+    let mut f = link_ichiban("2026-09-30", "2026-10-27", &link_day_rows());
+    support::add_days(&mut f, "2026-10-13", "2026-10-27", &link_day_rows());
+    let a = link_app(t, f).await;
+    let got = put_base(&a, t, &p.to_string(), json!({"base_date": "2026-10-20"})).await;
+    assert_eq!(got.status, 200);
+    let uri = format!("/api/leave/pages/{p}");
+    let ids = json!(["20260930-1"]);
+
+    // 行の日付を含まない期間 (窓の中の別の日) を送ると、窓は広がらず今どおり unknown_row
+    let body = json!({"employee_cd": "1021", "status": "linked",
+        "periods": [{"kind": "yukyu", "start_date": "2026-10-14", "end_date": "2026-10-14"}],
+        "ichiban_row_ids": ids});
+    let got = call(&a, "PUT", &uri, Some(t), ADMIN, Some(body)).await;
+    assert_eq!(
+        (got.status, got.json()),
+        (400, json!({"error": "unknown_row"}))
+    );
+    assert!(support::link_rows_of(p).await.is_empty());
+
+    // 期間の日 (9-30〜10-01) を送ると窓が広がり、その日の行を紐づけられる
+    let got = call(
+        &a,
+        "PUT",
+        &uri,
+        Some(t),
+        ADMIN,
+        Some(link_body("1021", "yukyu", ids)),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(support::link_rows_of(p).await.len(), 1);
+}
+
+#[tokio::test]
 async fn link_page_rejects_unknown_rows_without_writing() {
     let t = tenant().await;
     let p = page(t, &format!("{t}/a.pdf"), 1, RECEIVED).await;
