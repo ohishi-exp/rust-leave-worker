@@ -4196,6 +4196,63 @@ async fn candidates_cover_saved_periods_outside_the_window() {
     );
 }
 
+/// `from`/`to` があれば、基準日の窓の外でもその期間で一番星の行を引く。読めない・片方・逆順・93 日は 400 `invalid_range`
+#[tokio::test]
+async fn candidates_search_the_given_range() {
+    let t = tenant().await;
+    let p = page(t, &format!("{t}/a.pdf"), 1, RECEIVED).await;
+    let rows = [support::day_row(
+        "1021",
+        "2026-08-05",
+        "有休",
+        Some("20260805-1"),
+        None,
+    )];
+    let a = link_app(t, link_ichiban("2026-08-01", "2026-08-10", &rows)).await;
+    let base = format!("/api/leave/pages/{p}/candidates?employee_cd=1021");
+    let got = call(
+        &a,
+        "GET",
+        &format!("{base}&from=2026-08-01&to=2026-08-10"),
+        Some(t),
+        ADMIN,
+        None,
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(
+        got.json(),
+        json!({"periods": [
+            {"kind": "yukyu", "start_date": "2026-08-05", "end_date": "2026-08-05", "half": null, "rows": [
+                {"row_id": "20260805-1", "day": "2026-08-05", "item_name": "有休"}
+            ]}
+        ]})
+    );
+    let window =
+        leave::reconcile::days_paths("2026-08-01".parse().unwrap(), "2026-08-10".parse().unwrap());
+    assert_eq!(
+        ichiban_calls(&a),
+        vec![EMPLOYEES_PATH.to_owned(), window[0].clone()]
+    );
+    let before = ichiban_calls(&a).len();
+    for q in [
+        "&from=2026-08-01",
+        "&to=2026-08-10",
+        "&from=x&to=2026-08-10",
+        "&from=2026-08-10&to=2026-08-01",
+        "&from=2026-10-01&to=2027-01-01",
+    ] {
+        let got = call(&a, "GET", &format!("{base}{q}"), Some(t), ADMIN, None).await;
+        assert_eq!(
+            (got.status, got.json()),
+            (400, json!({"error": "invalid_range"})),
+            "{q}"
+        );
+    }
+    // 弾いた要求は一番星を呼ばない
+    assert_eq!(ichiban_calls(&a).len(), before);
+}
+
 #[tokio::test]
 async fn candidates_reject_and_need_ichiban() {
     let (t, other) = (tenant().await, tenant().await);
