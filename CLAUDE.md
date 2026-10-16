@@ -20,6 +20,8 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
   例外は定時実行 (`#[event(scheduled)]`、本番だけ・`crates/leave/src/cron.rs`。tenant をまたぐのは
   `leave_enabled_tenants()` だけ)と、スキャンの inbox の Queue
   (`#[event(queue)]`、`crates/leave/src/inbox.rs`。tenant は auth-worker の `verifyTicket` の結果だけから取る)。
+  inbox は一覧の口 `GET /api/leave/documents` を開いたときにも拾う (`inbox::sweep`。leave.use 層を通る人だけ = `may_sweep`、
+  `src/lib.rs` の fetch で **`db::connect` より前**。新しい順に 10 件、Retry は inbox に残して次の回)。
 - 公開範囲を弱めない: 本番・staging とも Service Binding だけ (どの env も `workers_dev`/`preview_urls` = false、route 無し)。
 - DB の経路 (`src/db.rs`、上から見て最初にあるもの): staging は **DO の binding `STAGING_DB`** (別 Worker
   `alc-staging-db-staging` の `StagingDb` = PGlite。user は本番と同じ `alc_api_rt`) が最優先 → `LEAVE_DB_VPC` (docker の
@@ -32,6 +34,6 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
 - DB は `PgClient::tenant_tx` + `query_typed` 系だけ。SQL は `crates/leave/src/pg.rs` の 1 か所。
   名前付き prepared statement 禁止。WHERE に tenant_id も明示する。
 - 応答・ログには固定の語だけ (識別子・入力値・生のエラー文を出さない)。
-- `coverage_100.toml` の登録を外さない。CI の本数 (lib 92・api_db 85・cron_db 17) はテストを足したら上げる。
+- `coverage_100.toml` の登録を外さない。CI の本数 (lib 93・api_db 89・cron_db 17) はテストを足したら上げる。
 - public repo: ホスト名・tenant UUID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (alc-vein-worker と同じ rev)。

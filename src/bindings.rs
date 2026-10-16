@@ -11,7 +11,7 @@ use futures_util::future::BoxFuture;
 use leave::cron::{send_body, Notifier, NotifyError, NotifyTarget, LINEWORKS_SEND_URL};
 use leave::holidays::{holidays_url, HolidaysApi, HolidaysError, HolidaysResponse};
 use leave::ichiban::{IchibanApi, IchibanError, IchibanResponse};
-use leave::inbox::{Inbox, InboxObject, TicketVerifier, VerifyError};
+use leave::inbox::{Inbox, InboxListed, InboxObject, TicketVerifier, VerifyError};
 use leave::store::{PdfStore, StoreError};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -173,6 +173,30 @@ impl R2Inbox {
 }
 
 impl Inbox for R2Inbox {
+    fn list(&self, limit: u32) -> BoxFuture<'_, Result<Vec<InboxListed>, StoreError>> {
+        Box::pin(SendFuture::new(async move {
+            let objects = self
+                .0
+                .list()
+                .limit(limit)
+                .execute()
+                .await
+                .map_err(|_| StoreError("list"))?;
+            Ok(objects
+                .objects()
+                .into_iter()
+                .map(|o| InboxListed {
+                    key: o.key(),
+                    size: o.size(),
+                    uploaded: chrono::DateTime::from_timestamp_millis(
+                        o.uploaded().as_millis() as i64
+                    )
+                    .unwrap_or_default(),
+                })
+                .collect())
+        }))
+    }
+
     fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<InboxObject>, StoreError>> {
         Box::pin(SendFuture::new(async move {
             let object = self.0.get(key).execute().await;

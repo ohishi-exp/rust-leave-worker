@@ -26,7 +26,7 @@ use futures_util::lock::Mutex;
 use leave::cron::{Notifier, NotifyError, NotifyTarget};
 use leave::holidays::{HolidaysApi, HolidaysError, HolidaysResponse};
 use leave::ichiban::{IchibanApi, IchibanError, IchibanResponse};
-use leave::inbox::{Inbox, InboxObject, TicketVerifier, VerifyError};
+use leave::inbox::{Inbox, InboxListed, InboxObject, TicketVerifier, VerifyError};
 use leave::reconcile::days_paths;
 use leave::store::{PdfStore, StoreError};
 use leave::{tenant_router, visible_minutes, LeaveState};
@@ -308,13 +308,18 @@ impl PdfStore for FakePdfs {
 /// inbox の object (中身, チケット)
 pub type InboxEntry = (Vec<u8>, Option<String>);
 
-/// 偽のスキャンの inbox (key → (中身, チケット))。`fail_get` / `fail_delete` なら失敗する
+/// 偽のスキャンの inbox (key → (中身, チケット))。`fail_get` / `fail_delete` / `fail_list` なら失敗する。
+/// list の大きさは中身の長さ、置かれた時刻は `uploaded` (無ければ UNIX 時刻の 0)。list は key の辞書順に `limit` 件まで
 #[derive(Default)]
 pub struct FakeInbox {
     pub objects: StdMutex<HashMap<String, InboxEntry>>,
+    pub uploaded: StdMutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
     pub deleted: StdMutex<Vec<String>>,
+    /// list に渡された件数
+    pub list_limits: StdMutex<Vec<u32>>,
     pub fail_get: bool,
     pub fail_delete: bool,
+    pub fail_list: bool,
 }
 
 impl FakeInbox {
@@ -330,6 +335,28 @@ impl FakeInbox {
 }
 
 impl Inbox for FakeInbox {
+    fn list(&self, limit: u32) -> BoxFuture<'_, Result<Vec<InboxListed>, StoreError>> {
+        Box::pin(async move {
+            self.list_limits.lock().unwrap().push(limit);
+            if self.fail_list {
+                return Err(StoreError("list"));
+            }
+            let objects = self.objects.lock().unwrap();
+            let uploaded = self.uploaded.lock().unwrap();
+            let mut keys: Vec<&String> = objects.keys().collect();
+            keys.sort();
+            Ok(keys
+                .into_iter()
+                .take(limit as usize)
+                .map(|k| InboxListed {
+                    key: k.clone(),
+                    size: objects[k].0.len() as u64,
+                    uploaded: uploaded.get(k).copied().unwrap_or_default(),
+                })
+                .collect())
+        })
+    }
+
     fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<InboxObject>, StoreError>> {
         Box::pin(async move {
             if self.fail_get {
