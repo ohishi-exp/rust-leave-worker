@@ -33,6 +33,7 @@
 //! 応答の本文のエラーは固定の語だけ (`{"error":"..."}`)。ログ ([`LogSink`]) に出すのも段の名前と kind だけで、
 //! 識別子・入力の値・エラーの生の文を出さない。
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use alc_core_wasm::TenantId;
@@ -62,6 +63,7 @@ use crate::pages::{
     PageUpdateInput,
 };
 use crate::pg::{self, PutSettings};
+use crate::reconcile::messages;
 use crate::settings::{validate, Settings, SettingsInput};
 use crate::store::PdfStore;
 
@@ -103,6 +105,8 @@ pub(crate) fn visible_since(state: &LeaveState) -> Option<DateTime<Utc>> {
 
 /// テスト送信の口の path (worker が、この口へのリクエストでだけ送信の口を組み立てるのに使う)
 pub const TEST_NOTIFY_PATH: &str = "/api/leave/settings/test-notify";
+/// 未解消の漏れを今すぐ送る口の path (テスト送信の口と同じく、worker はこの口でだけ送信の口を組み立てる)
+pub const ALERTS_NOTIFY_PATH: &str = "/api/leave/alerts/notify";
 
 /// テスト送信の文面 (固定)
 pub const TEST_NOTIFY_TEXT: &str =
@@ -143,6 +147,7 @@ fn admin_router() -> Router<LeaveState> {
     Router::new()
         .route("/leave/settings", get(get_settings).put(put_settings))
         .route("/leave/settings/test-notify", post(test_notify))
+        .route("/leave/alerts/notify", post(notify_alerts))
         .route("/leave/grants", post(ledger::create_grant))
         .route("/leave/grants/auto", post(ledger::auto_grants))
         .route("/leave/opening", put(ledger::put_openings))
@@ -208,6 +213,62 @@ async fn test_notify(
             (state.log)(&format!("test_notify: send {}", e.0));
             error(StatusCode::BAD_GATEWAY, "notify_failed")
         }
+    }
+}
+
+/// 未解消の漏れ (一覧の口と同じ窓・同じ SQL) を、今すぐ保存済みの通知先へ送る。文面は毎朝の通知と同じ
+/// ([`messages`]、毎朝と同じく通知済みかを問わず全部)。送れた通の漏れに通知の時刻を付ける。
+/// 漏れが無ければ送らず `{sent_messages: 0, notified: 0}`。氏名は一番星から (取れなければコードだけで送る)。
+/// 1 通も送れなければ 502 `notify_failed`。応答・ログは固定の語だけ
+async fn notify_alerts(
+    State(state): State<LeaveState>,
+    Extension(t): Extension<TenantId>,
+) -> Response {
+    let range = window(ledger::jst_date((state.now)()));
+    let got = pg::notify_material(&mut *state.pg.lock().await, t.0, range).await;
+    let (target, alerts) = match got {
+        Ok(m) => m,
+        Err(e) => return db_error(&state, "notify_alerts", &e),
+    };
+    let Some(target) = target else {
+        return bad_request("no_notify_target");
+    };
+    if !state.notifier.available() {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "notify_unavailable");
+    }
+    if alerts.is_empty() {
+        return Json(json!({ "sent_messages": 0, "notified": 0 })).into_response();
+    }
+    let names: BTreeMap<String, String> = match &state.ichiban {
+        Some(api) => ledger::tenant_employees(&state, api, t.0)
+            .await
+            .map(|es| {
+                es.into_iter()
+                    .filter_map(|e| Some((e.employee_code, e.employee_name?)))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        None => BTreeMap::new(),
+    };
+    let mut sent_messages = 0;
+    let mut sent = Vec::new();
+    for m in messages(&alerts, &names, 0) {
+        match state.notifier.send(target.clone(), &m.text).await {
+            Ok(()) => {
+                sent_messages += 1;
+                sent.extend(m.alerts.iter().map(|&i| alerts[i].id));
+            }
+            Err(e) => (state.log)(&format!("notify_alerts: send {}", e.0)),
+        }
+    }
+    if sent.is_empty() {
+        return error(StatusCode::BAD_GATEWAY, "notify_failed");
+    }
+    match pg::mark_notified(&mut *state.pg.lock().await, t.0, sent).await {
+        Ok(notified) => {
+            Json(json!({ "sent_messages": sent_messages, "notified": notified })).into_response()
+        }
+        Err(e) => db_error(&state, "notify_alerts", &e),
     }
 }
 

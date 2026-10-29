@@ -748,8 +748,51 @@ async fn rousai_continuing_after_the_page_is_not_a_leak() {
             false
         )]
     );
-    // 祝日は窓のうち延長を数える年だけ取る
-    assert_eq!(*h.calls.lock().unwrap(), vec![2026]);
+    // 祝日は、今日が休みか (通知を送るか) で 1 回、窓のうち延長を数える年で 1 回取る
+    assert_eq!(*h.calls.lock().unwrap(), vec![2026, 2026]);
+}
+
+/// 日曜・祝日の朝は突き合わせ (漏れの記録) だけして、通知は送らない。平日の朝 (翌営業日) にまとめて送る
+#[tokio::test]
+async fn sunday_and_holiday_mornings_do_not_notify() {
+    let _g = serial().await;
+    let (t, ch) = enabled_tenant("10", true).await;
+    let n = FakeNotifier::default();
+    // 10/11 (日)・10/12 (スポーツの日) は送らない。10/13 (火) は送る
+    for (today, quiet) in [
+        ("2026-10-11", true),
+        ("2026-10-12", true),
+        ("2026-10-13", false),
+    ] {
+        let today: NaiveDate = today.parse().unwrap();
+        let (from, to) = leave::cron::window(today);
+        let mut f = ichiban_with(&[(
+            EMPLOYEES_PATH,
+            200,
+            json!({"data": [employee("1021", "山田太郎", "10", None)]}),
+        )]);
+        add_days(
+            &mut f,
+            &from.to_string(),
+            &to.to_string(),
+            &[day("1021", "2026-10-01", "有休")],
+        );
+        let s = run(
+            &mut app_client().await,
+            &f,
+            &FakeHolidays::japan_2026(),
+            &n,
+            today,
+        )
+        .await;
+        assert_eq!(s.quiet, quiet, "{today}");
+        assert_eq!(s.line().contains("quiet_day"), quiet, "{today}");
+        assert_eq!(s.tenants[0].mismatches, 1, "{today}");
+    }
+    let sent = n.sent.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].0, channel_target(t, ch.unwrap()).await);
+    assert!(sent[0].1.contains("1021 山田太郎: 10/01 有休 — 申請書なし"));
 }
 
 /// 祝日が取れなければ日曜だけ飛ばす (祝日で止まり、その後は漏れになる)。ログに固定語

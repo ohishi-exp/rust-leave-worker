@@ -31,7 +31,7 @@ use axum::{middleware, Router};
 use chrono::{DateTime, Utc};
 use futures_util::lock::Mutex;
 use leave::cron::Notifier;
-use leave::{tenant_router, Clock, LeaveState, LogSink, TEST_NOTIFY_PATH};
+use leave::{tenant_router, Clock, LeaveState, LogSink, ALERTS_NOTIFY_PATH, TEST_NOTIFY_PATH};
 use tower_service::Service;
 use worker::{
     console_error, console_log, event, Context, Date, Env, HttpRequest, Result, ScheduleContext,
@@ -159,12 +159,13 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
         .service(ICHIBAN_DB_BINDING)
         .ok()
         .map(|f| Arc::new(IchibanBinding::new(f)) as Arc<dyn leave::ichiban::IchibanApi>);
-    // 送信の口 (secret の取得を伴う) はテスト送信の口へのリクエストでだけ組む。ほかの口は使わない
-    let notifier: Arc<dyn Notifier> = if req.uri().path() == TEST_NOTIFY_PATH {
-        Arc::from(notifier(&env).await)
-    } else {
-        Arc::new(NoNotifier)
-    };
+    // 送信の口 (secret の取得を伴う) はテスト送信と漏れを今送る口へのリクエストでだけ組む。ほかの口は使わない
+    let notifier: Arc<dyn Notifier> =
+        if [TEST_NOTIFY_PATH, ALERTS_NOTIFY_PATH].contains(&req.uri().path()) {
+            Arc::from(notifier(&env).await)
+        } else {
+            Arc::new(NoNotifier)
+        };
     let pg = Arc::new(Mutex::new(pg));
     let pdfs = Arc::new(R2Pdfs::new(bucket));
     let state = LeaveState {
