@@ -32,5 +32,6 @@ pub mod settings;
 pub mod store;
 
 pub use routes::{
-    tenant_router, visible_minutes, Clock, LeaveState, LogSink, TEST_NOTIFY_PATH, TEST_NOTIFY_TEXT,
+    tenant_router, visible_minutes, Clock, LeaveState, LogSink, ALERTS_NOTIFY_PATH,
+    TEST_NOTIFY_PATH, TEST_NOTIFY_TEXT,
 };

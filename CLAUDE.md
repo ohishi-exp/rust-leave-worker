@@ -18,7 +18,8 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
 - 管理 API の口は `/api/leave/…` だけ。**2 層**: leave.use 層 (管理者か `leave.use`・`*`。参照・紐づけ・取り込み。403 は `forbidden`) と
   admin 層 (管理者か `*`。設定・通知テスト・有給と期首残の書き込み。403 は `admin_only`)。判定は `auth.rs`、割り当ては `routes.rs`。**新しい口は既定で admin 層**。403 のテストも足す。
   例外は定時実行 (`#[event(scheduled)]`、本番だけ・`crates/leave/src/cron.rs`。tenant をまたぐのは
-  `leave_enabled_tenants()` だけ)。
+  `leave_enabled_tenants()` だけ。日曜・祝日の朝は突き合わせだけして通知は送らない = 平日の朝にまとめて届く)。
+  未解消の漏れを今すぐ送る口 `POST /api/leave/alerts/notify` は admin 層 (文面は毎朝と同じ。送れた漏れに通知の時刻を付ける)。
   スキャンの inbox は一覧の口 `GET /api/leave/documents` を開いたときに拾う (`inbox::sweep`、`crates/leave/src/inbox.rs`。
   leave.use 層を通る人だけ = `may_sweep`、`src/lib.rs` の fetch で **`db::connect` より前**。新しい順に 10 件、Retry は inbox に残して次の回。
   tenant は auth-worker の `verifyTicket` の結果だけから取る)。
@@ -34,6 +35,6 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
 - DB は `PgClient::tenant_tx` + `query_typed` 系だけ。SQL は `crates/leave/src/pg.rs` の 1 か所。
   名前付き prepared statement 禁止。WHERE に tenant_id も明示する。
 - 応答・ログには固定の語だけ (識別子・入力値・生のエラー文を出さない)。
-- `coverage_100.toml` の登録を外さない。CI の本数 (lib 93・api_db 89・cron_db 17) はテストを足したら上げる。
+- `coverage_100.toml` の登録を外さない。CI の本数 (lib 96・api_db 97・cron_db 18) はテストを足したら上げる。
 - public repo: ホスト名・tenant UUID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (alc-vein-worker と同じ rev)。

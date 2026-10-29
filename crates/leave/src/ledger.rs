@@ -119,7 +119,7 @@ fn ichiban_of(state: &LeaveState) -> Result<Arc<dyn IchibanApi>, Response> {
 }
 
 /// 自 tenant の部門に入る一番星の乗務員 (部門を選んでいない tenant は空で、一番星も呼ばない)
-async fn tenant_employees(
+pub(crate) async fn tenant_employees(
     state: &LeaveState,
     api: &Arc<dyn IchibanApi>,
     tenant_id: Uuid,

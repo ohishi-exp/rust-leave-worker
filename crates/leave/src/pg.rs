@@ -583,31 +583,36 @@ pub async fn notify_target(
     tenant_id: Uuid,
 ) -> Result<Option<NotifyTarget>, Error> {
     pg.tenant_tx(tenant_id, move |tx| {
-        Box::pin(async move {
-            let row = tx
-                .query_typed_opt(sql::NOTIFY_TARGET, &[(&tenant_id, Type::UUID)])
-                .await?;
-            Ok(row.and_then(|r| {
-                if r.get::<_, Option<Uuid>>(0).is_some() {
-                    let channel_id = r.get::<_, Option<String>>(4)?;
-                    let bot = r.get::<_, Option<Uuid>>(5)?;
-                    return Some(NotifyTarget::Channel {
-                        tenant: tenant_id,
-                        channel_id,
-                        bot,
-                    });
-                }
-                let id = r.get::<_, Option<Uuid>>(1)?;
-                let configured = r.get::<_, Option<Uuid>>(2).is_some();
-                let bot = r.get::<_, Option<Uuid>>(3);
-                if configured && bot.is_none() {
-                    return None;
-                }
-                Some(NotifyTarget::Recipient { id, bot })
-            }))
-        })
+        Box::pin(async move { notify_target_in(tx, tenant_id).await })
     })
     .await
+}
+
+async fn notify_target_in(
+    tx: &TenantTx<'_>,
+    tenant_id: Uuid,
+) -> Result<Option<NotifyTarget>, Error> {
+    let row = tx
+        .query_typed_opt(sql::NOTIFY_TARGET, &[(&tenant_id, Type::UUID)])
+        .await?;
+    Ok(row.and_then(|r| {
+        if r.get::<_, Option<Uuid>>(0).is_some() {
+            let channel_id = r.get::<_, Option<String>>(4)?;
+            let bot = r.get::<_, Option<Uuid>>(5)?;
+            return Some(NotifyTarget::Channel {
+                tenant: tenant_id,
+                channel_id,
+                bot,
+            });
+        }
+        let id = r.get::<_, Option<Uuid>>(1)?;
+        let configured = r.get::<_, Option<Uuid>>(2).is_some();
+        let bot = r.get::<_, Option<Uuid>>(3);
+        if configured && bot.is_none() {
+            return None;
+        }
+        Some(NotifyTarget::Recipient { id, bot })
+    }))
 }
 
 /// 未解消の警告の行 ([`sql::ALERTS_OPEN`]。通知と一覧の共用)
@@ -625,6 +630,33 @@ async fn open_alert_rows(
             (&to, Type::DATE),
         ],
     )
+    .await
+}
+
+fn pending_alert(r: &Row) -> PendingAlert {
+    PendingAlert {
+        id: r.get(0),
+        employee_cd: r.get(1),
+        day: r.get(2),
+        kind: r.get(3),
+        direction: r.get(4),
+    }
+}
+
+/// 漏れを今すぐ送る口の材料を 1 つの transaction で: 宛先 ([`notify_target`] と同じ) と、未解消の警告
+/// (毎朝の [`record_alerts`] の戻り値と同じ行)
+pub async fn notify_material(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    (from, to): (NaiveDate, NaiveDate),
+) -> Result<(Option<NotifyTarget>, Vec<PendingAlert>), Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let target = notify_target_in(tx, tenant_id).await?;
+            let rows = open_alert_rows(tx, tenant_id, from, to).await?;
+            Ok((target, rows.iter().map(pending_alert).collect()))
+        })
+    })
     .await
 }
 
@@ -695,16 +727,7 @@ pub async fn record_alerts(
                 )
                 .await?;
             let rows = open_alert_rows(tx, tenant_id, from, to).await?;
-            let pending = rows
-                .iter()
-                .map(|r| PendingAlert {
-                    id: r.get(0),
-                    employee_cd: r.get(1),
-                    day: r.get(2),
-                    kind: r.get(3),
-                    direction: r.get(4),
-                })
-                .collect();
+            let pending = rows.iter().map(pending_alert).collect();
             Ok((inserted, resolved, pending))
         })
     })

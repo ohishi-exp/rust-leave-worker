@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use alc_worker_db::PgClient;
-use chrono::{Duration, NaiveDate};
+use chrono::{Datelike, Duration, NaiveDate, Weekday};
 use futures_util::future::BoxFuture;
 use uuid::Uuid;
 
@@ -141,6 +141,8 @@ pub struct Summary {
     pub unknown: BTreeMap<String, usize>,
     /// tenant に入る前に止まった段 (一覧・一番星)
     pub failed: Option<String>,
+    /// 日曜・祝日の朝 (突き合わせはしたが通知は送っていない)
+    pub quiet: bool,
 }
 
 impl Summary {
@@ -177,11 +179,12 @@ impl Summary {
             .map(|(w, n)| format!("{w:?}x{n}"))
             .collect();
         format!(
-            "cron: tenants={} [{}] unknown_items={} [{}]{}",
+            "cron: tenants={} [{}] unknown_items={} [{}]{}{}",
             self.tenants.len(),
             tenants.join("; "),
             self.unknown.values().sum::<usize>(),
             unknown.join(", "),
+            if self.quiet { " quiet_day" } else { "" },
             self.failed
                 .as_ref()
                 .map(|f| format!(" failed={f}"))
@@ -236,6 +239,7 @@ pub async fn run(
         return summary;
     }
     let (from, to) = window(today);
+    summary.quiet = quiet_day(holidays, today).await;
     let (employees_body, day_bodies) = match fetch_ichiban(ichiban, from, to).await {
         Ok(b) => b,
         Err(stage) => {
@@ -253,6 +257,7 @@ pub async fn run(
             &employees_body,
             &day_bodies,
             (from, to, today),
+            summary.quiet,
             &mut result,
             &mut summary.unknown,
         )
@@ -265,6 +270,15 @@ pub async fn run(
     summary
 }
 
+/// 通知を送らない朝 (日曜か祝日)。祝日が取れなければ日曜だけを休みにする (送らないより送る方へ倒す)
+async fn quiet_day(holidays: &dyn HolidaysApi, today: NaiveDate) -> bool {
+    today.weekday() == Weekday::Sun
+        || holidays::load(holidays, today, today)
+            .await
+            .0
+            .contains(&today)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_tenant(
     pg: &mut PgClient,
@@ -274,6 +288,7 @@ async fn run_tenant(
     employees_body: &[u8],
     day_bodies: &[Vec<u8>],
     (from, to, today): (NaiveDate, NaiveDate, NaiveDate),
+    quiet: bool,
     result: &mut TenantResult,
     unknown: &mut BTreeMap<String, usize>,
 ) -> Result<(), String> {
@@ -329,9 +344,14 @@ async fn run_tenant(
     result.upserted = upserted;
     result.resolved = resolved;
     result.pending = pending.len();
-    let target = pg::notify_target(pg, t.tenant_id)
-        .await
-        .map_err(|e| db_stage("notify_target", &e))?;
+    // 日曜・祝日の朝は送らない (毎朝、未解消を全部送るので、次の平日の朝にまとめて届く)
+    let target = if quiet {
+        None
+    } else {
+        pg::notify_target(pg, t.tenant_id)
+            .await
+            .map_err(|e| db_stage("notify_target", &e))?
+    };
     if let Some(target) = target {
         let names: BTreeMap<String, String> = employees
             .iter()
@@ -391,6 +411,7 @@ mod tests {
             ],
             unknown: BTreeMap::from([("謎".to_owned(), 2)]),
             failed: None,
+            quiet: false,
         };
         assert_eq!(s.line(), "cron: tenants=2 [#1 unlinked=1 mismatches=2 upserted=2 resolved=0 pending=2 sent=1 notified=2 grants=3; #2 failed=record_alerts:08006] unknown_items=2 [\"謎\"x2]");
         let f = Summary {
@@ -401,6 +422,11 @@ mod tests {
             f.line(),
             "cron: tenants=0 [] unknown_items=0 [] failed=ichiban_unavailable"
         );
+        let q = Summary {
+            quiet: true,
+            ..Default::default()
+        };
+        assert_eq!(q.line(), "cron: tenants=0 [] unknown_items=0 [] quiet_day");
     }
 
     #[test]

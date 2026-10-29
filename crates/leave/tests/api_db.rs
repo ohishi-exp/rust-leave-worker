@@ -210,6 +210,18 @@ mod forbidden {
         assert_layer("GET", "/api/leave/alerts", CallBody::Empty, Layer::LeaveUse).await;
     }
 
+    /// 漏れを今送る口は管理者だけ (送信はテスト送信と同じ層)
+    #[tokio::test]
+    async fn notify_alerts() {
+        assert_layer(
+            "POST",
+            "/api/leave/alerts/notify",
+            CallBody::Empty,
+            Layer::Admin,
+        )
+        .await;
+    }
+
     /// PDF の取り込み。通らない人では置き場にも DB にも届かない
     #[tokio::test]
     async fn uploads() {
@@ -1606,6 +1618,7 @@ async fn db_errors_are_500() {
         ("GET", "/api/leave/settings".to_owned(), None),
         ("PUT", "/api/leave/settings".to_owned(), Some(json!({}))),
         ("POST", "/api/leave/settings/test-notify".to_owned(), None),
+        ("POST", "/api/leave/alerts/notify".to_owned(), None),
         ("GET", "/api/leave/alerts".to_owned(), None),
         ("GET", "/api/leave/employees".to_owned(), None),
         ("GET", "/api/leave/pages".to_owned(), None),
@@ -1629,7 +1642,7 @@ async fn db_errors_are_500() {
         assert_eq!(got.json(), json!({"error": "internal_error"}));
     }
     let logs = a.logs.lock().unwrap();
-    assert_eq!(logs.len(), 12);
+    assert_eq!(logs.len(), 13);
     for line in logs.iter() {
         assert!(
             !line.contains(&t.to_string()) && !line.contains(&p.to_string()),
@@ -4661,4 +4674,217 @@ async fn link_page_rejects_unknown_rows_without_writing() {
         page_before
     );
     assert_eq!(support::link_rows_of(p).await, rows_before);
+}
+
+async fn notify_alerts(a: &App, t: Uuid) -> support::Got {
+    call(a, "POST", "/api/leave/alerts/notify", Some(t), ADMIN, None).await
+}
+
+async fn notified_days(t: Uuid) -> Vec<String> {
+    support::admin()
+        .await
+        .query(
+            "SELECT day::text FROM alc_api.leave_alerts WHERE tenant_id = $1 AND notified_at IS NOT NULL ORDER BY day",
+            &[&t],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect()
+}
+
+/// 未解消の漏れ (一覧と同じ窓) を今すぐ毎朝と同じ文面で送り、送れた漏れに通知の時刻を付ける。
+/// 解決済み・窓の外は送らない。氏名は一番星から (自 tenant の部門の人だけ。外れた人はコードだけ)
+#[tokio::test]
+async fn notify_alerts_sends_open_alerts_now() {
+    let t = tenant().await;
+    let r = notify_recipient(t, "lineworks", true).await;
+    let n = Arc::new(FakeNotifier::default());
+    let a = support::app_with_notifier_and_ichiban(
+        n.clone(),
+        ichiban_with(&[(EMPLOYEES_PATH, 200, employees_body())]),
+    )
+    .await;
+    put_settings(
+        &a,
+        t,
+        json!({"notify_recipient_id": r, "dept_codes": ["10"]}),
+    )
+    .await;
+    alert_row(
+        t,
+        "1021",
+        "2026-10-03",
+        ("yukyu", "ichiban_only"),
+        None,
+        false,
+    )
+    .await;
+    alert_row(
+        t,
+        "1022",
+        "2026-10-05",
+        ("rousai", "pdf_only"),
+        Some("2026-10-06T23:00:00Z"),
+        false,
+    )
+    .await;
+    alert_row(
+        t,
+        "1021",
+        "2026-10-04",
+        ("yukyu", "ichiban_only"),
+        None,
+        true,
+    )
+    .await;
+    alert_row(
+        t,
+        "1021",
+        "2026-07-20",
+        ("yukyu", "ichiban_only"),
+        None,
+        false,
+    )
+    .await;
+
+    let got = notify_alerts(&a, t).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json(), json!({"sent_messages": 1, "notified": 2}));
+    assert_eq!(
+        *n.sent.lock().unwrap(),
+        vec![(
+            NotifyTarget::Recipient { id: r, bot: None },
+            "【勤怠申請】一番星と申請書のずれ 2 件\n1021 甲: 10/03 有休 — 申請書なし\n1022: 10/05 労災 — 一番星に入力なし"
+                .to_owned()
+        )]
+    );
+    assert_eq!(notified_days(t).await, vec!["2026-10-03", "2026-10-05"]);
+    assert!(a.logs.lock().unwrap().is_empty());
+}
+
+/// 漏れが無ければ送らず 0 件。一番星が無い環境では氏名なし (コードだけ) で送る
+#[tokio::test]
+async fn notify_alerts_without_alerts_or_ichiban() {
+    let t = tenant().await;
+    let r = notify_recipient(t, "lineworks", true).await;
+    let n = Arc::new(FakeNotifier::default());
+    let a = app_with_notifier(n.clone()).await;
+    put_settings(&a, t, json!({"notify_recipient_id": r})).await;
+    let got = notify_alerts(&a, t).await;
+    assert_eq!(
+        (got.status, got.json()),
+        (200, json!({"sent_messages": 0, "notified": 0}))
+    );
+    assert_eq!(*n.calls.lock().unwrap(), 0);
+
+    alert_row(
+        t,
+        "1021",
+        "2026-10-03",
+        ("yukyu", "ichiban_only"),
+        None,
+        false,
+    )
+    .await;
+    let got = notify_alerts(&a, t).await;
+    assert_eq!(
+        (got.status, got.json()),
+        (200, json!({"sent_messages": 1, "notified": 1}))
+    );
+    assert_eq!(
+        n.sent.lock().unwrap()[0].1,
+        "【勤怠申請】一番星と申請書のずれ 1 件\n1021: 10/03 有休 — 申請書なし"
+    );
+}
+
+/// 宛先が無ければ 400、送れない環境は 503、1 通も送れなければ 502 で通知の時刻を付けない (どれも固定の語)
+#[tokio::test]
+async fn notify_alerts_failures() {
+    let t = tenant().await;
+    alert_row(
+        t,
+        "1021",
+        "2026-10-03",
+        ("yukyu", "ichiban_only"),
+        None,
+        false,
+    )
+    .await;
+    let n = Arc::new(FakeNotifier {
+        fail_calls: vec![0],
+        ..Default::default()
+    });
+    let a = app_with_notifier(n.clone()).await;
+    let got = notify_alerts(&a, t).await;
+    assert_eq!(
+        (got.status, got.json()),
+        (400, json!({"error": "no_notify_target"}))
+    );
+
+    let r = notify_recipient(t, "lineworks", true).await;
+    put_settings(&a, t, json!({"notify_recipient_id": r})).await;
+    let got = notify_alerts(&a, t).await;
+    assert_eq!(
+        (got.status, got.json()),
+        (502, json!({"error": "notify_failed"}))
+    );
+    assert!(notified_days(t).await.is_empty());
+    assert_eq!(
+        *a.logs.lock().unwrap(),
+        vec!["notify_alerts: send status".to_owned()]
+    );
+
+    let a = app_with_notifier(Arc::new(UnavailableNotifier)).await;
+    let got = notify_alerts(&a, t).await;
+    assert_eq!(
+        (got.status, got.json()),
+        (503, json!({"error": "notify_unavailable"}))
+    );
+}
+
+/// 送れたあと通知の時刻を付ける段で DB が失敗したら 500 (送った事実は変わらない)。失敗は、決めた乗務員コードの行の
+/// UPDATE でだけ例外を投げる trigger で起こす
+#[tokio::test]
+async fn notify_alerts_mark_failure_is_500() {
+    let t = tenant().await;
+    let r = notify_recipient(t, "lineworks", true).await;
+    let n = Arc::new(FakeNotifier::default());
+    let a = app_with_notifier(n.clone()).await;
+    put_settings(&a, t, json!({"notify_recipient_id": r})).await;
+    alert_row(
+        t,
+        "notify-fail",
+        "2026-10-03",
+        ("yukyu", "ichiban_only"),
+        None,
+        false,
+    )
+    .await;
+    support::admin()
+        .await
+        .batch_execute(
+            "CREATE OR REPLACE FUNCTION alc_api.leave_test_fail_notified() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN IF NEW.employee_cd = 'notify-fail' THEN RAISE EXCEPTION 'leave test'; END IF; RETURN NEW; END $$; \
+             DROP TRIGGER IF EXISTS leave_test_fail_notified ON alc_api.leave_alerts; \
+             CREATE TRIGGER leave_test_fail_notified BEFORE UPDATE ON alc_api.leave_alerts \
+             FOR EACH ROW EXECUTE FUNCTION alc_api.leave_test_fail_notified();",
+        )
+        .await
+        .unwrap();
+    let got = notify_alerts(&a, t).await;
+    support::admin()
+        .await
+        .batch_execute("DROP TRIGGER leave_test_fail_notified ON alc_api.leave_alerts")
+        .await
+        .unwrap();
+    assert_eq!(
+        (got.status, got.json()),
+        (500, json!({"error": "internal_error"}))
+    );
+    assert_eq!(n.sent.lock().unwrap().len(), 1);
+    let logs = a.logs.lock().unwrap();
+    assert_eq!(logs.len(), 1);
+    assert!(logs[0].starts_with("notify_alerts: "), "{logs:?}");
 }

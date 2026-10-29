@@ -639,6 +639,20 @@ pub async fn app_with_notifier(notifier: Arc<dyn Notifier>) -> App {
     )
 }
 
+/// 送信の口と偽の一番星を差して組み立てる (漏れを今送る口の氏名)
+pub async fn app_with_notifier_and_ichiban(
+    notifier: Arc<dyn Notifier>,
+    ichiban: FakeIchiban,
+) -> App {
+    build(
+        app_client().await,
+        FakePdfs::default(),
+        Some(ichiban),
+        notifier,
+        None,
+    )
+}
+
 /// 接続が切れた DB (backend を落とした接続) で組み立てる (DB のエラーの経路を通すため)
 pub async fn app_with_broken_db(ichiban: Option<FakeIchiban>) -> App {
     build(
