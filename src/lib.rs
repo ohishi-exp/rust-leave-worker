@@ -51,6 +51,8 @@ const ICHIBAN_DB_BINDING: &str = "ICHIBAN_DB";
 const NOTIFY_SECRET_BINDING: &str = "INTERNAL_SHARED_SECRET";
 /// auth-worker の Service Binding (本番だけ)。LINE WORKS への送信 (定時実行の通知) に使う
 const AUTH_WORKER_BINDING: &str = "AUTH_WORKER";
+/// alc-lineworks の Service Binding (本番だけ)。トークルーム宛の送信を tenant 付きの `/messages` へ
+const ALC_LINEWORKS_BINDING: &str = "ALC_LINEWORKS";
 /// スキャンの inbox の R2 (本番と staging で別の bucket)
 const LEAVE_INBOX_BINDING: &str = "LEAVE_INBOX";
 /// auth-worker の named entrypoint `MachineCredentialEntrypoint` (チケットの検証 `verifyTicket`)
@@ -200,7 +202,8 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
 }
 
 /// 送信の口 (auth-worker の binding と共有 secret)。どちらかが無ければ送らない (警告は未通知のまま次の回へ残る。
-/// テスト送信の口は 503 `notify_unavailable`)。cron とテスト送信の口で共用する
+/// テスト送信の口は 503 `notify_unavailable`)。トークルーム宛は alc-lineworks の binding (`ALC_LINEWORKS`) も使い、
+/// それが無ければトークルーム宛だけ送れない。cron とテスト送信の口で共用する
 async fn notifier(env: &Env) -> Box<dyn Notifier> {
     let Ok(fetcher) = env.service(AUTH_WORKER_BINDING) else {
         console_error!("leave: cron no {AUTH_WORKER_BINDING} binding");
@@ -211,7 +214,11 @@ async fn notifier(env: &Env) -> Box<dyn Notifier> {
         Err(_) => None,
     };
     match secret {
-        Some(s) => Box::new(AuthWorkerNotifier::new(fetcher, s)),
+        Some(s) => Box::new(AuthWorkerNotifier::new(
+            fetcher,
+            s,
+            env.service(ALC_LINEWORKS_BINDING).ok(),
+        )),
         None => {
             console_error!("leave: cron no {NOTIFY_SECRET_BINDING} secret");
             Box::new(NoNotifier)

@@ -233,9 +233,13 @@ pub mod sql {
         "SELECT tenant_id, dept_codes, grace_days FROM alc_api.leave_enabled_tenants()";
 
     /// 警告の宛先 (グループ, 個人, 設定した bot, その bot が使えるか)。個人は LINE WORKS の有効な行のときだけ返す
-    /// (無効になった宛先に毎朝送り続けない)。bot は設定されていて使える (自 tenant・lineworks・有効) ときだけ 4 列目が入る
-    pub const NOTIFY_TARGET: &str = "SELECT s.lineworks_channel_id, r.id, s.notify_bot_config_id, b.id \
+    /// (無効になった宛先に毎朝送り続けない)。bot は設定されていて使える (自 tenant・lineworks・有効) ときだけ 4 列目が入る。
+    /// グループは、この tenant のトークルームの行から LINE WORKS の channelId とそのトークルームの bot を 5・6 列目に引く
+    /// (送信はこれを tenant 付きで渡す。tenant をまたぐ関数で引かせない)
+    pub const NOTIFY_TARGET: &str = "SELECT s.lineworks_channel_id, r.id, s.notify_bot_config_id, b.id, \
+         c.channel_id, c.bot_config_id \
          FROM alc_api.leave_settings s \
+         LEFT JOIN alc_api.lineworks_channels c ON c.id = s.lineworks_channel_id AND c.tenant_id = $1 \
          LEFT JOIN alc_api.notify_recipients r ON r.id = s.notify_recipient_id AND r.tenant_id = $1 \
          AND r.provider = 'lineworks' AND r.enabled \
          LEFT JOIN alc_api.bot_configs b ON b.id = s.notify_bot_config_id AND b.tenant_id = $1 \
@@ -572,8 +576,8 @@ pub async fn enabled_tenants(pg: &mut PgClient) -> Result<Vec<EnabledTenant>, Er
     .await
 }
 
-/// tenant の警告の宛先 (グループか個人)。無い・個人が送れない行・設定した bot が使えない (消えた・無効) なら `None`
-/// (bot を名前順の最初に戻して別用途の bot から送ることはしない)
+/// tenant の警告の宛先 (グループか個人)。無い・個人が送れない行・設定した bot が使えない (消えた・無効)・
+/// 設定したグループがこの tenant に無いなら `None` (bot を名前順の最初に戻して別用途の bot から送ることはしない)
 pub async fn notify_target(
     pg: &mut PgClient,
     tenant_id: Uuid,
@@ -584,8 +588,14 @@ pub async fn notify_target(
                 .query_typed_opt(sql::NOTIFY_TARGET, &[(&tenant_id, Type::UUID)])
                 .await?;
             Ok(row.and_then(|r| {
-                if let Some(channel) = r.get::<_, Option<Uuid>>(0) {
-                    return Some(NotifyTarget::Channel(channel));
+                if r.get::<_, Option<Uuid>>(0).is_some() {
+                    let channel_id = r.get::<_, Option<String>>(4)?;
+                    let bot = r.get::<_, Option<Uuid>>(5)?;
+                    return Some(NotifyTarget::Channel {
+                        tenant: tenant_id,
+                        channel_id,
+                        bot,
+                    });
                 }
                 let id = r.get::<_, Option<Uuid>>(1)?;
                 let configured = r.get::<_, Option<Uuid>>(2).is_some();

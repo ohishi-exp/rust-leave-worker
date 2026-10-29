@@ -218,6 +218,23 @@ pub async fn lineworks_channel(tenant_id: Uuid) -> Uuid {
         .get(0)
 }
 
+/// トークルームの行 (`lineworks_channels.id`) を送信の宛先にしたもの (LINE WORKS の channelId とそのトークルームの bot)
+pub async fn channel_target(tenant_id: Uuid, row: Uuid) -> leave::cron::NotifyTarget {
+    let r = admin()
+        .await
+        .query_one(
+            "SELECT channel_id, bot_config_id FROM alc_api.lineworks_channels WHERE id = $1",
+            &[&row],
+        )
+        .await
+        .unwrap();
+    leave::cron::NotifyTarget::Channel {
+        tenant: tenant_id,
+        channel_id: r.get(0),
+        bot: r.get(1),
+    }
+}
+
 /// tenant の通知先 (個人) を 1 つ作る (`provider` = lineworks / line、値は固定のダミー)
 pub async fn notify_recipient(tenant_id: Uuid, provider: &str, enabled: bool) -> Uuid {
     let user = Uuid::new_v4().to_string();

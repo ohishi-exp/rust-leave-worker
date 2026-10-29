@@ -12,8 +12,8 @@ use leave::ichiban::{DEPARTMENTS_PATH, EMPLOYEES_PATH};
 use leave::TEST_NOTIFY_TEXT;
 use serde_json::{json, Value};
 use support::{
-    app, app_with_notifier, call, ichiban_with, lineworks_channel, notify_recipient, page, tenant,
-    App, FakeIchiban, FakeNotifier, FakePdfs, UnavailableNotifier,
+    app, app_with_notifier, call, channel_target, ichiban_with, lineworks_channel,
+    notify_recipient, page, tenant, App, FakeIchiban, FakeNotifier, FakePdfs, UnavailableNotifier,
 };
 use uuid::Uuid;
 
@@ -585,12 +585,10 @@ async fn test_notify_sends_the_fixed_text_to_the_saved_target() {
     put_settings(&a, t, json!({"lineworks_channel_id": ch})).await;
     let got = test_notify(&a, t).await;
     assert_eq!(got.status, 200);
+    let want = channel_target(t, ch).await;
     let sent = n.sent.lock().unwrap();
     assert_eq!(sent.len(), 2);
-    assert_eq!(
-        sent[1],
-        (NotifyTarget::Channel(ch), TEST_NOTIFY_TEXT.to_owned())
-    );
+    assert_eq!(sent[1], (want, TEST_NOTIFY_TEXT.to_owned()));
 }
 
 /// 宛先が無い (設定が無い・個人が LINE か無効) なら 400 `no_notify_target` で、送らない
