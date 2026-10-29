@@ -8,7 +8,9 @@
 //! このファイルは wasm 専用で、CI のテストと coverage の gate の外 (確かめるのは staging / 本番の実物)。
 
 use futures_util::future::BoxFuture;
-use leave::cron::{send_body, Notifier, NotifyError, NotifyTarget, LINEWORKS_SEND_URL};
+use leave::cron::{
+    send_body, Notifier, NotifyError, NotifyTarget, LINEWORKS_MESSAGES_URL, LINEWORKS_SEND_URL,
+};
 use leave::holidays::{holidays_url, HolidaysApi, HolidaysError, HolidaysResponse};
 use leave::ichiban::{IchibanApi, IchibanError, IchibanResponse};
 use leave::inbox::{Inbox, InboxListed, InboxObject, TicketVerifier, VerifyError};
@@ -113,18 +115,21 @@ impl HolidaysApi for HolidaysJp {
     }
 }
 
-/// auth-worker (Service Binding `AUTH_WORKER`) の内部 proxy 経由で LINE WORKS へ送る。
-/// `X-Alc-Proxy-Secret` は Secrets Store の共有 secret (consumer worker の証明)。応答の本文は読まない
+/// LINE WORKS へ送る。個人宛は auth-worker (Service Binding `AUTH_WORKER`) の内部 proxy 経由の `/send`
+/// (`X-Alc-Proxy-Secret` は Secrets Store の共有 secret = consumer worker の証明)。トークルーム宛は alc-lineworks
+/// (Service Binding `ALC_LINEWORKS`) の `/messages` へ `X-Tenant-ID` 付きで直接 (binding が無ければ送らない)。応答の本文は読まない
 pub struct AuthWorkerNotifier {
     fetcher: SendWrapper<Fetcher>,
     secret: String,
+    lineworks: Option<SendWrapper<Fetcher>>,
 }
 
 impl AuthWorkerNotifier {
-    pub fn new(fetcher: Fetcher, secret: String) -> Self {
+    pub fn new(fetcher: Fetcher, secret: String, lineworks: Option<Fetcher>) -> Self {
         Self {
             fetcher: SendWrapper::new(fetcher),
             secret,
+            lineworks: lineworks.map(SendWrapper::new),
         }
     }
 }
@@ -138,19 +143,31 @@ impl Notifier for AuthWorkerNotifier {
         Box::pin(SendFuture::new(async move {
             let headers = Headers::new();
             headers
-                .set("X-Alc-Proxy-Secret", &self.secret)
-                .map_err(|_| NotifyError("headers"))?;
-            headers
                 .set("Content-Type", "application/json")
                 .map_err(|_| NotifyError("headers"))?;
+            let (url, fetcher) = match &target {
+                NotifyTarget::Channel { tenant, .. } => {
+                    let Some(lineworks) = &self.lineworks else {
+                        return Err(NotifyError("no_lineworks_binding"));
+                    };
+                    headers
+                        .set("X-Tenant-ID", &tenant.to_string())
+                        .map_err(|_| NotifyError("headers"))?;
+                    (LINEWORKS_MESSAGES_URL, lineworks)
+                }
+                NotifyTarget::Recipient { .. } => {
+                    headers
+                        .set("X-Alc-Proxy-Secret", &self.secret)
+                        .map_err(|_| NotifyError("headers"))?;
+                    (LINEWORKS_SEND_URL, &self.fetcher)
+                }
+            };
             let mut init = RequestInit::new();
             init.with_method(Method::Post)
                 .with_headers(headers)
-                .with_body(Some(JsValue::from_str(&send_body(target, text))));
-            let req = Request::new_with_init(LINEWORKS_SEND_URL, &init)
-                .map_err(|_| NotifyError("request"))?;
-            let resp = self
-                .fetcher
+                .with_body(Some(JsValue::from_str(&send_body(&target, text))));
+            let req = Request::new_with_init(url, &init).map_err(|_| NotifyError("request"))?;
+            let resp = fetcher
                 .fetch_request(req)
                 .await
                 .map_err(|_| NotifyError("fetch"))?;

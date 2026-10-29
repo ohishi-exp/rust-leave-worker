@@ -28,7 +28,7 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
   PgBouncer。**切り戻し用**) → 本番 Hyperdrive → ローカル `DATABASE_URL`。**切り戻しは `STAGING_DB` の binding を外すだけ**。
   binding が在るのに繋がらないときは次の段へ落とさず 500。DO の binding は **env.staging に 1 件だけ**
   (name/class_name/script_name 完全一致。トップレベル・他の env・migrations は禁止。`check-exposure.sh`)。
-  `ICHIBAN_DB`・`AUTH_WORKER` (LINE WORKS 送信)・Hyperdrive・`[triggers]` (cron) は本番だけ (staging / local の crons は空)、
+  `ICHIBAN_DB`・`AUTH_WORKER` (LINE WORKS 送信。個人宛)・`ALC_LINEWORKS` (トークルーム宛を alc-lineworks の `/messages` へ `X-Tenant-ID` 付きで)・Hyperdrive・`[triggers]` (cron) は本番だけ (staging / local の crons は空)、
   staging の R2 は staging のもの、env 下の services は `-staging` の service だけ (一番星用は置かない)。
   `wrangler.toml` の表の順を変えない (新しい表は placement より後)。
 - DB は `PgClient::tenant_tx` + `query_typed` 系だけ。SQL は `crates/leave/src/pg.rs` の 1 か所。

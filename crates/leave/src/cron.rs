@@ -54,11 +54,20 @@ pub fn window(today: NaiveDate) -> (NaiveDate, NaiveDate) {
 pub const LINEWORKS_SEND_URL: &str =
     "https://auth-worker.internal/alc-internal-proxy/api/internal/lineworks/send";
 
-/// 警告の宛先 (`leave_settings` のグループか個人のどちらか 1 つ。rust-alc-api の `SendTarget` と同じ形)
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// alc-lineworks (Service Binding `ALC_LINEWORKS`) の tenant 付きの送信の口 (host は名目)。トークルーム宛はここへ
+/// `X-Tenant-ID` 付きで送る (`/send` は tenant を持たず、alc-lineworks が tenant をまたぐ関数でトークルームを引くため)
+pub const LINEWORKS_MESSAGES_URL: &str = "https://alc-lineworks/api/internal/lineworks/messages";
+
+/// 警告の宛先 (`leave_settings` のグループか個人のどちらか 1 つ)
+#[derive(Debug, Clone, PartialEq)]
 pub enum NotifyTarget {
-    /// `lineworks_channels.id` (LINE WORKS の channelId ではない)
-    Channel(Uuid),
+    /// トークルーム: この tenant の中で引いた LINE WORKS の channelId と、そのトークルームに居る bot
+    /// (`lineworks_channels.bot_config_id`)。alc-lineworks の `/messages` へ `X-Tenant-ID` 付きで送る
+    Channel {
+        tenant: Uuid,
+        channel_id: String,
+        bot: Uuid,
+    },
     /// `notify_recipients.id` (LINE WORKS の有効な行) と、その送信に使う bot (`bot_configs.id`)。
     /// bot が `None` なら送信側の既定 (設定が無い従来の形)。tenant に bot が複数あるとき、bot を指定しないと
     /// 別用途の bot から届くので、設定した bot が使えないときは宛先にせず送らない (`pg::notify_target`)
@@ -67,11 +76,17 @@ pub enum NotifyTarget {
 
 impl alc_worker_db::TxOutput for NotifyTarget {}
 
-/// 送信の本文 (`{"channel_id": "<id>", "text": "..."}` か `{"recipient_id": "<id>", "text": "..."}` の排他。
-/// 個人宛てで bot があれば `"bot_config_id"` も載せる)。宛先は `Uuid` の型で受けるので形は常に正しい
-pub fn send_body(target: NotifyTarget, text: &str) -> String {
+/// 送信の本文。トークルームは alc-lineworks の `/messages` の形 (`{"bot_config_id", "to": {"channel_id"}, "content": {"type": "text", "text"}}`)、
+/// 個人は `/send` の形 (`{"recipient_id": "<id>", "text": "..."}`。bot があれば `"bot_config_id"` も載せる)
+pub fn send_body(target: &NotifyTarget, text: &str) -> String {
     match target {
-        NotifyTarget::Channel(id) => serde_json::json!({ "channel_id": id, "text": text }),
+        NotifyTarget::Channel {
+            channel_id, bot, ..
+        } => serde_json::json!({
+            "bot_config_id": bot,
+            "to": { "channel_id": channel_id },
+            "content": { "type": "text", "text": text },
+        }),
         NotifyTarget::Recipient { id, bot: None } => {
             serde_json::json!({ "recipient_id": id, "text": text })
         }
@@ -324,7 +339,7 @@ async fn run_tenant(
             .collect();
         let mut sent = Vec::new();
         for m in messages(&pending, &names, result.unlinked) {
-            if notifier.send(target, &m.text).await.is_ok() {
+            if notifier.send(target.clone(), &m.text).await.is_ok() {
                 result.sent_messages += 1;
                 sent.extend(m.alerts.iter().map(|&i| pending[i].id));
             }
@@ -404,20 +419,29 @@ mod tests {
     #[test]
     fn send_body_shape() {
         let body: serde_json::Value = serde_json::from_str(&send_body(
-            NotifyTarget::Channel(Uuid::from_u128(1)),
+            &NotifyTarget::Channel {
+                tenant: Uuid::from_u128(9),
+                channel_id: "ch-1".to_owned(),
+                bot: Uuid::from_u128(1),
+            },
             "あ\n\"い\"",
         ))
         .unwrap();
+        // tenant は本文に載せない (`X-Tenant-ID` で渡す)
         assert_eq!(
             body,
-            serde_json::json!({"channel_id": Uuid::from_u128(1).to_string(), "text": "あ\n\"い\""})
+            serde_json::json!({
+                "bot_config_id": Uuid::from_u128(1).to_string(),
+                "to": {"channel_id": "ch-1"},
+                "content": {"type": "text", "text": "あ\n\"い\""}
+            })
         );
     }
 
     #[test]
     fn send_body_recipient_shape() {
         let body: serde_json::Value = serde_json::from_str(&send_body(
-            NotifyTarget::Recipient {
+            &NotifyTarget::Recipient {
                 id: Uuid::from_u128(2),
                 bot: None,
             },
@@ -433,7 +457,7 @@ mod tests {
     #[test]
     fn send_body_recipient_with_bot_shape() {
         let body: serde_json::Value = serde_json::from_str(&send_body(
-            NotifyTarget::Recipient {
+            &NotifyTarget::Recipient {
                 id: Uuid::from_u128(2),
                 bot: Some(Uuid::from_u128(3)),
             },

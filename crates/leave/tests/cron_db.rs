@@ -10,8 +10,8 @@ use leave::cron::{run, NotifyTarget, Summary};
 use leave::ichiban::EMPLOYEES_PATH;
 use serde_json::{json, Value};
 use support::{
-    add_days, admin, app_client, ichiban_with, lineworks_channel, notify_recipient, tenant,
-    FakeHolidays, FakeIchiban, FakeNotifier,
+    add_days, admin, app_client, channel_target, ichiban_with, lineworks_channel, notify_recipient,
+    tenant, FakeHolidays, FakeIchiban, FakeNotifier,
 };
 use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
@@ -209,7 +209,7 @@ async fn detects_notifies_and_grants() {
     );
     assert_eq!(s.unknown.get("謎"), Some(&1));
     let sent = n.sent.lock().unwrap().clone();
-    assert_eq!(sent, vec![(NotifyTarget::Channel(ch.unwrap()), "【勤怠申請】一番星と申請書のずれ 3 件\n1021 山田太郎: 10/03 有休 — 申請書なし\n1021 山田太郎: 10/06 労災 — 一番星に入力なし\n1022 佐藤花子: 09/20 欠勤 — 申請書なし".to_owned())]);
+    assert_eq!(sent, vec![(channel_target(t, ch.unwrap()).await, "【勤怠申請】一番星と申請書のずれ 3 件\n1021 山田太郎: 10/03 有休 — 申請書なし\n1021 山田太郎: 10/06 労災 — 一番星に入力なし\n1022 佐藤花子: 09/20 欠勤 — 申請書なし".to_owned())]);
     assert_eq!(
         alerts(t).await,
         vec![
@@ -375,7 +375,8 @@ async fn no_channel_keeps_alerts_pending() {
         .unwrap();
     let s = run_once(&f, &n).await;
     assert_eq!((s.tenants[0].sent_messages, s.tenants[0].notified), (1, 1));
-    assert_eq!(n.sent.lock().unwrap()[0].0, NotifyTarget::Channel(ch));
+    let want = channel_target(t, ch).await;
+    assert_eq!(n.sent.lock().unwrap()[0].0, want);
 }
 
 /// 有効な tenant の宛先を個人にする
@@ -1003,9 +1004,10 @@ async fn changed_ichiban_rows_unlink_pages() {
             a("1021", "2026-09-03", "yukyu", "ichiban_only", true, false)
         ]
     );
+    let want = channel_target(t, ch.unwrap()).await;
     let sent = n.sent.lock().unwrap();
     assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0].0, NotifyTarget::Channel(ch.unwrap()));
+    assert_eq!(sent[0].0, want);
     assert!(sent[0].1.starts_with(
         "【勤怠申請】一番星と申請書のずれ 2 件\n一番星が変わったため紐づけを解除: 3 件\n1021 山田太郎: 09/02"
     ));
