@@ -38,6 +38,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use chrono::{DateTime, Datelike, Months, NaiveDate, Utc};
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -171,7 +172,11 @@ async fn opening_of(
     Ok(got.map(|o| opening_grants(o, emp.hire_date, emp.retire_date)))
 }
 
-/// 一番星の休暇の行を `from`〜`to` で取り、`codes` の乗務員の行だけを返す (92 日ごとに呼ぶ。正規化はしない)
+/// 一番星の休暇の口を同時に呼ぶ本数 (Workers の 1 リクエストで同時に開ける接続は 6 本まで)
+pub const DAYS_CONCURRENCY: usize = 6;
+
+/// 一番星の休暇の行を `from`〜`to` で取り、`codes` の乗務員の行だけを返す (92 日ごとに [`DAYS_CONCURRENCY`] 本ずつ
+/// 同時に呼び、並びは日付順のまま。正規化はしない)
 pub(crate) async fn fetch_rows<'a>(
     state: &LeaveState,
     api: &Arc<dyn IchibanApi>,
@@ -179,14 +184,17 @@ pub(crate) async fn fetch_rows<'a>(
     from: NaiveDate,
     to: NaiveDate,
 ) -> Result<Vec<IchibanRow<'a>>, &'static str> {
-    let mut out = Vec::new();
-    for path in days_paths(from, to) {
-        let body = ichiban_get(state, api, &path).await?;
-        out.extend(read_day_rows(&body, codes).inspect_err(|code| {
-            (state.log)(&format!("ichiban {}: {code}", crate::reconcile::DAYS_PATH));
-        })?);
-    }
-    Ok(out)
+    let chunks: Vec<Vec<IchibanRow<'a>>> = stream::iter(days_paths(from, to))
+        .map(|path| async move {
+            let body = ichiban_get(state, api, &path).await?;
+            read_day_rows(&body, codes).inspect_err(|code| {
+                (state.log)(&format!("ichiban {}: {code}", crate::reconcile::DAYS_PATH));
+            })
+        })
+        .buffered(DAYS_CONCURRENCY)
+        .try_collect()
+        .await?;
+    Ok(chunks.into_iter().flatten().collect())
 }
 
 /// 一番星の休暇を `from`〜`to` で取り、`codes` の乗務員だけを正規化する ([`fetch_rows`])
