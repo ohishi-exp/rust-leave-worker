@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use alc_core_wasm::require_tenant_header;
@@ -428,17 +429,24 @@ impl TicketVerifier for FakeVerifier {
     }
 }
 
-/// 偽の一番星 Worker (path → 応答)。登録の無い path は呼び出しの失敗
+/// 偽の一番星 Worker (path → 応答)。登録の無い path は呼び出しの失敗。
+/// 応答の前に 1 回だけ譲り、同時に走った本数の最大を `max_in_flight` に残す
 #[derive(Default)]
 pub struct FakeIchiban {
     pub responses: HashMap<String, IchibanResponse>,
     pub calls: StdMutex<Vec<String>>,
+    in_flight: AtomicUsize,
+    pub max_in_flight: AtomicUsize,
 }
 
 impl IchibanApi for FakeIchiban {
     fn get<'a>(&'a self, path: &'a str) -> BoxFuture<'a, Result<IchibanResponse, IchibanError>> {
         Box::pin(async move {
             self.calls.lock().unwrap().push(path.to_owned());
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
             self.responses.get(path).cloned().ok_or(IchibanError)
         })
     }

@@ -2949,10 +2949,19 @@ async fn ledger_lists_everyone_by_fiscal_year() {
     };
     let calls = || a.ichiban.as_ref().unwrap().calls.lock().unwrap().len();
 
-    // 基準日の省略は今日 (2026-10-10) → 2026 年度。一番星は社員 1 回 + 休暇の窓 1 つ (92 日ずつ 16 回) だけ
+    // 基準日の省略は今日 (2026-10-10) → 2026 年度。一番星は社員 1 回 + 休暇の窓 1 つ (92 日ずつ 16 回) だけで、
+    // 休暇の口は DAYS_CONCURRENCY 本ずつ同時に呼ぶ
     let before = calls();
     let v = get("/api/leave/ledger").await;
     assert_eq!(calls() - before, 1 + 16);
+    assert_eq!(
+        a.ichiban
+            .as_ref()
+            .unwrap()
+            .max_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst),
+        leave::ledger::DAYS_CONCURRENCY
+    );
     assert_eq!(
         (v["as_of"].clone(), v["fiscal_year"].clone()),
         (
