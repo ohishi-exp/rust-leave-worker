@@ -267,11 +267,18 @@ pub mod sql {
 
     /// 未解消の警告 = 未解決かつ窓 (`$2`〜`$3`) の中。毎朝の通知 ([`super::record_alerts`]) と一覧
     /// ([`super::open_alerts`]) が同じこの 1 文を使う。窓の外へ出た未解決の行は `resolved_at` が NULL のまま表に
-    /// 残るが、通知にも一覧にも出ない (仕様)
+    /// 残るが、通知にも一覧にも出ない (仕様)。
+    /// 8 列目は同じ乗務員の紐づけ済みページのうち、その日を期間に含むもの (区分は問わない。突き合わせのずれを
+    /// 一覧から PDF で確かめるため。通知は読まない)
     pub const ALERTS_OPEN: &str =
-        "SELECT id, employee_cd, day, kind, direction, first_seen_at, notified_at FROM alc_api.leave_alerts \
-         WHERE tenant_id = $1 AND resolved_at IS NULL AND day BETWEEN $2 AND $3 \
-         ORDER BY employee_cd, day, kind, direction";
+        "SELECT a.id, a.employee_cd, a.day, a.kind, a.direction, a.first_seen_at, a.notified_at, \
+         ARRAY(SELECT DISTINCT p.id FROM alc_api.leave_periods pr \
+         JOIN alc_api.leave_pages p ON p.id = pr.page_id AND p.tenant_id = pr.tenant_id \
+         WHERE pr.tenant_id = $1 AND p.tenant_id = $1 AND p.status = 'linked' \
+         AND p.employee_cd = a.employee_cd AND a.day BETWEEN pr.start_date AND pr.end_date) AS page_ids \
+         FROM alc_api.leave_alerts a \
+         WHERE a.tenant_id = $1 AND a.resolved_at IS NULL AND a.day BETWEEN $2 AND $3 \
+         ORDER BY a.employee_cd, a.day, a.kind, a.direction";
 
     /// 送れた警告に最後に送った時刻を付ける (毎朝送るので、送れるたびに上書きする)
     pub const ALERTS_NOTIFIED: &str = "UPDATE alc_api.leave_alerts SET notified_at = NOW() \
@@ -678,6 +685,7 @@ pub async fn open_alerts(
                     direction: r.get(4),
                     first_seen_at: r.get(5),
                     notified_at: r.get(6),
+                    page_ids: r.get(7),
                 })
                 .collect())
         })

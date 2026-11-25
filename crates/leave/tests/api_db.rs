@@ -1497,6 +1497,47 @@ async fn list_alerts_open_in_window_only() {
     .await;
     // 他の tenant
     alert_row(other, "1021", "2026-10-03", ichiban_only, None, false).await;
+    // その日を期間に含む同じ乗務員の紐づけ済みページ (区分は問わない) を `page_ids` に載せる。
+    // 紐づけていないページ・別の乗務員・別の日・他の tenant のページは載らない
+    let save = |t: Uuid,
+                emp: &'static str,
+                status: &'static str,
+                kind: &'static str,
+                (from, to): (&'static str, &'static str)| {
+        let a = &a;
+        async move {
+            let p = page(
+                t,
+                &format!("{t}/{emp}-{from}.pdf"),
+                1,
+                "2026-10-01T00:00:00Z",
+            )
+            .await;
+            let body = json!({"employee_cd": emp, "status": status,
+                "periods": [{"kind": kind, "start_date": from, "end_date": to}]});
+            let uri = format!("/api/leave/pages/{p}");
+            assert_eq!(
+                call(a, "PUT", &uri, Some(t), ADMIN, Some(body))
+                    .await
+                    .status,
+                200
+            );
+            p
+        }
+    };
+    let rousai = save(t, "1021", "linked", "rousai", ("2026-10-05", "2026-10-09")).await;
+    let tokukyu = save(t, "1022", "linked", "tokukyu", ("2026-10-02", "2026-10-03")).await;
+    save(t, "1021", "unlinked", "yukyu", ("2026-08-09", "2026-08-09")).await;
+    save(t, "1022", "linked", "yukyu", ("2026-08-09", "2026-08-09")).await;
+    save(t, "1021", "linked", "yukyu", ("2026-08-10", "2026-08-10")).await;
+    save(
+        other,
+        "1021",
+        "linked",
+        "yukyu",
+        ("2026-08-09", "2026-08-09"),
+    )
+    .await;
 
     let got = get(t).await;
     assert_eq!(got.status, 200);
@@ -1504,11 +1545,12 @@ async fn list_alerts_open_in_window_only() {
         got.json(),
         json!({"alerts": [
             {"employee_cd": "1021", "day": "2026-08-09", "kind": "yukyu", "direction": "ichiban_only",
-             "first_seen_at": "2026-10-01T00:00:00Z", "notified_at": null},
+             "first_seen_at": "2026-10-01T00:00:00Z", "notified_at": null, "page_ids": []},
             {"employee_cd": "1021", "day": "2026-10-09", "kind": "rousai", "direction": "pdf_only",
-             "first_seen_at": "2026-10-01T00:00:00Z", "notified_at": "2026-10-09T23:00:00Z"},
+             "first_seen_at": "2026-10-01T00:00:00Z", "notified_at": "2026-10-09T23:00:00Z",
+             "page_ids": [rousai]},
             {"employee_cd": "1022", "day": "2026-10-03", "kind": "yukyu", "direction": "ichiban_only",
-             "first_seen_at": "2026-10-01T00:00:00Z", "notified_at": null}
+             "first_seen_at": "2026-10-01T00:00:00Z", "notified_at": null, "page_ids": [tokukyu]}
         ], "from": "2026-08-01", "to": "2026-10-09"})
     );
     let got = get(other).await;

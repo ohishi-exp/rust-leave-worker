@@ -581,6 +581,8 @@ pub struct OpenAlert {
     pub first_seen_at: DateTime<Utc>,
     /// 最後に通知を送った時刻 (まだ送れていなければ `null`)
     pub notified_at: Option<DateTime<Utc>>,
+    /// 同じ乗務員の紐づけ済みページのうち、その日を期間に含むもの (区分は問わない)
+    pub page_ids: Vec<Uuid>,
 }
 
 impl TxOutput for OpenAlert {}
