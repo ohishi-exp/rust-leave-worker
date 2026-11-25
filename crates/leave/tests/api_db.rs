@@ -1558,7 +1558,7 @@ async fn list_alerts_open_in_window_only() {
 }
 
 /// 紐づけて保存したら、その期間の日の未解決の `ichiban_only` を同じ PUT ですぐ閉じる (翌朝の突き合わせを待たない)。
-/// 期間が覆わない日・別の区分・`pdf_only`・別 tenant の同じ鍵は残る。linked でない保存は閉じない。
+/// 期間が覆わない日・別の区分・別 tenant の同じ鍵は残る (`pdf_only` は [`save_page_resolves_uncovered_pdf_only_alerts`])。linked でない保存は閉じない。
 /// 窓の外の日も鍵が合えば閉じる (毎朝の解決は窓の中だけだが、窓の外の行は一覧にも通知にも出ないので意図した差)
 #[tokio::test]
 async fn link_page_resolves_ichiban_only_alerts() {
@@ -1579,7 +1579,6 @@ async fn link_page_resolves_ichiban_only_alerts() {
         false,
     )
     .await;
-    alert_row(t, "1380", "2026-10-03", ("yukyu", "pdf_only"), None, false).await;
     alert_row(t, "1381", "2026-10-03", yukyu, None, false).await;
     alert_row(t, "1380", "2026-07-20", yukyu, None, false).await;
     alert_row(other, "1380", "2026-10-03", yukyu, None, false).await;
@@ -1604,7 +1603,7 @@ async fn link_page_resolves_ichiban_only_alerts() {
         }
     };
     let before = open(t).await;
-    assert_eq!(before.len(), 6);
+    assert_eq!(before.len(), 5);
     let resolved_july = || async {
         support::admin()
             .await
@@ -1636,7 +1635,6 @@ async fn link_page_resolves_ichiban_only_alerts() {
         open(t).await,
         vec![
             "1380 2026-10-03 kekkin ichiban_only",
-            "1380 2026-10-03 yukyu pdf_only",
             "1380 2026-10-05 yukyu ichiban_only",
             "1381 2026-10-03 yukyu ichiban_only",
         ]
@@ -1646,6 +1644,85 @@ async fn link_page_resolves_ichiban_only_alerts() {
         open(other).await,
         vec!["1380 2026-10-03 yukyu ichiban_only"]
     );
+}
+
+/// 保存したら、紐づけ済みのページの期間 (同じ乗務員・同じ区分) がもう覆っていない未解決の `pdf_only` を同じ PUT ですぐ閉じる
+/// (ページを外した・期間を直した直後に漏れの一覧から消す)。覆われている日・労災 (延長があるので毎朝に任せる)・
+/// 別 tenant の行は残る
+#[tokio::test]
+async fn save_page_resolves_uncovered_pdf_only_alerts() {
+    let (t, other) = (tenant().await, tenant().await);
+    let p = page(t, &format!("{t}/a.pdf"), 1, "2026-10-01T00:00:00Z").await;
+    let q = page(t, &format!("{t}/b.pdf"), 1, "2026-10-01T00:00:00Z").await;
+    let a = app(FakePdfs::default(), None).await;
+    let put = |id: Uuid, body: Value| {
+        let a = &a;
+        async move {
+            let uri = format!("/api/leave/pages/{id}");
+            assert_eq!(
+                call(a, "PUT", &uri, Some(t), ADMIN, Some(body))
+                    .await
+                    .status,
+                200
+            );
+        }
+    };
+    let linked = |kind: &str, from: &str, to: &str| {
+        json!({"employee_cd": "1718", "status": "linked",
+            "periods": [{"kind": kind, "start_date": from, "end_date": to}]})
+    };
+    // p は 10/14 の有休、q は 10/20 の有休と 10/21 の労災
+    put(p, linked("yukyu", "2026-10-14", "2026-10-14")).await;
+    put(
+        q,
+        json!({"employee_cd": "1718", "status": "linked", "periods": [
+            {"kind": "yukyu", "start_date": "2026-10-20", "end_date": "2026-10-20"},
+            {"kind": "rousai", "start_date": "2026-10-21", "end_date": "2026-10-21"}
+        ]}),
+    )
+    .await;
+    let pdf = |kind| (kind, "pdf_only");
+    alert_row(t, "1718", "2026-10-14", pdf("yukyu"), None, false).await;
+    alert_row(t, "1718", "2026-10-20", pdf("yukyu"), None, false).await;
+    alert_row(t, "1718", "2026-10-21", pdf("rousai"), None, false).await;
+    alert_row(t, "1718", "2026-10-22", pdf("rousai"), None, false).await;
+    alert_row(other, "1718", "2026-10-14", pdf("yukyu"), None, false).await;
+    let open = |t: Uuid| async move {
+        support::admin()
+            .await
+            .query(
+                "SELECT to_char(day, 'MM-DD') || ' ' || kind FROM alc_api.leave_alerts \
+                 WHERE tenant_id = $1 AND resolved_at IS NULL ORDER BY day, kind",
+                &[&t],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect::<Vec<String>>()
+    };
+    let all = vec!["10-14 yukyu", "10-20 yukyu", "10-21 rousai", "10-22 rousai"];
+    assert_eq!(open(t).await, all);
+
+    // 覆ったままの保存では何も閉じない
+    put(p, linked("yukyu", "2026-10-14", "2026-10-14")).await;
+    assert_eq!(open(t).await, all);
+
+    // p を外すと 10/14 だけ閉じる (q の期間・労災は残る)
+    put(
+        p,
+        json!({"employee_cd": "1718", "status": "unlinked", "periods": []}),
+    )
+    .await;
+    assert_eq!(
+        open(t).await,
+        vec!["10-20 yukyu", "10-21 rousai", "10-22 rousai"]
+    );
+
+    // q の区分を特休に直すと 10/20 の有休も閉じる。労災は期間が外れても閉じない
+    put(q, linked("tokukyu", "2026-10-20", "2026-10-20")).await;
+    assert_eq!(open(t).await, vec!["10-21 rousai", "10-22 rousai"]);
+    assert_eq!(open(other).await, vec!["10-14 yukyu"]);
 }
 
 /// 接続が切れた DB では、どの口も 500 の固定の語で、ログは段の名前と kind だけ

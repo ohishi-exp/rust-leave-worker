@@ -265,6 +265,16 @@ pub mod sql {
          WHERE tenant_id = $1 AND resolved_at IS NULL AND direction = 'ichiban_only' \
          AND (employee_cd, day, kind) IN (SELECT e, d, k FROM unnest($2::text[], $3::date[], $4::text[]) AS u(e, d, k))";
 
+    /// 紐づけ済みのページの期間がもう覆っていない未解決の `pdf_only` を解決にする (保存した PUT と同じ transaction。
+    /// ページを外した・期間や区分を直した直後に一覧から消すため)。労災は延長 (`reconcile::rousai_extension`) で
+    /// 期間の外の日も PDF 側に数えるので閉じない (毎朝の計算に任せる)
+    pub const ALERTS_RESOLVE_UNCOVERED_PDF: &str = "UPDATE alc_api.leave_alerts a SET resolved_at = NOW() \
+         WHERE a.tenant_id = $1 AND a.resolved_at IS NULL AND a.direction = 'pdf_only' AND a.kind <> 'rousai' \
+         AND NOT EXISTS (SELECT 1 FROM alc_api.leave_periods pr \
+         JOIN alc_api.leave_pages p ON p.id = pr.page_id AND p.tenant_id = pr.tenant_id \
+         WHERE pr.tenant_id = $1 AND p.tenant_id = $1 AND p.status = 'linked' \
+         AND p.employee_cd = a.employee_cd AND pr.kind = a.kind AND a.day BETWEEN pr.start_date AND pr.end_date)";
+
     /// 未解消の警告 = 未解決かつ窓 (`$2`〜`$3`) の中。毎朝の通知 ([`super::record_alerts`]) と一覧
     /// ([`super::open_alerts`]) が同じこの 1 文を使う。窓の外へ出た未解決の行は `resolved_at` が NULL のまま表に
     /// 残るが、通知にも一覧にも出ない (仕様)。
@@ -989,7 +999,7 @@ pub async fn get_page(
     .await
 }
 
-/// 1 つの transaction で: ページを行ロック → 期間を全削除 → 挿入 → 一番星の行を全削除 → `link_rows` を挿入 → 保存した期間に当たる `ichiban_only` の警告を解決 (`reconcile::linked_alert_keys`) → ページを更新。
+/// 1 つの transaction で: ページを行ロック → 期間を全削除 → 挿入 → 一番星の行を全削除 → `link_rows` を挿入 → 保存した期間に当たる `ichiban_only` の警告を解決 (`reconcile::linked_alert_keys`) → ページを更新 → どの期間も覆わなくなった `pdf_only` を解決。
 /// `linked_by` / `linked_at` は `status = linked` のときだけ `actor` / 今にし、それ以外は消す。
 /// `link_rows` は確かめ済みの行 (`ledger::verified_link_rows`。linked 以外・行の指定が無ければ空 = 削除だけ)。
 /// 自 tenant に見えなければ何も書かずに `None`
@@ -1083,6 +1093,11 @@ pub async fn update_page(
                     ],
                 )
                 .await?;
+            tx.execute_typed(
+                sql::ALERTS_RESOLVE_UNCOVERED_PDF,
+                &[(&tenant_id, Type::UUID)],
+            )
+            .await?;
             let periods = periods_of(tx, tenant_id, id).await?;
             Ok(Some(PageDetail {
                 page: page_from_row(&row),
